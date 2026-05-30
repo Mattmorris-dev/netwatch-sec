@@ -1,0 +1,324 @@
+![NetWatch](docs/banner.png)
+
+# NetWatch
+
+**All-in-one network security dashboard** — deploy honeypots, capture traffic, run OSINT, scan targets, block threats, and forward alerts over mesh radio. One command, one file, real-time.
+
+```
+sudo netwatch
+```
+
+NetWatch turns any Linux box into a full network security sensor. It deploys 4 honeypot services that lure and log attackers, sniffs all traffic on your interface with raw sockets and tshark, auto-enriches every IP with geolocation and threat scoring, and gives you 100+ commands to investigate, track, and block threats — all from a single terminal or browser.
+
+Built for Raspberry Pi, Kali, Parrot OS, and any Debian-based Linux. Runs as a single Python file with no microservices, no Docker, no cloud dependency.
+
+---
+
+## How It Works
+
+1. **Launch** — `sudo netwatch` starts everything: 4 honeypots bind their ports, raw socket sniffer attaches to your interface, tshark begins protocol analysis, ARP monitor discovers devices, web dashboard opens on :9090
+2. **Capture** — Every packet is parsed for source/destination IPs, ports, protocols, and DNS queries. Honeypots log credentials, commands, file uploads, and malware download attempts
+3. **Enrich** — Each new IP is automatically scored for threat level based on port behavior, known bad ports, and scan patterns. Run OSINT commands to add geolocation, WHOIS, abuse reports, and ASN data
+4. **Respond** — Block attackers with iptables, tag and watchlist IPs, run deep nmap scans, capture payloads, export reports. Forward critical alerts over LoRa mesh radio for off-grid monitoring
+5. **View** — Full-screen TUI with 11 tabs, or browser dashboard with live charts, clickable IPs, 5 color themes, and CRT scanline effects
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     NETWATCH v1.0.0                          │
+├──────────────────────────────────────────────────────────────┤
+│  TERMINAL UI (TUI)        │  WEB DASHBOARD (:9090)           │
+│  Full-screen ANSI         │  Flask + SSE live updates        │
+│  11 tabs, console mode    │  5 themes, CRT scanlines         │
+│  Tab/number key nav       │  Charts, clickable IPs, API      │
+├──────────────────────────────────────────────────────────────┤
+│  HONEYPOTS                │  TRAFFIC MONITORING              │
+│  HTTP :8080 (NVR panel)   │  Raw socket sniffer              │
+│  Telnet :2323 (DVR)       │  tshark protocol analysis        │
+│  FTP :2121 (bait files)   │  tcpdump PCAP recording          │
+│  RTSP :8554 (camera)      │  ARP device discovery            │
+├──────────────────────────────────────────────────────────────┤
+│  SCANNING & RECON         │  OSINT (16 tools)                │
+│  nmap integration         │  GeoIP, WHOIS, DNS enum          │
+│  Port scanning            │  SSL/TLS, HTTP headers           │
+│  Service detection        │  Abuse/ASN, cert transparency    │
+│  Stealth (Tor) mode       │  Tech fingerprinting, speedtest  │
+├──────────────────────────────────────────────────────────────┤
+│  DEFENSE                  │  MESH RADIO                      │
+│  iptables blocking        │  Meshtastic LoRa support         │
+│  Threat scoring           │  Alert forwarding                │
+│  Watchlists & tagging     │  Two-way messaging               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+## Install
+
+```bash
+# System tools (one-shot — covers all commands NetWatch shells out to)
+sudo apt install -y nmap tshark tcpdump traceroute iproute2 iptables \
+                    openssl curl dnsutils whois psmisc arp-scan \
+                    tor proxychains4
+
+# Python deps
+pip3 install -r requirements.txt
+
+# Optional features
+pip3 install graphene flask-graphql    # GraphQL API at :9090/graphql
+pip3 install meshtastic                # LoRa mesh radio alerts
+sudo apt install -y speedtest-cli      # `speed` command
+
+# Install launcher system-wide
+chmod +x netwatch-start.sh
+sudo ln -s $(pwd)/netwatch-start.sh /usr/local/bin/netwatch
+```
+
+## Quick Start
+
+```bash
+# Random token each launch (default — more secure)
+sudo netwatch
+
+# Persistent token across restarts (requires NETWATCH_FIXED_TOKEN env var)
+export NETWATCH_FIXED_TOKEN=$(openssl rand -hex 24)
+sudo -E netwatch --fixed-token
+
+# Specific interface
+sudo netwatch eth0
+```
+
+Token is printed on every launch. Use it to log into the web dashboard at `http://<your-ip>:9090`.
+
+Both TUI and web UI launch together — one command runs everything.
+
+## Remote Access
+
+```bash
+# Cloudflare quick tunnel (no account needed)
+cloudflared tunnel --url http://localhost:9090
+```
+
+## Terminal UI
+
+Three screens, hotkey-toggled. Switching screens keeps your tab and scroll position.
+
+| Screen | Hotkey | Purpose |
+|--------|--------|---------|
+| **Dashboard** | `F1` | 11 tabs, live host/protocol/honeypot view |
+| **Command Line** | `F2` | Full-screen prompt + command output |
+| **Console** | `F3` | Full-screen log of tool output |
+
+```
+F1 / F2 / F3       Switch screens
+1-9, 0             Jump to tab
+Type anything      Open command prompt
+Up/Down            History recall
+PgUp / PgDn        Scrollback
+Home / End         Top / bottom
+ESC                Close help overlay
+clear              Wipe console buffer
+```
+
+### Tabs
+
+`all` · `hosts` · `proto` · `dns` · `honeypot` · `nmap` · `arp` · `alerts` · `osint` · `proxy` · `mesh`
+
+## Web Dashboard
+
+Browser UI on `:9090` with live SSE updates, 5 themes, and CRT scanline effects.
+
+- **Themes**: Terminal Classic, Matrix Green, Midnight Blue, Cyberpunk, Light Mode
+- **CRT Scanlines**: Off, Soft, Heavy — retro terminal aesthetic
+- **Charts**: Live traffic timeline, protocol distribution, threat breakdown
+- **Click any IP** for context menu — scan, geo, whois, traceroute, full recon
+- **Resizable output panel** with drag handle
+- **Host detail modal** with ports, tags, OSINT results, honeypot activity
+- **Keyboard shortcuts**: 1-0 for tabs, `/` to focus command bar, ESC to dismiss
+
+### Security
+
+- Token auth required (auto-generated or `--token <val>` or env var `NETWATCH_TOKEN`)
+- Fernet-encrypted session cookies, key persisted at `~/.config/netwatch/web.key`
+- Private network access only (127/10/192.168/100.64)
+- CSRF origin validation on all POST endpoints
+- Destructive commands disabled via web
+- SSRF protection on outbound OSINT (fails closed, private IP rejection)
+- Rate limiting: 20 cmd/min, 3 expensive/min per IP
+- CIDR max /20 on web scan commands
+- Nmap target validation at function entry (regex + flag allowlist)
+
+## Commands
+
+### OSINT (16 tools)
+
+| Command | Description |
+|---------|-------------|
+| `geo <ip>` | IP geolocation |
+| `whois <ip/domain>` | WHOIS lookup |
+| `dnsinfo <domain>` | DNS enumeration (A/AAAA/MX/NS/TXT/SOA/CNAME/SRV) |
+| `rdns <ip>` | Reverse DNS |
+| `ssl <host> [port]` | TLS certificate inspection |
+| `secheaders <url>` | Security header audit + grade |
+| `techstack <url>` | Web technology fingerprinting |
+| `ping <ip> [count]` | Jitter analysis + TTL OS guess |
+| `health <target>` | Full profile (ping + SSL + headers + tech + geo + DNS) |
+| `etrace <target>` | Enriched traceroute with per-hop GeoIP |
+| `portscan <ip>` | Socket-based top 1000 port scan |
+| `subnet [cidr]` | Threaded ping sweep |
+| `crt <domain>` | Certificate transparency search |
+| `headers <url>` | HTTP response headers |
+| `asn <ip>` | ASN/BGP info |
+| `abuse <ip>` | IP reputation check |
+| `speed` | Network speed test (download/upload/ping) |
+| `ifinfo` | Local interface info + routing table |
+
+### Scanning
+
+| Command | Description |
+|---------|-------------|
+| `scan <ip> [preset]` | Nmap scan (quick/syn/udp/ping/full) |
+| `deep <ip>` | All ports + vuln scripts |
+| `stealth <ip>` | SYN scan through Tor |
+| `recon <ip>` | Full OSINT profile |
+| `fullrecon <ip>` | 7-phase recon chain |
+| `sweep [cidr]` | ARP + ping + port scan |
+| `banner <ip> <port>` | Service banner grab |
+| `trace <ip>` | Traceroute |
+
+### Tracking & Capture
+
+| Command | Description |
+|---------|-------------|
+| `track <ip> [secs]` | Live packet tail (tshark) |
+| `conns <ip>` | TCP conversation capture |
+| `sniff <ip> [secs]` | Raw payload capture |
+| `trackdns <ip>` | DNS query capture |
+| `pcap start/stop` | PCAP recording |
+
+### Defense
+
+| Command | Description |
+|---------|-------------|
+| `block <ip>` | iptables DROP |
+| `unblock <ip>` | Remove block |
+| `blockall attackers` | Block all honeypot IPs |
+| `diffarp` | ARP table change detection |
+
+### Smart Filters
+
+| Command | Description |
+|---------|-------------|
+| `top [n]` | Top N talkers |
+| `sus` | Suspicious hosts (threat > 0) |
+| `new [mins]` | Recently appeared |
+| `loud` | Most ports touched |
+| `find <pattern>` | Search all data |
+| `ports <port>` | Hosts using port |
+| `country <CC>` | Filter by country |
+
+### Batch Operations
+
+```
+scanall [list]     reconall [list]     geoall [list]     whoisall [list]
+```
+
+Lists: `hosts` · `attackers` · `arp` · `nmap` · `watchlist` · `tracked` · `blocked`
+
+Use `@N` to reference IPs by index: `scan @3` scans the 3rd IP in the current list.
+
+### Proxy / Tor
+
+```
+proxy add socks5 127.0.0.1:9050    proxy list
+proxy test                         proxy rotate
+proxy start                        proxy stop
+```
+
+### Mesh Radio
+
+```
+mesh send <text>     mesh status     mesh nodes     mesh alert on/off
+```
+
+## Honeypots
+
+| Service | Port | Captures |
+|---------|------|----------|
+| **HTTP NVR Panel** | 8080 | Credentials, session tokens, API probes |
+| **Telnet DVR** | 2323 | Login attempts, shell commands, malware downloads |
+| **FTP Bait Server** | 2121 | Credentials, keystroke logs, file uploads (max 10MB) |
+| **RTSP Camera** | 8554 | Auth probes, stream requests |
+
+All events logged to JSON with ANSI-stripped, sanitized data. Connection limits per service (50 max). FTP has path traversal protection and filename sanitization.
+
+## GraphQL API
+
+Available at `:9090/graphql` when `graphene` is installed.
+
+```graphql
+{ hosts(minThreat: 10, limit: 20) { ip hostname threatScore tags } }
+{ honeypotEvents(service: "telnet") { time ip summary } }
+mutation { runCommand(cmd: "geo 8.8.8.8") { output } }
+```
+
+## Testing
+
+```bash
+python3 -m pytest tests/ -q
+```
+
+## Security Model
+
+- All subprocess calls use argument lists, never `shell=True`
+- Nmap target regex validation at function entry + flag allowlist
+- ANSI escape stripping on all logged data (log injection prevention)
+- FTP upload path traversal blocked via `os.path.realpath` checks
+- FTP data connection synchronized with `threading.Event`
+- Session stores bounded with TTL eviction
+- Log rotation at 50MB
+- SSRF protection: private IP rejection on outbound OSINT, fails closed on DNS errors
+- PTR records never trusted for security decisions
+- Flask secret keys randomized per startup
+- Fernet-encrypted web cookies — no plaintext fallback
+- Thread-safe rendering with RLock synchronization
+- GraphQL query complexity limited (depth 7, aliases 10, length 4000)
+- Web API rate limiting: 20 cmd/min, 3 expensive/min per IP
+- CIDR max /20 on web scan commands
+
+## Requirements
+
+| Component | Details |
+|-----------|---------|
+| **OS** | Linux (Debian, Ubuntu, Raspbian, Parrot, Kali) |
+| **Python** | 3.9+ |
+| **Root** | Required (raw sockets, iptables, port binding) |
+| **System** | nmap, tshark, tcpdump, traceroute |
+| **Python** | flask, requests, python-whois, dnspython, markupsafe, cryptography |
+| **Optional** | graphene, flask-graphql, meshtastic, speedtest-cli |
+
+Tested on Raspberry Pi 5 and Parrot OS.
+
+## Deploy
+
+```bash
+git clone https://github.com/<you>/netwatch.git && cd netwatch
+sudo apt install nmap tshark tcpdump traceroute
+pip3 install -r requirements.txt
+
+# System-wide install
+sudo ln -s $(pwd)/netwatch-start.sh /usr/local/bin/netwatch
+
+# Start on boot (optional)
+sudo cp netwatch.service /etc/systemd/system/
+sudo systemctl enable --now netwatch
+```
+
+## Headless Mode
+
+No TTY detected (SSH pipe, systemd, Docker) = headless mode. Web dashboard only on `:9090`. All honeypots and traffic monitoring still active.
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE)

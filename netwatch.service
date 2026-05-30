@@ -1,0 +1,15 @@
+[Unit]
+Description=NetWatch Network Security Dashboard
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/netwatch/netwatch.py wlan0
+WorkingDirectory=/opt/netwatch
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

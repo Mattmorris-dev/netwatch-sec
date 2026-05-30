@@ -1,0 +1,31 @@
+# ── Python deps (required) ────────────────────────────────────────────────────
+flask>=2.3.0
+markupsafe>=2.1.0
+requests>=2.28.0
+python-whois>=0.8.0
+dnspython>=2.3.0
+cryptography>=42.0.0
+
+# ── Python deps (optional features) ───────────────────────────────────────────
+# Uncomment to enable:
+# graphene>=3.1.0          # GraphQL API at :9090/graphql
+# flask-graphql>=2.0.0     # GraphQL view integration
+# meshtastic>=2.0.0        # LoRa mesh radio alerts
+# speedtest-cli>=2.1.3     # `speed` command (also installable via apt)
+
+# ── System binaries required (install via apt, not pip) ───────────────────────
+# sudo apt install -y nmap tshark tcpdump traceroute iproute2 iptables \
+#                     openssl curl dnsutils whois fuser psmisc arp-scan tor \
+#                     proxychains4
+#
+# Notes:
+#   - nmap, tshark, tcpdump, traceroute   → scanning, sniffing, recon
+#   - iproute2 (ip), iptables, fuser      → defense / port mgmt
+#   - openssl, curl, dnsutils (host/dig)  → OSINT
+#   - whois                               → WHOIS lookups
+#   - arp-scan                            → device discovery
+#   - tor + proxychains4                  → stealth scan mode
+#   - psmisc                              → fuser, pkill
+#
+# Optional:
+#   sudo apt install -y speedtest-cli     # `speed` command

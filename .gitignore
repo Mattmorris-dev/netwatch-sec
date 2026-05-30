@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Logs and captures
+logs/
+*.pcap
+*.log
+
+# Runtime
+ftp_root/
+ftp_uploads/
+
+# Environment
+.env
+*.pem
+*.key
+
+# Claude / agent state (may contain tokens, transcripts)
+.claude/
+agent-memory/
+
+# IDE
+.vscode/
+.idea/
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
