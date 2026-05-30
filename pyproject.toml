@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netwatch-sec"
+version = "1.1.0"
+description = "All-in-one network security dashboard: honeypots, traffic capture, OSINT, scanning, mesh alerts."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "mrrobot", email = "matthewjmorris1993@gmail.com" }
+]
+keywords = [
+    "network-security", "honeypot", "osint", "nmap", "tshark",
+    "cybersecurity", "intrusion-detection", "raspberry-pi"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: System :: Networking :: Monitoring",
+]
+dependencies = [
+    "flask>=2.3.0",
+    "markupsafe>=2.1.0",
+    "requests>=2.28.0",
+    "python-whois>=0.8.0",
+    "dnspython>=2.3.0",
+    "cryptography>=42.0.0",
+]
+
+[project.optional-dependencies]
+graphql = ["graphene>=3.1.0", "flask-graphql>=2.0.0"]
+mesh = ["meshtastic>=2.0.0"]
+speed = ["speedtest-cli>=2.1.3"]
+all = [
+    "graphene>=3.1.0",
+    "flask-graphql>=2.0.0",
+    "meshtastic>=2.0.0",
+    "speedtest-cli>=2.1.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/mattymomo1993/netwatch"
+Repository = "https://github.com/mattymomo1993/netwatch"
+Issues = "https://github.com/mattymomo1993/netwatch/issues"
+
+[project.scripts]
+netwatch = "netwatch:main"
+
+[tool.setuptools]
+py-modules = ["netwatch"]
+
+[tool.setuptools.packages.find]
+exclude = ["tests*", "docs*", "logs*", "ftp_root*", ".claude*"]
