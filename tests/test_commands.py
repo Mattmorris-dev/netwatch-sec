@@ -260,6 +260,7 @@ class TestProfileCommand:
 # ═══════════════════════════════════════��═══════════════════
 
 class TestBlockCommands:
+    @patch("netwatch.HAS_RAW_NET", True)
     @patch("netwatch.subprocess.run")
     def test_block_valid_ip(self, mock_run):
         netwatch.handle_command("block 203.0.113.1")

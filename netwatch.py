@@ -91,6 +91,16 @@ total_packets = 0
 total_bytes = 0
 start_time = time.time()
 
+# Environment detection — Termux (Android) cannot use raw sockets or iptables
+# without root. Run in "passive" mode: honeypots + OSINT + web only.
+IS_TERMUX = bool(os.environ.get("TERMUX_VERSION") or
+                 os.environ.get("PREFIX", "").startswith("/data/data/com.termux"))
+try:
+    IS_ROOT = (os.geteuid() == 0)
+except AttributeError:
+    IS_ROOT = False
+HAS_RAW_NET = IS_ROOT and not IS_TERMUX  # raw sockets, tcpdump, tshark, iptables
+
 MAX_ALERTS = 500
 MAX_HOSTS = 2000
 MAX_DNS_CACHE = 1000
@@ -189,7 +199,7 @@ def resolve_host(ip):
     return name
 
 KNOWN_INFRA = ("cloudfront", "google", "amazon", "aws", "telegram",
-               "anthropic", "microsoft", "apple", "akamai", "fastly",
+               "microsoft", "apple", "akamai", "fastly",
                "cloudflare", "github", "facebook", "meta", "netflix")
 
 def enrich_host(ip):
@@ -212,8 +222,6 @@ def enrich_host(ip):
         h["tags"].add("AWS")
     elif "telegram" in hostname:
         h["tags"].add("Telegram")
-    elif "anthropic" in hostname:
-        h["tags"].add("Claude")
 
     # NOTE: is_known is based on reverse DNS which is attacker-controllable.
     # We still tag for DISPLAY, but NEVER skip threat scoring based on PTR alone.
@@ -2382,6 +2390,7 @@ _CMD_HISTORY_MAX = 5000
 _cmd_history = deque(maxlen=_CMD_HISTORY_MAX)
 _output_scroll = 0
 _OUTPUT_PANEL_MIN = 6
+_tunnel_url = ""  # populated when cloudflared trycloudflare URL is captured
 
 # ─── Screen State (AppState dataclass) ───────────────────
 #
@@ -2390,12 +2399,28 @@ _OUTPUT_PANEL_MIN = 6
 # Switching = dispatch in _render_frame(); per-screen state (tab, scroll,
 # focus, help overlay) persists in AppState so returning to dashboard
 # restores exact prior state. F1/F2/F3 or commands `dashboard`/`cli`/`console`.
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 SCREEN_DASHBOARD = "dashboard"
 SCREEN_CLI = "cli"
 SCREEN_CONSOLE = "console"
 SCREENS = (SCREEN_DASHBOARD, SCREEN_CLI, SCREEN_CONSOLE)
+
+
+def _get_terminal_dims():
+    """Return (cols, rows). Falls back to 80x40 if not a TTY."""
+    try:
+        return os.get_terminal_size()
+    except Exception:
+        return (80, 40)
+
+
+def _write_frame(buf):
+    """Best-effort write to stdout. Swallow OSError (terminal gone)."""
+    try:
+        os.write(1, buf.encode('utf-8', errors='replace') if isinstance(buf, str) else buf)
+    except OSError:
+        pass
 
 
 @dataclass
@@ -2407,21 +2432,22 @@ class AppState:
     """
     current_screen: str = SCREEN_DASHBOARD
     current_tab: str = "all"
-    show_help_overlay: bool = False
     dash_scroll: int = 0       # OUTPUT-panel scroll within dashboard
     cli_scroll: int = 0        # scrollback offset for CLI screen
     console_scroll: int = 0    # scrollback offset for console screen
     # Per-screen "focus" / cursor row hints — for restore on return.
     dash_focus: int = 0
     last_screen: str = SCREEN_DASHBOARD  # toggle-back target
+    needs_clear: bool = False  # one-shot \033[2J before next paint
 
     def switch(self, target: str) -> None:
         if target not in SCREENS or target == self.current_screen:
             return
         self.last_screen = self.current_screen
         self.current_screen = target
+        self.needs_clear = True
 
-    def scroll_for(self, screen: str | None = None) -> int:
+    def scroll_for(self, screen: str = "") -> int:
         s = screen or self.current_screen
         return {SCREEN_DASHBOARD: self.dash_scroll,
                 SCREEN_CLI: self.cli_scroll,
@@ -2509,13 +2535,16 @@ _HELP_SECTIONS = [
     ("System", None, [
         ("status", "Service info"), ("dashboard / d", "Return to TUI"),
         ("clear", "Clear screen"), ("help", "This reference"),
+        ("rotate-key", "New Fernet key (invalidate sessions)"),
+        ("rotate-token", "New web auth token"),
     ]),
 ]
 
 
 def _help_to_console():
-    global show_help_overlay
+    global show_help_overlay, _output_scroll
     show_help_overlay = True
+    _output_scroll = 10**9  # clamps to max_scroll → render from top
     add_console(f"NETWATCH v{VERSION} — COMMAND REFERENCE")
     add_console(f"{'='*56}")
     for cat, subtitle, cmds in _HELP_SECTIONS:
@@ -2749,8 +2778,37 @@ def handle_command(cmd):
         _help_to_console()
     elif action == "status":
         _disp_summary(parts)
+    elif action in ("rotate-key", "rotatekey"):
+        _disp_rotate_key()
+    elif action in ("rotate-token", "rotatetoken"):
+        _disp_rotate_token()
     else:
         add_console(f"{RED}Unknown: '{action}'. Type 'help' for commands.{RESET}")
+
+
+def _disp_rotate_key():
+    """Generate fresh Fernet key. All web sessions invalidated."""
+    global WEB_ENCRYPTION_KEY, _fernet
+    try:
+        new_key = rotate_key()
+        WEB_ENCRYPTION_KEY = new_key
+        _fernet = _Fernet(new_key)
+        add_console(f"{GREEN}Web encryption key rotated — all sessions invalidated.{RESET}")
+    except Exception as e:
+        add_console(f"{RED}Key rotation failed: {_safe_error(e)}{RESET}")
+
+
+def _disp_rotate_token():
+    """Generate fresh WEB_TOKEN and persist. All web sessions invalidated."""
+    global WEB_TOKEN
+    try:
+        new_token = secrets.token_hex(24)
+        WEB_TOKEN = new_token
+        _persist_web_token(new_token, _TOKEN_PATH)
+        redacted = f"{new_token[:6]}…{new_token[-4:]}"
+        add_console(f"{GREEN}Web token rotated: {redacted}  (full token in {_TOKEN_PATH}){RESET}")
+    except Exception as e:
+        add_console(f"{RED}Token rotation failed: {_safe_error(e)}{RESET}")
 
 # ─── OSINT command-handler helpers ───────────────────────
 # Most _cmd_* handlers follow the same shape: call OSINT fn → check error →
@@ -3109,6 +3167,9 @@ def _disp_profile(parts):
 
 def _iptables_rule(action: str, ip: str) -> None:
     """action ∈ {'-A', '-D'} — add or delete DROP for src/dst."""
+    if not HAS_RAW_NET:
+        add_console(f"{YELLOW}iptables unavailable (Termux or non-root){RESET}")
+        return
     for chain, flag in (("INPUT", "-s"), ("OUTPUT", "-d")):
         subprocess.run(["iptables", action, chain, flag, ip, "-j", "DROP"], capture_output=True)
 
@@ -4353,6 +4414,9 @@ def _build_frame(cols=80, max_content=35, active_tab=None):
 
     # Content based on active tab
     if tab == "all":
+        if _tunnel_url:
+            lines.append(f"  {GREEN}Tunnel:{RESET} {_tunnel_url}")
+            lines.append("")
         lines.extend(_section_hosts(8))
         lines.append("")
         p = _section_protocols(6)
@@ -4438,10 +4502,7 @@ def _section_mesh(limit=20):
 
 def _paint_dashboard():
     global _output_scroll
-    try:
-        cols, rows = os.get_terminal_size()
-    except Exception:
-        cols, rows = 80, 40
+    cols, rows = _get_terminal_dims()
 
     # Fixed layout: row 1..top_end = dashboard, divider, output panel, separator, prompt
     output_panel = max(_OUTPUT_PANEL_MIN, (rows - 9) // 2)
@@ -4451,14 +4512,14 @@ def _paint_dashboard():
 
     if show_help_overlay:
         # Use full screen for help (rows - 2: leave room for separator + prompt).
-        # Scrollable via PgUp/PgDn through _output_scroll.
+        # Scroll semantics for help: scroll=0 → top, scroll=max_scroll → bottom.
         help_rows = max(8, rows - 2)
         all_help = _build_help_overlay(cols, rows)
         total_help = len(all_help)
         max_scroll = max(0, total_help - help_rows)
         scroll = min(_output_scroll, max_scroll)
-        end_idx = total_help - scroll
-        start_idx = max(0, end_idx - help_rows)
+        start_idx = scroll
+        end_idx = min(total_help, start_idx + help_rows)
         top_lines = all_help[start_idx:end_idx]
         if total_help > help_rows:
             top_lines = top_lines + [f"  {DIM}── {start_idx+1}-{end_idx}/{total_help}  PgUp/PgDn scroll · ESC close{RESET}"]
@@ -4509,19 +4570,13 @@ def _paint_dashboard():
     buf += f"{BOLD}{RED}nw>{RESET} \033[K"
     buf += "\033[?25h"
 
-    try:
-        os.write(1, buf.encode('utf-8', errors='replace'))
-    except OSError:
-        pass
+    _write_frame(buf)
 
 
 def _paint_cli():
     """Full-screen Command Line: history + interleaved output, prompt at bottom.
     State (cli_scroll) persists in app_state; returning to dashboard restores it."""
-    try:
-        cols, rows = os.get_terminal_size()
-    except Exception:
-        cols, rows = 80, 40
+    cols, rows = _get_terminal_dims()
     with lock:
         out_snap = list(console_output)
         hist_snap = list(_cmd_history)
@@ -4545,18 +4600,12 @@ def _paint_cli():
     buf += f"{DIM}{'─'*3} {BOLD}{WHITE}CLI{RESET}{DIM}{info}{'─'*max(1, cols-12-len(info))}{RESET}\033[K\n"
     buf += f"{BOLD}{RED}nw>{RESET} \033[K"
     buf += "\033[?25h"
-    try:
-        os.write(1, buf.encode('utf-8', errors='replace'))
-    except OSError:
-        pass
+    _write_frame(buf)
 
 
 def _paint_console():
     """Full-screen Console: tool output log only, scrollable, read-only."""
-    try:
-        cols, rows = os.get_terminal_size()
-    except Exception:
-        cols, rows = 80, 40
+    cols, rows = _get_terminal_dims()
     with lock:
         snap = list(console_output)
     body_rows = max(3, rows - 3)
@@ -4576,10 +4625,7 @@ def _paint_console():
         buf += "\033[K\n"
     info = f" {start+1}-{end}/{len(snap)} " if snap else " (empty) "
     buf += f"{DIM}{'─'*3} {BOLD}{WHITE}LOG{RESET}{DIM}{info}{'─'*max(1, cols-12-len(info))}{RESET}\033[K"
-    try:
-        os.write(1, buf.encode('utf-8', errors='replace'))
-    except OSError:
-        pass
+    _write_frame(buf)
 
 
 def _render_frame():
@@ -4591,6 +4637,12 @@ def _render_frame():
     try:
         if console_mode or _input_active:
             return
+        if app_state.needs_clear:
+            try:
+                os.write(1, b"\033[2J\033[H")
+            except OSError:
+                pass
+            app_state.needs_clear = False
         screen = app_state.current_screen
         if screen == SCREEN_CLI:
             _paint_cli()
@@ -4604,10 +4656,7 @@ def _render_frame():
 
 def draw_dashboard():
     enrich_counter = 0
-    try:
-        os.write(1, b"\033[2J\033[H")
-    except OSError:
-        pass
+    _write_frame(b"\033[2J\033[H")
 
     while True:
       try:
@@ -4688,6 +4737,26 @@ from cryptography.fernet import Fernet as _Fernet, InvalidToken as _InvalidToken
 # reads existing or seeds new. Survives restarts so sessions don't die on reboot.
 _KEY_DIR = os.path.join(os.path.expanduser("~"), ".config", "netwatch")
 _KEY_PATH = os.path.join(_KEY_DIR, "web.key")
+_TOKEN_PATH = os.path.join(_KEY_DIR, "token")
+
+def _persist_web_token(token: str, path: str = _TOKEN_PATH) -> None:
+    """Write token to disk with 0600 perms. Idempotent — overwrites on rotation."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            os.chmod(os.path.dirname(path), 0o700)
+        except OSError:
+            pass
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(token + "\n")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 def load_or_create_key(path=_KEY_PATH):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -6233,9 +6302,12 @@ def save_logs():
 
 def main():
     global IFACE
-    if os.geteuid() != 0:
-        print(f"{RED}[!] Run as root: sudo python3 netwatch.py [interface]{RESET}")
-        sys.exit(1)
+    if not HAS_RAW_NET:
+        if IS_TERMUX:
+            print(f"{YELLOW}[!] Termux detected — running passive mode (honeypots + OSINT + web only).{RESET}")
+            print(f"{DIM}    Disabled: packet sniff, tshark, tcpdump, iptables (require root).{RESET}")
+        elif not IS_ROOT:
+            print(f"{YELLOW}[!] Not root — running passive mode. Use sudo for full capture features.{RESET}")
     if not re.match(r'^[a-zA-Z0-9_\-]+$', IFACE):
         print(f"{RED}[!] Invalid interface: {IFACE}{RESET}")
         sys.exit(1)
@@ -6318,13 +6390,15 @@ def main():
     threading.Thread(target=telnet_honeypot, args=(2323,), daemon=True).start()
     threading.Thread(target=rtsp_honeypot, args=(8554,), daemon=True).start()
     threading.Thread(target=ftp_honeypot, args=(2121,), daemon=True).start()
-    threading.Thread(target=traffic_monitor, daemon=True).start()
-    threading.Thread(target=tshark_monitor, daemon=True).start()
-    threading.Thread(target=arp_monitor, daemon=True).start()
+    if HAS_RAW_NET:
+        threading.Thread(target=traffic_monitor, daemon=True).start()
+        threading.Thread(target=tshark_monitor, daemon=True).start()
+        threading.Thread(target=arp_monitor, daemon=True).start()
     threading.Thread(target=draw_dashboard, daemon=True).start()
 
-    # Start packet capture
-    start_tcpdump()
+    # Start packet capture (skipped without raw-net privileges)
+    if HAS_RAW_NET:
+        start_tcpdump()
 
     # Auto-scan local subnet on startup
     time.sleep(5)
@@ -6341,7 +6415,9 @@ def main():
     web_thread = threading.Thread(target=start_web_dashboard, daemon=True)
     web_thread.start()
     print(f"  {GREEN}Web Dashboard   : http://0.0.0.0:{WEB_PORT}{RESET}")
-    print(f"  {YELLOW}Web Token       : {WEB_TOKEN}{RESET}")
+    _persist_web_token(WEB_TOKEN)
+    _redacted = f"{WEB_TOKEN[:6]}…{WEB_TOKEN[-4:]}" if len(WEB_TOKEN) >= 12 else "(short)"
+    print(f"  {YELLOW}Web Token       : {_redacted}  (full token in {_TOKEN_PATH}, 0600){RESET}")
 
     # Time-series sampling for charts
     threading.Thread(target=_sample_timeseries, daemon=True).start()
@@ -6368,11 +6444,13 @@ def main():
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
             )
             def _parse_tunnel():
+                global _tunnel_url
                 for line in _cf_proc.stdout:
                     if "trycloudflare.com" in line:
                         m = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', line)
                         if m:
                             url = m.group(0)
+                            _tunnel_url = url
                             print(f"  {GREEN}Remote Access   : {url}{RESET}")
                             with lock:
                                 alerts.append({"time": datetime.now().strftime("%H:%M:%S"),
@@ -6566,7 +6644,6 @@ def main():
                 current_tab = TABS[9]
                 app_state.current_tab = current_tab
                 show_help_overlay = False
-                app_state.show_help_overlay = False
                 if app_state.current_screen != SCREEN_DASHBOARD:
                     app_state.switch(SCREEN_DASHBOARD)
                 _redraw_event.set()
@@ -6575,7 +6652,6 @@ def main():
                 current_tab = TABS[int(key) - 1]
                 app_state.current_tab = current_tab
                 show_help_overlay = False
-                app_state.show_help_overlay = False
                 if app_state.current_screen != SCREEN_DASHBOARD:
                     app_state.switch(SCREEN_DASHBOARD)
                 _redraw_event.set()
@@ -6596,6 +6672,7 @@ def main():
 
                 if action == "help":
                     show_help_overlay = True
+                    _output_scroll = 10**9  # clamp to max_scroll → render from top
                     _redraw_event.set()
                     continue
 

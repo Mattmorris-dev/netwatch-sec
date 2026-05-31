@@ -702,6 +702,7 @@ class TestDefenseBlock:
         netwatch.handle_command("block 203.0.113.1")
         assert any("BLOCKED" in c for c in netwatch.console_output)
 
+    @patch("netwatch.HAS_RAW_NET", True)
     @patch("netwatch.subprocess.run")
     def test_block_calls_iptables_twice(self, mock_run):
         netwatch.handle_command("block 203.0.113.2")
@@ -751,6 +752,7 @@ class TestDefenseUnblock:
         netwatch.handle_command("unblock 203.0.113.1")
         assert any("UNBLOCKED" in c for c in netwatch.console_output)
 
+    @patch("netwatch.HAS_RAW_NET", True)
     @patch("netwatch.subprocess.run")
     def test_unblock_calls_iptables_twice(self, mock_run):
         netwatch.handle_command("unblock 203.0.113.1")

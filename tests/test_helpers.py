@@ -341,12 +341,6 @@ class TestEnrichHost:
         netwatch.enrich_host("5.5.5.5")
         assert "Telegram" in netwatch.hosts["5.5.5.5"]["tags"]
 
-    @patch("netwatch.resolve_host", return_value="api.anthropic.com")
-    def test_tags_claude(self, mock_resolve):
-        netwatch.hosts["6.6.6.6"]["ports"] = set()
-        netwatch.enrich_host("6.6.6.6")
-        assert "Claude" in netwatch.hosts["6.6.6.6"]["tags"]
-
     @patch("netwatch.resolve_host", return_value="")
     def test_remote_access_tag(self, mock_resolve):
         ip = "203.0.113.60"
