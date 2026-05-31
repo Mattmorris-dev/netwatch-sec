@@ -42,9 +42,14 @@ class TestAppStateDataclass:
         assert s.cli_scroll == 0
         assert s.console_scroll == 0
 
-    def test_help_overlay_default_off(self):
+    def test_needs_clear_default_off(self):
         s = AppState()
-        assert s.show_help_overlay is False
+        assert s.needs_clear is False
+
+    def test_switch_sets_needs_clear(self):
+        s = AppState()
+        s.switch(SCREEN_CLI)
+        assert s.needs_clear is True
 
     def test_screens_constant(self):
         assert SCREENS == (SCREEN_DASHBOARD, SCREEN_CLI, SCREEN_CONSOLE)

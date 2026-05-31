@@ -12,7 +12,7 @@
 [![Parrot OS](https://img.shields.io/badge/Parrot%20OS-15CDCA?logo=parrotsecurity&logoColor=white)](https://www.parrotsec.org/)
 [![Kali](https://img.shields.io/badge/Kali-557C94?logo=kalilinux&logoColor=white)](https://www.kali.org/)
 [![Platform: Debian](https://img.shields.io/badge/platform-debian-A81D33?logo=debian&logoColor=white)](https://www.debian.org/)
-[![Tests](https://img.shields.io/badge/tests-1696-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-1900-brightgreen.svg)](tests/)
 [![Status: Active](https://img.shields.io/badge/status-active-brightgreen.svg)]()
 
 **All-in-one network security dashboard** — deploy honeypots, capture traffic, run OSINT, scan targets, block threats, and forward alerts over mesh radio. One command, one file, real-time.
@@ -111,15 +111,48 @@ sudo -E netwatch --fixed-token
 sudo netwatch eth0
 ```
 
-Token is printed on every launch. Use it to log into the web dashboard at `http://<your-ip>:9090`.
+On launch a redacted token preview is printed (`ABCDEF…WXYZ`) and the full token is written to `~/.config/netwatch/token` (mode 0600). Use it to log into the web dashboard at `http://<your-ip>:9090`.
 
 Both TUI and web UI launch together — one command runs everything.
 
+### Key & token rotation
+
+From the TUI prompt:
+
+| Command | Effect |
+|---------|--------|
+| `rotate-key` | Generate a new Fernet key — invalidates all active web sessions. Persisted to `~/.config/netwatch/web.key`. |
+| `rotate-token` | Generate a new auth token — invalidates all sessions. Re-written to `~/.config/netwatch/token` (0600). |
+
 ## Remote Access
 
+When `cloudflared` is available, NetWatch starts a quick tunnel automatically at launch. The public `*.trycloudflare.com` URL is printed at startup and pinned to the top of the **all** tab on the dashboard so you can copy it without scrolling through alerts.
+
 ```bash
-# Cloudflare quick tunnel (no account needed)
+# Manual fallback if cloudflared isn't on $PATH
 cloudflared tunnel --url http://localhost:9090
+```
+
+## Termux / non-root (passive mode)
+
+NetWatch runs on Termux (Android) and any non-root environment in **passive mode** — honeypots, OSINT, web dashboard, and nmap connect-scan still work. Features that need raw sockets or kernel access are auto-disabled:
+
+| Feature | Root | Termux / non-root |
+|---------|------|-------------------|
+| Honeypots (HTTP/Telnet/FTP/RTSP) | ✓ | ✓ |
+| Web dashboard + OSINT | ✓ | ✓ |
+| nmap (connect / `-sV`) | ✓ | ✓ |
+| Raw-socket sniffer / `traffic` | ✓ | — |
+| `tshark` / `tcpdump` capture | ✓ | — |
+| ARP monitor | ✓ | — |
+| `block` / `unblock` (iptables) | ✓ | — |
+| nmap SYN scan (`-sS`) | ✓ | — |
+
+```bash
+# Termux quick start
+pkg install python nmap whois tor
+pip install netwatch-sec
+netwatch                    # passive mode — no sudo needed
 ```
 
 ## Terminal UI
@@ -211,6 +244,8 @@ Browser UI on `:9090` with live SSE updates, 5 themes, and CRT scanline effects.
 
 ### Tracking & Capture
 
+Requires root. Disabled automatically in passive mode.
+
 | Command | Description |
 |---------|-------------|
 | `track <ip> [secs]` | Live packet tail (tshark) |
@@ -223,10 +258,21 @@ Browser UI on `:9090` with live SSE updates, 5 themes, and CRT scanline effects.
 
 | Command | Description |
 |---------|-------------|
-| `block <ip>` | iptables DROP |
-| `unblock <ip>` | Remove block |
-| `blockall attackers` | Block all honeypot IPs |
+| `block <ip>` | iptables DROP (root only) |
+| `unblock <ip>` | Remove block (root only) |
+| `blockall attackers` | Block all honeypot IPs (root only) |
 | `diffarp` | ARP table change detection |
+
+### System
+
+| Command | Description |
+|---------|-------------|
+| `status` | Service info + uptime |
+| `dashboard` / `d` | Return to dashboard screen |
+| `clear` | Wipe console buffer |
+| `help` | Show full reference overlay |
+| `rotate-key` | New Fernet key (invalidates web sessions) |
+| `rotate-token` | New web auth token (invalidates sessions) |
 
 ### Smart Filters
 
@@ -289,6 +335,13 @@ mutation { runCommand(cmd: "geo 8.8.8.8") { output } }
 
 ```bash
 python3 -m pytest tests/ -q
+# 1900 tests, ~30s on a Pi 5
+```
+
+Lint (CI threshold `--fail-under=9.0`):
+
+```bash
+pylint $(git ls-files '*.py') --fail-under=9.0
 ```
 
 ## Security Model
@@ -313,14 +366,14 @@ python3 -m pytest tests/ -q
 
 | Component | Details |
 |-----------|---------|
-| **OS** | Linux (Debian, Ubuntu, Raspbian, Parrot, Kali) |
+| **OS** | Linux (Debian, Ubuntu, Raspbian, Parrot, Kali) — also runs on Termux (Android) in passive mode |
 | **Python** | 3.9+ |
-| **Root** | Required (raw sockets, iptables, port binding) |
+| **Root** | Recommended (raw sockets, iptables, sub-1024 binding). Non-root and Termux run in passive mode (honeypots, OSINT, web, nmap connect-scan). |
 | **System** | nmap, tshark, tcpdump, traceroute |
 | **Python** | flask, requests, python-whois, dnspython, markupsafe, cryptography |
 | **Optional** | graphene, flask-graphql, meshtastic, speedtest-cli |
 
-Tested on Raspberry Pi 5 and Parrot OS.
+Tested on Raspberry Pi 5, Parrot OS, and Termux (Android, passive mode).
 
 ## Deploy
 

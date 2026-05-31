@@ -804,9 +804,10 @@ class TestCommandRouting:
 
     def test_block_command_calls_iptables(self):
         """'block 1.2.3.4' calls iptables."""
-        with patch("netwatch.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            netwatch.handle_command("block 1.2.3.4")
+        with patch.object(netwatch, "HAS_RAW_NET", True):
+            with patch("netwatch.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0)
+                netwatch.handle_command("block 1.2.3.4")
         assert mock_run.call_count == 2  # INPUT + OUTPUT
 
     def test_block_invalid_ip_rejects(self):

@@ -404,6 +404,7 @@ class TestBatchOps:
         output = "\n".join(netwatch.console_output)
         assert "Safety" in output or "safety" in output.lower()
 
+    @patch("netwatch.HAS_RAW_NET", True)
     @patch("netwatch.subprocess.run")
     def test_blockall_attackers(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
