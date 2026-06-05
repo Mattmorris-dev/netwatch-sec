@@ -22,16 +22,27 @@ from datetime import datetime, timezone
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(_BASE_DIR, "logs")
 
-# IPv4 dotted, IPv6 colon-hex, plus _HHMMSS suffix from ftp_log.
+# IPv4 dotted, IPv6 colon-hex, plus _HHMMSS suffix from ftp_log,
+# with optional _microseconds appended (FTP per-connect uniqueness).
 # \A / \Z (not ^ / $) — Python's $ allows a trailing newline; we don't.
-SESSION_ID_RE = re.compile(r"\A[0-9a-fA-F.:]+_[0-9]{6}\Z")
+SESSION_ID_RE = re.compile(r"\A[0-9a-fA-F.:]+_[0-9]{6}(?:_[0-9]+)?\Z")
+
+# Strips trailing _HHMMSS (+ optional _microsec) from a session_id to recover the IP.
+_SESSION_TIME_SUFFIX_RE = re.compile(r"_[0-9]{6}(?:_[0-9]+)?\Z")
 
 # Legacy session-log lines pre-dating the JSON ftp_log() schema.
 _LEGACY_LINE_RE = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{3})\]\s+(\w+):\s*(.*)$")
 
 _INDEX_CACHE_TTL = 5.0
-_index_cache = {"at": 0.0, "data": None, "dir": None}
+_index_cache = {"at": 0.0, "data": None, "dir": None, "dir_mtime": 0.0}
 _cache_lock = threading.Lock()
+
+
+def _dir_mtime(path):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0.0
 
 
 def _resolve_log_dir(log_dir):
@@ -122,7 +133,7 @@ def _load_ftp_session(session_id, log_dir):
     path = _session_log_path(session_id, log_dir)
     if not os.path.exists(path):
         raise FileNotFoundError(f"no session log: {path}")
-    ip = session_id.rsplit("_", 1)[0]
+    ip = _SESSION_TIME_SUFFIX_RE.sub("", session_id)
     anchor = _anchor_date_for(path)
     raw = []
     with open(path) as f:
@@ -271,11 +282,14 @@ def replay_index(log_dir=None):
     """
     log_dir = _resolve_log_dir(log_dir)
     now = _time.monotonic()
+    dmtime = _dir_mtime(log_dir)
     with _cache_lock:
         if (_index_cache["dir"] == log_dir
                 and _index_cache["data"] is not None
-                and now - _index_cache["at"] < _INDEX_CACHE_TTL):
-            return _index_cache["data"]
+                and now - _index_cache["at"] < _INDEX_CACHE_TTL
+                and _index_cache["dir_mtime"] == dmtime):
+            # Shallow copy so callers can sort/mutate without corrupting the cache.
+            return list(_index_cache["data"])
 
     out = []
     # FTP — per-session log files on disk
@@ -297,7 +311,7 @@ def replay_index(log_dir=None):
             continue
         out.append({
             "session_id": session_id,
-            "ip": session_id.rsplit("_", 1)[0],
+            "ip": _SESSION_TIME_SUFFIX_RE.sub("", session_id),
             "protocol": "ftp",
             "started_at_mtime": datetime.fromtimestamp(
                 st.st_mtime, tz=timezone.utc).isoformat(),
@@ -317,12 +331,14 @@ def replay_index(log_dir=None):
 
     out.sort(key=lambda r: r["started_at_mtime"], reverse=True)
     with _cache_lock:
-        _index_cache.update({"at": now, "data": out, "dir": log_dir})
-    return out
+        _index_cache.update({"at": now, "data": out, "dir": log_dir, "dir_mtime": dmtime})
+    return list(out)
 
 
 def _intel_path(ip, log_dir):
-    safe = ip.replace(".", "_").replace(":", "_")
+    # Match the writer at netwatch.py:2294 — only "." is flattened.
+    # IPv6 with ":" in the filename works on Linux but is a known v1 gap.
+    safe = ip.replace(".", "_")
     return os.path.join(log_dir, f"recon_{safe}.json")
 
 

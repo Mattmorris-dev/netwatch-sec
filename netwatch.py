@@ -6377,7 +6377,7 @@ def web_replay_api_session(session_id):
     for log_dir in [None] + _replay_extra_dirs():
         try:
             timeline = replay.replay_loader(session_id, protocol=proto, log_dir=log_dir)
-            timeline["intel"] = replay.load_intel(timeline["ip"])
+            timeline["intel"] = replay.load_intel(timeline["ip"], log_dir=log_dir)
             return jsonify(timeline)
         except FileNotFoundError as e:
             last_err = e
