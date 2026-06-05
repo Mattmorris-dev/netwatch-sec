@@ -156,11 +156,83 @@ class TestReplayIndex:
         # A fresh tmp_path => empty list, no crash
         assert replay.replay_index(log_dir=str(tmp_path)) == []
 
-    def test_cache_hit_returns_same_object(self, tmp_path):
+    def test_cache_invalidates_when_new_session_arrives(self, tmp_path):
+        import os as _os
+        # Pin dir mtime to t=1000 so the cache snapshot is deterministic.
+        (tmp_path / "ftp_session_1.1.1.1_120000.log").write_text("x")
+        _os.utime(str(tmp_path), (1000, 1000))
+        first = replay.replay_index(log_dir=str(tmp_path))
+        assert len(first) == 1
+        # New session lands within the 5s TTL — bump dir mtime so cache invalidates.
+        (tmp_path / "ftp_session_2.2.2.2_120000.log").write_text("x")
+        _os.utime(str(tmp_path), (2000, 2000))
+        second = replay.replay_index(log_dir=str(tmp_path))
+        assert len(second) == 2
+
+    def test_cache_hit_returns_independent_copy(self, tmp_path):
         (tmp_path / "ftp_session_192.0.2.4_120000.log").write_text("x")
         a = replay.replay_index(log_dir=str(tmp_path))
         b = replay.replay_index(log_dir=str(tmp_path))
-        assert a is b  # same cached object, no re-walk
+        assert a == b           # cache hit → same content
+        assert a is not b       # but distinct lists — mutating one must not corrupt the other
+        a.clear()
+        c = replay.replay_index(log_dir=str(tmp_path))
+        assert c == b           # cache survived the mutation of `a`
+
+
+# ─────────────────────────────────────────────────────────────
+#  Three-part session_id (ip_HHMMSS_microsec) — added by FTP per-connect uniqueness
+# ─────────────────────────────────────────────────────────────
+
+class TestThreePartSessionId:
+    @pytest.mark.parametrize("sid", [
+        "192.0.2.4_120000_123456",
+        "127.0.0.1_093945_000001",
+        "10.0.0.1_113000_999999",
+        "2001:db8::1_235959_42",
+    ])
+    def test_validate_accepts_three_part(self, sid):
+        replay._validate_session_id(sid)  # no raise
+
+    @pytest.mark.parametrize("sid", [
+        "192.0.2.4_120000_",       # trailing underscore, no microsec
+        "192.0.2.4_120000_abc",    # non-digit microsec
+        "192.0.2.4_12000_123456",  # HHMMSS not 6 digits
+    ])
+    def test_validate_rejects_malformed_three_part(self, sid):
+        with pytest.raises(ValueError):
+            replay._validate_session_id(sid)
+
+    def test_replay_loader_three_part_extracts_ip(self, tmp_path):
+        sid = "192.0.2.4_120000_123456"
+        (tmp_path / f"ftp_session_{sid}.log").write_text(
+            '{"ts": "12:00:00.000", "dir": "SERVER", "data": "220 ready"}\n'
+            '{"ts": "12:00:00.500", "dir": "CLIENT", "data": "USER admin"}\n'
+        )
+        result = replay.replay_loader(sid, log_dir=str(tmp_path))
+        assert result["session_id"] == sid
+        assert result["ip"] == "192.0.2.4"  # microsec stripped, not "192.0.2.4_120000"
+        assert len(result["events"]) == 2
+
+    def test_replay_index_finds_three_part(self, tmp_path):
+        for sid in ("192.0.2.4_120000_111111", "10.0.0.1_113000_222222"):
+            (tmp_path / f"ftp_session_{sid}.log").write_text(
+                '{"ts": "12:00:00.000", "dir": "SERVER", "data": "x"}\n')
+        idx = replay.replay_index(log_dir=str(tmp_path))
+        sids = sorted(r["session_id"] for r in idx)
+        ips = sorted(r["ip"] for r in idx)
+        assert sids == ["10.0.0.1_113000_222222", "192.0.2.4_120000_111111"]
+        assert ips == ["10.0.0.1", "192.0.2.4"]  # IP correctly extracted from 3-part
+
+    def test_two_and_three_part_coexist_in_index(self, tmp_path):
+        (tmp_path / "ftp_session_1.2.3.4_120000.log").write_text(
+            '{"ts": "12:00:00.000", "dir": "SERVER", "data": "x"}\n')
+        (tmp_path / "ftp_session_5.6.7.8_120000_500000.log").write_text(
+            '{"ts": "12:00:00.000", "dir": "SERVER", "data": "x"}\n')
+        idx = replay.replay_index(log_dir=str(tmp_path))
+        by_ip = {r["ip"]: r["session_id"] for r in idx}
+        assert by_ip["1.2.3.4"] == "1.2.3.4_120000"
+        assert by_ip["5.6.7.8"] == "5.6.7.8_120000_500000"
 
 
 # ─────────────────────────────────────────────────────────────
