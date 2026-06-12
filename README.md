@@ -1,4 +1,6 @@
-![NetWatch](docs/banner.png)
+<p align="center">
+  <img src="docs/netwatch-square.png" alt="NetWatch" width="240">
+</p>
 
 # NetWatch
 
@@ -208,7 +210,7 @@ python tools/synth_ftp_session.py 198.51.100.42        # optional — fake an at
 
 Every captured session (FTP, Telnet, HTTP probes) is recorded as a scrubbable timeline. The web player auto-lists sessions; pick one and step through the keystrokes frame by frame. In the TUI, `replay list` shows recent sessions and `replay <idx>` drops into the player.
 
-Player keys: `space` play/pause · `←/→` step · `</>` jump session · `+/-` speed · `Home/End` ends. Full architecture in [`docs/DROP4_TUI_REPLAY_PLAN.md`](docs/DROP4_TUI_REPLAY_PLAN.md).
+Player keys: `space` play/pause · `←/→` step · `</>` jump session · `+/-` speed · `Home/End` ends.
 
 ## Remote Access
 
