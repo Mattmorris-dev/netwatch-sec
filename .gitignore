@@ -55,3 +55,8 @@ pro_beta_snapshots/
 # VPS / deploy notes — environment-specific, do not publish
 docs/VPS_*
 docs/private/
+
+# Roadmap / pricing / internal plans — keep private, do not publish
+docs/ROADMAP.md
+docs/PRICING.md
+docs/DROP4_TUI_REPLAY_PLAN.md
