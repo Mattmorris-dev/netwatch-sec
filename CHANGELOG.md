@@ -2,6 +2,32 @@
 
 All notable changes to NetWatch are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.3.0 — 2026-07-02
+
+### Added
+- **`expose`** — external exposure self-check. Free: public IP + geolocation +
+  quick reachability probe of common ports. Pro runs an external `nmap -sV`
+  service fingerprint with hardening advice.
+- **`alert`** — send honeypot hits to a Discord/Slack/generic webhook
+  (`alert set <url>` / `alert test` / `alert off`). Egress is fail-closed:
+  https-only and routed through the SSRF guard. Throttled per source IP. Pro
+  unlocks multi-channel (Slack/Teams/PagerDuty), email, and SIEM routing.
+- **`netwatch activate <key>` / `netwatch license`** — license activation and
+  tier status. The Free package ships no Pro code; paid tiers unlock only when
+  the signed `netwatch-pro` add-on is installed and a valid license is present.
+- **One-line installer** (`install.sh`) for a low-friction first run.
+
+### Changed
+- Tier gate is now license-based (Free / Pro / Business / Enterprise) with a
+  graceful fall-back to Free when the add-on isn't installed. `NETWATCH_PRO=1`
+  remains a dev/CI override.
+
+### Fixed
+- `pytest` no longer aborts collection on the runtime `logs/` directory
+  (`testpaths`/`norecursedirs` scoped to `tests/`).
+- Packaging excludes `netwatch_pro*` so Pro code can never leak into the Free
+  wheel.
+
 ## 1.2.2 — 2026-06-10
 
 ### Security

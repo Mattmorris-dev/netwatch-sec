@@ -74,6 +74,13 @@ Built for Raspberry Pi, Kali, Parrot OS, and any Debian-based Linux. Runs as a s
 
 ## Install
 
+**One-liner (fastest):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/Mattmorris-dev/netwatch-sec/main/install.sh | bash
+```
+Installs the `netwatch` CLI (via pipx when present), reports any missing capture
+tools, and prints next steps. Runs passively without root.
+
 **Quick install (from PyPI):**
 ```bash
 sudo apt install -y nmap tshark tcpdump traceroute iproute2 iptables \

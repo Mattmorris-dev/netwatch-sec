@@ -71,7 +71,7 @@ for _i, _a in enumerate(sys.argv):
     if _a == "--token" and _i + 1 < len(sys.argv):
         _cli_token = sys.argv[_i + 1]
         break
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 
 # Honeypot listener ports — overridable via env so deployments can move to
 # standard ports (80/23/21/554) without local sed against the repo.
@@ -81,9 +81,54 @@ TELNET_PORT = int(os.environ.get("NETWATCH_TELNET_PORT", "2323"))
 FTP_PORT    = int(os.environ.get("NETWATCH_FTP_PORT",    "2121"))
 RTSP_PORT   = int(os.environ.get("NETWATCH_RTSP_PORT",   "8554"))
 
-# Pro tier gate. Free (off) = basic attacker intel + upsell CTA only.
-# Pro (NETWATCH_PRO=1) = also runs the deep nmap port-scan + fingerprint recon.
-PRO_ENABLED = os.environ.get("NETWATCH_PRO") == "1"
+# ─── Tier gate (Free / Pro / Business / Enterprise) ───────────────────────
+# Free is the default. Paid tiers unlock when a signed license is installed —
+# the paid `netwatch-pro` add-on ships an offline Ed25519 verifier
+# (`netwatch_license`). This FREE package contains NO Pro code; it only
+# *detects* a valid license if the add-on is present and otherwise degrades to
+# Free with an upgrade CTA. NETWATCH_PRO=1 is a dev/CI override that forces Pro.
+_TIER_ORDER = ("community", "pro", "team", "enterprise")
+_TIER_ALIASES = {"free": "community", "business": "team"}  # marketing → internal
+
+# Upgrade CTA. No waitlist — points at pricing + the real activation command.
+PRO_UPGRADE_HINT = "🔒 Pro feature — see PRICING.md · activate: netwatch activate <key>"
+
+
+def _license_tier():
+    """Tier from an installed + valid license, or None. Never raises: if the
+    paid add-on isn't installed the import fails and we stay Free."""
+    try:
+        from netwatch_license import load_license  # ships only with netwatch-pro
+    except Exception:
+        return None
+    try:
+        s = load_license()
+    except Exception:
+        return None
+    if s is None or not getattr(s, "valid", False):
+        return None
+    return _TIER_ALIASES.get(s.tier, s.tier)
+
+
+def current_tier():
+    """Live effective tier. NETWATCH_PRO=1 forces 'pro' (dev override)."""
+    if os.environ.get("NETWATCH_PRO") == "1":
+        return "pro"
+    return _license_tier() or "community"
+
+
+def tier_at_least(name):
+    """True if current tier >= `name` in Free<Pro<Business<Enterprise order."""
+    name = _TIER_ALIASES.get(name, name)
+    try:
+        return _TIER_ORDER.index(current_tier()) >= _TIER_ORDER.index(name)
+    except ValueError:
+        return False
+
+
+# Backward-compat module flag: True when Pro-or-higher is active at startup.
+# The deep-recon gate and existing tests reference this directly (patchable).
+PRO_ENABLED = current_tier() != "community"
 
 # ─── Colors ──────────────────────────────────────────────
 
@@ -353,6 +398,131 @@ def log_event(service, ip, data):
             threading.Thread(target=_cs_defend, args=(service, ip), daemon=True).start()
         except ImportError:
             pass
+
+    # Free-tier alert webhook on high-signal events — throttled + backgrounded,
+    # mirroring the mesh-forward path above.
+    if service in _ALERT_SERVICES:
+        _maybe_notify_attack(service, ip, short)
+
+
+# ─── Free-tier alert webhook (Discord / Slack / generic JSON) ─────────────
+# One outbound webhook the operator configures. Pro unlocks multi-channel
+# (Slack/Teams/PagerDuty), email, and SIEM routing. All egress is fail-closed:
+# https only, and the host is run through the same SSRF guard as recon.
+_ALERT_SERVICES = ("credential", "telnet", "malware_attempt", "ftp_upload")
+_alert_last = {}
+_alert_lock = threading.Lock()
+_ALERT_COOLDOWN = 30.0
+_ALERT_MAX_TRACKED = 4096      # cap _alert_last so an IP-rotating flood can't grow it unbounded
+_ALERT_GLOBAL_MIN = 1.0        # min seconds between ANY two sends (protect the webhook rate limit)
+_alert_last_global = 0.0
+
+
+def _alerts_cfg_path():
+    return os.path.join(os.path.expanduser("~"), ".config", "netwatch", "alerts.json")
+
+
+def _load_alerts_cfg():
+    try:
+        with open(_alerts_cfg_path()) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_alerts_cfg(cfg):
+    p = _alerts_cfg_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True, mode=0o700)
+    # Create 0600 from the start — the file holds the webhook secret (Discord/
+    # Slack URLs embed a token). Never let it exist even briefly at the umask
+    # default, and O_CREAT|O_WRONLY (no follow of a pre-planted symlink target
+    # for writing beyond the 0700 parent) avoids the chmod-after-write window.
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f)
+
+
+def _webhook_kind(url):
+    if "discord.com/api/webhooks" in url or "discordapp.com/api/webhooks" in url:
+        return "discord"
+    if "hooks.slack.com" in url:
+        return "slack"
+    return "generic"
+
+
+def _sanitize_alert_field(s, cap=256):
+    """Neutralize attacker-controlled honeypot input before it reaches an alert
+    channel: collapse control chars (incl. the \\n/\\t the ANSI stripper keeps)
+    so a crafted username can't forge extra alert lines or inject markdown
+    structure, and hard-cap length. Mention pings are killed at the payload
+    level (Discord allowed_mentions / Slack mrkdwn=off)."""
+    s = re.sub(r"[\x00-\x1f\x7f]+", " ", str(s))
+    return s[:cap].strip()
+
+
+def _send_webhook(url, title, msg):
+    """POST one alert. Fails closed on non-https or internal/blocked hosts."""
+    if not req_lib or not url:
+        return False
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    ip, _reason = _resolve_safe(host)   # SSRF guard: blocks internal/link-local
+    if not ip:
+        return False
+    kind = _webhook_kind(url)
+    text = f"🛰 NetWatch: {_sanitize_alert_field(title, 120)} — {_sanitize_alert_field(msg, 300)}"
+    if kind == "discord":
+        # allowed_mentions parse:[] → @everyone/@here/role pings in attacker
+        # input are inert even though the text still shows the literal string.
+        payload = {"content": text[:1900], "allowed_mentions": {"parse": []}}
+    elif kind == "slack":
+        payload = {"text": text[:2000], "mrkdwn": False}  # no link/mention rendering
+    else:
+        payload = {"title": _sanitize_alert_field(title, 120), "text": text[:2000]}
+    try:
+        r = req_lib.post(url, json=payload, timeout=5)
+        return 200 <= r.status_code < 300
+    except Exception:
+        return False
+
+
+def notify_attack(title, msg):
+    """Send an alert to the configured webhook, if any. No-op when unset."""
+    return _send_webhook(_load_alerts_cfg().get("url"), title, msg)
+
+
+def _maybe_notify_attack(service, ip, short):
+    global _alert_last_global
+    now = time.time()
+    with _alert_lock:
+        # Per-IP cooldown AND global min-interval, checked+claimed atomically so
+        # concurrent same-IP events can't double-fire.
+        if now - _alert_last.get(ip, 0) < _ALERT_COOLDOWN:
+            return
+        if now - _alert_last_global < _ALERT_GLOBAL_MIN:
+            return
+        _alert_last[ip] = now
+        _alert_last_global = now
+        # Bound memory: purge entries older than the cooldown once we're big,
+        # and hard-reset if a flood still blows past the cap.
+        if len(_alert_last) > _ALERT_MAX_TRACKED:
+            cutoff = now - _ALERT_COOLDOWN
+            for k in [k for k, t in _alert_last.items() if t < cutoff]:
+                del _alert_last[k]
+            if len(_alert_last) > _ALERT_MAX_TRACKED:
+                _alert_last.clear()
+    cfg = _load_alerts_cfg()
+    if not cfg.get("url"):
+        return
+    threading.Thread(target=_send_webhook,
+                     args=(cfg["url"], f"{service} from {ip}", short),
+                     daemon=True).start()
+
 
 def _short_summary(service, ip, data):
     if service == "credential":
@@ -2926,6 +3096,12 @@ _HELP_SECTIONS = [
         ("mesh send <text>", "Send message"), ("mesh status", "Connection info"),
         ("mesh nodes", "List nodes"), ("mesh alert on/off", "Toggle forwarding"),
     ]),
+    ("Exposure & Alerts", None, [
+        ("expose", "Self-check what the internet can see (Pro: deep scan)"),
+        ("alert set <url>", "Send attacks to a Discord/Slack webhook"),
+        ("alert test", "Send a test alert"), ("alert off", "Disable alerts"),
+        ("license", "Show tier / license status"),
+    ]),
     ("System", None, [
         ("status", "Service info"), ("dashboard / d", "Return to TUI"),
         ("clear", "Clear screen"), ("help", "This reference"),
@@ -3191,6 +3367,8 @@ def handle_command(cmd):
         "watch": (1, _disp_watch), "mesh": (1, _disp_mesh), "ifinfo": (1, _disp_ifinfo),
         "proxy": (1, _disp_proxy), "replay": (1, _disp_replay),
         "doctor": (1, _disp_doctor), "deps": (1, _disp_doctor), "check": (1, _disp_doctor),
+        "expose": (1, _disp_expose), "checkme": (1, _disp_expose),
+        "alert": (1, _disp_alerts),  # note: "alerts" (plural) is a TAB name
     }
 
     if action in _DIRECT_CMDS:
@@ -3472,6 +3650,127 @@ def _disp_restart_tunnel():
 
 
 # ─── doctor: dependency + environment self-check ─────────────────────────
+_EXPOSE_PORTS = [(21, "FTP"), (22, "SSH"), (23, "Telnet"), (80, "HTTP"),
+                 (443, "HTTPS"), (445, "SMB"), (554, "RTSP"), (3389, "RDP"),
+                 (8080, "HTTP-alt"), (8443, "HTTPS-alt")]
+
+
+def _disp_expose(parts):
+    """expose — external exposure self-check. Free: public IP + geo + quick
+    reachability probe. Pro: external nmap -sV fingerprint + hardening report."""
+    add_console(f"{BOLD}NetWatch expose — what the internet can see{RESET}")
+    pub = None
+    r = _proxied_get("http://ip-api.com/json/?fields=query,country,city,isp,hosting,proxy", timeout=8)
+    if r is not None:
+        try:
+            d = r.json()
+            pub = d.get("query")
+            # The public IP arrives over plaintext HTTP — never trust it as a
+            # scan target. Require a real, global IP literal: this blocks a
+            # MITM/DNS-spoof from redirecting our probe at localhost/internal
+            # (SSRF) and blocks nmap argument-injection via a leading '-'.
+            if pub is not None:
+                try:
+                    _ipobj = ipaddress.ip_address(pub)
+                    if _ip_is_dangerous(_ipobj):
+                        pub = None
+                except ValueError:
+                    pub = None
+            if pub:
+                add_console(f"  Public IP : {BOLD}{pub}{RESET}")
+                add_console(f"  Location  : {d.get('city','?')}, {d.get('country','?')}  ({d.get('isp','?')})")
+                flags = []
+                if d.get("hosting"):
+                    flags.append("datacenter/VPS")
+                if d.get("proxy"):
+                    flags.append("proxy/VPN")
+                if flags:
+                    add_console(f"  Network   : {', '.join(flags)}")
+        except Exception:
+            pass
+    if not pub:
+        add_console(f"  {RED}Could not determine public IP (offline or blocked).{RESET}")
+        return
+    add_console(f"  {DIM}Probing {len(_EXPOSE_PORTS)} common ports…{RESET}")
+    open_ports = []
+    for port, name in _EXPOSE_PORTS:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.5)
+            if s.connect_ex((pub, port)) == 0:
+                open_ports.append((port, name))
+            s.close()
+        except Exception:
+            pass
+    if open_ports:
+        add_console(f"  {YELLOW}Reachable from the internet:{RESET}")
+        for port, name in open_ports:
+            add_console(f"    {RED}:{port}{RESET} {name} — exposed")
+    else:
+        add_console(f"  {GREEN}No common ports reachable from this probe.{RESET}")
+        add_console(f"  {DIM}NAT/hairpin can mask true exposure — Pro scans from outside.{RESET}")
+    if not tier_at_least("pro"):
+        add_console(f"  {PRO_UPGRADE_HINT}")
+        add_console(f"  {DIM}Pro: external nmap -sV fingerprint + per-service hardening advice.{RESET}")
+        return
+    _expose_deep_scan(pub)
+
+
+def _expose_deep_scan(pub):
+    if not shutil.which("nmap"):
+        add_console(f"  {YELLOW}nmap not installed — cannot run deep scan.{RESET}")
+        return
+    add_console(f"  {CYAN}Pro: deep nmap -sV scan of {pub}…{RESET}")
+    try:
+        result = subprocess.run(
+            ["nmap", "-sV", "-T4", "--top-ports", "100", "--open", "-oN", "-", pub],
+            capture_output=True, text=True, timeout=120)
+        for line in result.stdout.splitlines():
+            if "/tcp" in line and "open" in line:
+                add_console(f"    {line.strip()}")
+    except Exception as e:
+        add_console(f"  {RED}scan failed: {e.__class__.__name__}{RESET}")
+
+
+def _disp_alerts(parts):
+    """alert [set <url> | test | off] — Free: one Discord/Slack/generic webhook.
+    Pro unlocks Slack/Teams/PagerDuty, email, and SIEM routing."""
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    if sub == "set":
+        if len(parts) < 3:
+            add_console("  usage: alert set <https-webhook-url>")
+            return
+        url = parts[2]
+        from urllib.parse import urlparse
+        if urlparse(url).scheme != "https":
+            add_console(f"  {RED}Webhook must be https://{RESET}")
+            return
+        _save_alerts_cfg({"url": url, "kind": _webhook_kind(url)})
+        add_console(f"  {GREEN}Alert webhook saved ({_webhook_kind(url)}).{RESET}")
+        if not tier_at_least("pro"):
+            add_console(f"  {DIM}Free: 1 webhook. Pro: Slack/Teams/PagerDuty + email + SIEM.{RESET}")
+        return
+    if sub == "off":
+        _save_alerts_cfg({})
+        add_console(f"  {GREEN}Alerts disabled.{RESET}")
+        return
+    if sub == "test":
+        cfg = _load_alerts_cfg()
+        if not cfg.get("url"):
+            add_console(f"  {YELLOW}No webhook set. Use: alert set <url>{RESET}")
+            return
+        ok = notify_attack("Test alert", "NetWatch alert webhook is working.")
+        add_console("  ✅ delivered" if ok else f"  {RED}❌ failed — check URL/network{RESET}")
+        return
+    cfg = _load_alerts_cfg()
+    if cfg.get("url"):
+        add_console(f"  Alerts: {GREEN}ON{RESET} ({cfg.get('kind','generic')})")
+    else:
+        add_console("  Alerts: off — set one with: alert set <https-webhook-url>")
+    if not tier_at_least("pro"):
+        add_console(f"  {DIM}Pro unlocks Slack/Teams/PagerDuty, email, and SIEM routing.{RESET}")
+
+
 # (module, pip-install-name)
 _REQUIRED_PIP = [("flask", "flask"), ("markupsafe", "markupsafe"),
                  ("requests", "requests"), ("whois", "python-whois"),
@@ -7930,8 +8229,43 @@ def save_logs():
         json.dump(stats, f, indent=2, default=str)
     print(f"\n{GREEN}[*] Saved to {traffic_file}{RESET}")
 
+def _cli_subcommand(argv):
+    """Handle `netwatch <cmd>` license/version subcommands before argv[0] is
+    treated as an interface name. License ops delegate to the paid add-on when
+    installed; Free degrades to a clear upgrade message."""
+    cmd = argv[0]
+    if cmd in ("--version", "-V", "version"):
+        print(f"netwatch {VERSION}  (tier: {current_tier()})")
+        return 0
+    try:
+        from netwatch_activate import main as _lic_main  # paid add-on only
+    except Exception:
+        _lic_main = None
+    if cmd in ("activate", "register"):
+        if _lic_main is None:
+            print("Pro add-on not installed — nothing to activate on the Free tier.")
+            print("  pip install netwatch-pro   # then: netwatch activate <key>")
+            print(PRO_UPGRADE_HINT)
+            return 1
+        return _lic_main(argv)
+    if cmd in ("license", "status"):
+        if _lic_main is None:
+            print("License: Community (Free tier)")
+            print(PRO_UPGRADE_HINT)
+            return 0
+        return _lic_main(argv)
+    return 0
+
+
+_CLI_SUBCOMMANDS = ("activate", "register", "license", "status",
+                    "--version", "-V", "version")
+
+
 def main():
     global IFACE
+    _argv = sys.argv[1:]
+    if _argv and _argv[0] in _CLI_SUBCOMMANDS:
+        return _cli_subcommand(_argv)
     if not HAS_RAW_NET:
         if IS_TERMUX:
             print(f"{YELLOW}[!] Termux detected — running passive mode (honeypots + OSINT + web only).{RESET}")

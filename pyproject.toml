@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netwatch-sec"
-version = "1.2.2"
+version = "1.3.0"
 description = "All-in-one network security dashboard: honeypots, traffic capture, OSINT, scanning, mesh alerts."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -63,4 +63,9 @@ netwatch = "netwatch:main"
 py-modules = ["netwatch"]
 
 [tool.setuptools.packages.find]
-exclude = ["tests*", "docs*", "logs*", "ftp_root*", ".claude*", "pro_beta*"]
+exclude = ["tests*", "docs*", "logs*", "ftp_root*", ".claude*", "pro_beta*",
+           "netwatch_pro*", "dist*", "build*", "*.egg-info*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["logs", "pro_beta", "pro_beta_snapshots", "dist", "build", ".git", "ftp_root", "netwatch_pro"]
