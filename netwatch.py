@@ -71,7 +71,7 @@ for _i, _a in enumerate(sys.argv):
     if _a == "--token" and _i + 1 < len(sys.argv):
         _cli_token = sys.argv[_i + 1]
         break
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 # Honeypot listener ports — overridable via env so deployments can move to
 # standard ports (80/23/21/554) without local sed against the repo.
@@ -2992,6 +2992,30 @@ def dispatch_command(cmd):
     return False
 current_tab = "all"
 TABS = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts", "osint", "proxy", "mesh", "fleet"]
+# Derived from TABS so the two tab-switch code paths (raw input loop and
+# handle_command) can never drift. Typing any of these names switches tabs.
+_TAB_NAMES = frozenset(TABS)
+
+
+def _cycle_tab(current, delta):
+    """Return the tab `delta` steps from `current` (wraps). Reaches every tab
+    including the 11th/12th (mesh, fleet) that have no number hotkey. Pure."""
+    try:
+        i = TABS.index(current)
+    except ValueError:
+        i = 0
+    return TABS[(i + delta) % len(TABS)]
+
+
+def _tab_for_command(cmd):
+    """The tab a typed console command selects, or None if it isn't a tab name.
+    Pure helper shared by the raw input loop and tests."""
+    if not cmd or not cmd.strip():
+        return None
+    action = cmd.strip().lower().split()[0]
+    return action if action in _TAB_NAMES else None
+
+
 show_help_overlay = False
 osint_results = []
 MAX_OSINT = 50
@@ -3493,8 +3517,9 @@ def handle_command(cmd):
         threading.Thread(target=_run_batch, daemon=True).start()
         return
 
-    # Tab switching
-    _TAB_NAMES = {"hosts", "alerts", "dns", "proto", "honeypot", "nmap", "arp", "all", "osint", "fleet"}
+    # Tab switching — uses module-level _TAB_NAMES (derived from TABS) so it
+    # stays in sync with every tab. (proxy/mesh also have info commands in
+    # _DIRECT_CMDS above, which take precedence in this console path.)
     if action in _TAB_NAMES:
         current_tab = action
         add_console(f"{CYAN}Switched to [{action.upper()}] view{RESET}")
@@ -5441,14 +5466,35 @@ def _cmd_proxy(sub):
 
 def _tab_bar(cols, active=None):
     active = active or current_tab
-    parts = []
-    for i, t in enumerate(TABS):
-        num = str(i + 1) if i < 9 else "0"
-        if t == active:
-            parts.append(f"{BOLD}{BG_RED}{WHITE} {num}:{t.upper()} {RESET}")
-        else:
-            parts.append(f"{DIM}{num}:{t.upper()}{RESET}")
-    return "  " + "  ".join(parts)
+
+    def _hotkey(i):
+        # 1-9 for the first nine, 0 for the tenth; 11th+ have no numeric hotkey.
+        return f"{i + 1}:" if i < 9 else ("0:" if i == 9 else "")
+
+    def _build(sep, show_num):
+        parts = []
+        for i, t in enumerate(TABS):
+            num = _hotkey(i) if show_num else ""
+            label = t.upper()
+            if t == active:
+                parts.append(f"{BOLD}{BG_RED}{WHITE} {num}{label} {RESET}")
+            else:
+                parts.append(f"{DIM}{num}{label}{RESET}")
+        return "  " + sep.join(parts)
+
+    def _vis(s):
+        return len(re.sub(r'\x1b\[[0-9;]*m', '', s))
+
+    # Degrade gracefully so the bar never overflows and wraps (which shoves the
+    # whole dashboard down a row): full → single-space → drop the number prefix.
+    for sep, show_num in (("  ", True), (" ", True), (" ", False)):
+        bar = _build(sep, show_num)
+        if _vis(bar) <= cols:
+            return bar
+    # Still too wide (very narrow terminal): hard-clip the compact form.
+    bar = _build(" ", False)
+    plain = re.sub(r'\x1b\[[0-9;]*m', '', bar)
+    return plain[:max(0, cols - 1)]
 
 
 def _host_line(ip, data):
@@ -5705,8 +5751,8 @@ def _build_help_overlay(cols, rows):
     lines.append(f"{pad}{BOLD}{RED}  NETWATCH v{VERSION} — COMMAND REFERENCE{RESET}  {DIM}(ESC to close){RESET}")
     lines.append(f"{pad}{BOLD}{RED}{'═'*w}{RESET}")
     lines.append("")
-    lines.append(f"{pad}{BOLD}Tabs:{RESET}  {DIM}type name or 1-9/0 to switch{RESET}")
-    lines.append(f"{pad}  {GREEN}all{RESET}  {GREEN}hosts{RESET}  {GREEN}proto{RESET}  {GREEN}dns{RESET}  {GREEN}honeypot{RESET}  {GREEN}nmap{RESET}  {GREEN}arp{RESET}  {GREEN}alerts{RESET}  {GREEN}osint{RESET}  {GREEN}proxy{RESET}")
+    lines.append(f"{pad}{BOLD}Tabs:{RESET}  {DIM}type name, 1-9/0, or [ ] / Tab to cycle (reaches mesh & fleet){RESET}")
+    lines.append(f"{pad}  " + "  ".join(f"{GREEN}{t}{RESET}" for t in TABS))
     lines.append("")
     for cat, subtitle, cmds in _HELP_SECTIONS:
         hdr = f"{pad}{BOLD}{cat}:{RESET}"
@@ -9087,6 +9133,17 @@ def main():
                 _redraw_event.set()
                 continue
 
+            # [ / ] / Tab cycle through ALL tabs (incl. mesh & fleet, the 11th
+            # and 12th, which have no number hotkey). Left = prev, right = next.
+            if key in ("[", "]", "\t"):
+                current_tab = _cycle_tab(current_tab, -1 if key == "[" else 1)
+                app_state.current_tab = current_tab
+                show_help_overlay = False
+                if app_state.current_screen != SCREEN_DASHBOARD:
+                    app_state.switch(SCREEN_DASHBOARD)
+                _redraw_event.set()
+                continue
+
             if len(key) == 1 and 32 <= ord(key) < 127 and not key.isdigit():
                 show_help_overlay = False
                 cmd = _command_input(fd, key)
@@ -9095,8 +9152,14 @@ def main():
                     continue
                 action = cmd.strip().lower().split()[0]
 
-                if action in TABS:
-                    current_tab = action
+                # Typing a tab name switches to it AND shows the dashboard —
+                # matches the number-hotkey behavior so it works from any screen.
+                _tab = _tab_for_command(cmd)
+                if _tab is not None:
+                    current_tab = _tab
+                    app_state.current_tab = current_tab
+                    if app_state.current_screen != SCREEN_DASHBOARD:
+                        app_state.switch(SCREEN_DASHBOARD)
                     _redraw_event.set()
                     continue
 

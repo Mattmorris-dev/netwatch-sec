@@ -295,12 +295,13 @@ class TestTabBar:
         assert "HOSTS" in stripped.upper()
 
     def test_contains_numbered_tabs(self):
-        bar = _strip(netwatch._tab_bar(80))
+        # Numbers show when the bar fits; at wide widths they always do.
+        bar = _strip(netwatch._tab_bar(160))
         assert "1:" in bar
 
     def test_tab_number_zero_for_tenth(self):
-        # TABS[9] = "proxy", number = "0"
-        bar = _strip(netwatch._tab_bar(80))
+        # TABS[9] = "proxy", number = "0" (shown at a width where numbers fit)
+        bar = _strip(netwatch._tab_bar(160))
         assert "0:" in bar
 
     def test_tab_bar_narrow_cols(self):

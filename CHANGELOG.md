@@ -2,6 +2,29 @@
 
 All notable changes to NetWatch are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.3.2 — 2026-07-02
+
+### Fixed
+- **TUI dashboard layout broke** on terminals narrower than ~106 cols: the tab
+  bar (12 tabs since the `fleet` tab was added) overflowed and wrapped, shoving
+  the whole dashboard down a row. `_tab_bar` is now width-aware — it degrades
+  (full → single-space → drop the number prefix → clip) so it always fits.
+- **Typing a tab name did nothing** if you were in console/CLI mode: it set the
+  tab but didn't return to the dashboard, so nothing appeared to happen. Typing
+  a tab name now switches to the dashboard too (matching number-hotkey behavior).
+- Tab hotkey labels: the 11th/12th tabs no longer mislabel as `0:` (only the
+  10th is `0`; 11+ have no numeric hotkey).
+
+### Added
+- `[` / `]` / Tab keys cycle through **all** tabs — the only way to reach the
+  11th/12th (mesh, fleet), which have no number hotkey.
+- Stability test nets: `tests/test_tui_stability.py` (render never crashes / tab
+  bar never overflows) and `tests/test_input_dispatch.py` (tab-switch logic).
+
+### Internal
+- `_TAB_NAMES` is now derived from `TABS` so the two can't drift (the root cause
+  of typed tab names silently failing for some tabs).
+
 ## 1.3.1 — 2026-07-02
 
 ### Added

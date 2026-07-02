@@ -340,6 +340,17 @@ def test_fleet_tab_registered():
     assert "fleet" in netwatch.TABS
 
 
+def test_tab_bar_never_overflows_width():
+    """The tab bar must fit within the terminal width or it wraps and shoves the
+    whole TUI layout down a row (regression: 12 tabs overflowed at 80 cols)."""
+    import re as _re
+    for cols in (40, 60, 72, 80, 100, 120, 200):
+        for active in netwatch.TABS:
+            bar = netwatch._tab_bar(cols, active=active)
+            visible = len(_re.sub(r'\x1b\[[0-9;]*m', '', bar))
+            assert visible <= cols, f"tab bar {visible} > {cols} cols (active={active})"
+
+
 def test_fleet_tab_empty_prompts_add(tmp_path):
     with _remotes(tmp_path):
         out = "\n".join(netwatch._section_fleet(30))
@@ -427,6 +438,47 @@ def test_api_fleet_pro_shows_all_nodes(tmp_path):
     r = _fleet_api(tmp_path, {"a": {"url": "https://a"}, "b": {"url": "https://b"}}, paying=True)
     j = json.loads(r.data)
     assert len(j["nodes"]) == 2 and j["paying"] is True
+
+
+# ─── Pro wire-in (license → features activate) ────────────────────────────
+
+def test_pro_sub_none_on_free():
+    with patch.object(netwatch, "tier_at_least", return_value=False):
+        assert netwatch._pro_sub("mitre") is None
+        assert netwatch.pro_active_modules() == []
+
+
+def test_pro_sub_loads_when_licensed():
+    import types
+    fake = types.ModuleType("netwatch_pro.mitre")
+    with patch.object(netwatch, "tier_at_least", return_value=True), \
+         patch("importlib.import_module", return_value=fake):
+        netwatch._pro_submods.pop("mitre", None)
+        assert netwatch._pro_sub("mitre") is fake
+    netwatch._pro_submods.pop("mitre", None)
+
+
+def test_attacks_free_has_no_pro_markers():
+    netwatch.honeypot_events.clear()
+    netwatch.honeypot_events.append({"time": "01:00", "service": "telnet", "ip": "5.6.7.8", "summary": "x"})
+    with patch.object(netwatch, "tier_at_least", return_value=False), \
+         patch.object(netwatch, "resolve_host", return_value="h"):
+        netwatch._disp_attacks(["attacks"])
+    out = _console_tail(20)
+    assert "PRO active" not in out and "ATT&CK" not in out
+
+
+def test_attacks_pro_lights_up_mitre():
+    fake_mitre = MagicMock()
+    fake_mitre.techniques_for_event.side_effect = lambda s: {"telnet": ["T1021"]}.get(s, [])
+    netwatch.honeypot_events.clear()
+    netwatch.honeypot_events.append({"time": "01:00", "service": "telnet", "ip": "5.6.7.8", "summary": "x"})
+    with patch.object(netwatch, "tier_at_least", return_value=True), \
+         patch.object(netwatch, "_pro_sub", side_effect=lambda n: fake_mitre if n == "mitre" else None), \
+         patch.object(netwatch, "resolve_host", return_value="h"):
+        netwatch._disp_attacks(["attacks"])
+    out = _console_tail(20)
+    assert "PRO active" in out and "mitre" in out and "T1021" in out
 
 
 def test_expose_pro_runs_deep_scan():
