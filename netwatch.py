@@ -6616,6 +6616,33 @@ def _cached_snapshot():
 def web_state():
     return web_app.response_class(_cached_snapshot(), mimetype="application/json")
 
+@web_app.route("/api/fleet")
+def web_fleet():
+    # Live remote-node data for the web "fleet" tab. Free shows 1 node; Pro the
+    # whole fleet. The `data` blob is the remote's own snapshot (untrusted) —
+    # the browser escapes every field when rendering (XSS-safe).
+    remotes = _load_remotes()
+    if remotes:
+        _ensure_remote_poller()
+    paying = tier_at_least("pro")
+    names = list(remotes) if paying else list(remotes)[:1]
+    with _remote_live_lock:
+        live = {n: _remote_live.get(n) for n in names}
+    now = time.time()
+    nodes = []
+    for name in names:
+        entry = live.get(name)
+        nodes.append({
+            "name": name,
+            "url": remotes[name].get("url", ""),
+            "age": int(now - entry["ts"]) if entry and entry.get("ts") else None,
+            "data": (entry or {}).get("data"),
+        })
+    return web_app.response_class(
+        json.dumps({"nodes": nodes, "total": len(remotes), "paying": paying,
+                    "poll": int(_REMOTE_POLL_INTERVAL)}, default=str),
+        mimetype="application/json")
+
 @web_app.route("/api/stream")
 def web_stream():
     global _sse_count
@@ -6980,7 +7007,7 @@ background:rgba(0,212,255,.1);color:var(--cyan);border:1px solid rgba(0,212,255,
   <div class="close-hint">Esc to close</div>
 </div>
 <script>
-const TABS=["all","hosts","proto","dns","honeypot","scan","nmap","arp","alerts","osint","proxy","mesh","replay","help"];
+const TABS=["all","hosts","proto","dns","honeypot","scan","nmap","arp","alerts","osint","proxy","mesh","fleet","replay","help"];
 let tab="all",D={};
 function $(s){return document.querySelector(s)}
 function $$(s){return document.querySelectorAll(s)}
@@ -7122,6 +7149,62 @@ function renderProxy(){
   return s;
 }
 let _replayCache=null,_replayCacheAt=0,_replayProto="ftp",_replayFilter="";
+let _fleetCache=null,_fleetTimer=null;
+function renderFleet(){
+  let s=`<div class="section-title">REMOTE NODES — live <span class="count" id="fleet-count">(loading...)</span></div>`;
+  s+=`<div id="fleet-body">${_loading("Connecting to remote node(s)...")}</div>`;
+  setTimeout(_fleetMount,0);
+  return s;
+}
+function _fleetMount(){
+  _fleetRefresh();
+  if(_fleetTimer)clearInterval(_fleetTimer);
+  // auto-refresh on the node's poll cadence while this tab is open
+  _fleetTimer=setInterval(()=>{ if(tab==="fleet")_fleetRefresh(); else {clearInterval(_fleetTimer);_fleetTimer=null;} }, 12000);
+}
+async function _fleetRefresh(){
+  try{const r=await fetch("/api/fleet",{credentials:"same-origin"});_fleetCache=await r.json();}
+  catch(e){_fleetCache={nodes:[],total:0};}
+  _fleetPaint();
+}
+function _fleetPaint(){
+  const body=document.getElementById("fleet-body");if(!body)return;
+  const d=_fleetCache||{nodes:[]};
+  const cnt=document.getElementById("fleet-count");if(cnt)cnt.textContent="("+(d.total||0)+")";
+  if(!d.nodes||!d.nodes.length){
+    body.innerHTML=_empty("No remote nodes","In the terminal run:  remote add droplet https://<tunnel-or-ip:9090> <web-token>  — then this tab shows its live data.");
+    return;
+  }
+  let h="";
+  for(const n of d.nodes){
+    h+=`<div class="section-title">◉ ${esc(n.name)} <span class="count">${esc(n.url)}${n.age!=null?" · "+n.age+"s ago":""}</span></div>`;
+    const data=n.data;
+    if(!data){h+=`<div class="empty">connecting...</div>`;continue;}
+    if(data._error){h+=`<div class="empty" style="color:var(--red)">${esc(data._error)} — check url / token</div>`;continue;}
+    const num=v=>(typeof v==="number"&&isFinite(v))?v:0;
+    const td=(data.threat_dist&&typeof data.threat_dist==="object")?data.threat_dist:{};
+    h+=`<div class="meta">Uptime ${esc(String(data.uptime||"?"))} · ${num(data.host_count)} hosts · ${num(data.total_packets).toLocaleString()} pkts · ${esc(String(data.total_bytes_fmt||"?"))} · iface ${esc(String(data.iface||"?"))}</div>`;
+    h+=`<div class="meta">Threats: <span style="color:var(--red)">high=${num(td.high)}</span> med=${num(td.medium)} low=${num(td.low)} clean=${num(td.clean)}</div>`;
+    const hp=Array.isArray(data.honeypot)?data.honeypot.filter(e=>e&&typeof e==="object"):[];
+    if(hp.length){
+      const by={};
+      for(const e of hp){const ip=String(e.ip||"?");(by[ip]=by[ip]||[]).push(e);}
+      h+=`<table><tr><th style="width:140px">Attacker</th><th style="width:70px">Hits</th><th>Services</th></tr>`;
+      Object.entries(by).sort((a,b)=>b[1].length-a[1].length).slice(0,10).forEach(([ip,evs])=>{
+        const svcs=[...new Set(evs.map(e=>String(e.service||"?")))].join(",");
+        h+=`<tr><td class="ip" style="color:var(--red)">${esc(ip)}</td><td>${evs.length}</td><td>${esc(svcs)}</td></tr>`;
+      });
+      h+=`</table>`;
+    }else{h+=`<div class="empty">No honeypot hits in the current window.</div>`;}
+    const al=Array.isArray(data.alerts)?data.alerts.filter(a=>a&&typeof a==="object"):[];
+    if(al.length){
+      h+=`<div class="section-title">Latest alerts</div>`;
+      al.slice(-6).forEach(a=>{h+=`<div class="alert-row"><span style="color:var(--dim)">${esc(String(a.time||""))}</span> ${esc(String(a.msg||""))}</div>`;});
+    }
+  }
+  if(!d.paying&&d.total>1){h+=`<div class="empty">+${d.total-1} more node(s) hidden — upgrade to Pro for full fleet view.</div>`;}
+  body.innerHTML=h;
+}
 function renderReplay(){
   let s=`<div class="section-title">SESSION REPLAY
     <span class="count" id="replay-count">(loading...)</span>
@@ -7421,6 +7504,8 @@ function render(){
   }else if(tab==="mesh"){
     html+=`<div class="section-title">MESH RADIO</div>`;
     html+=renderMesh();
+  }else if(tab==="fleet"){
+    html+=renderFleet();
   }else if(tab==="replay"){
     html+=renderReplay();
   }else if(tab==="help"){

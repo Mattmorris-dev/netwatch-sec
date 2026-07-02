@@ -380,6 +380,55 @@ def test_remote_poller_starts_once():
     netwatch._remote_poller_started = False
 
 
+# ─── web GUI: /api/fleet + fleet tab ──────────────────────────────────────
+
+def _fleet_api(tmp_path, remotes, live=None, paying=False):
+    import time
+    with patch.object(netwatch, "_remotes_cfg_path", return_value=str(tmp_path / "remotes.json")), \
+         patch.object(netwatch, "WEB_TOKEN", ""), \
+         patch.object(netwatch, "_ensure_remote_poller"), \
+         patch.object(netwatch, "tier_at_least", return_value=paying):
+        netwatch._save_remotes(remotes)
+        with netwatch._remote_live_lock:
+            netwatch._remote_live.clear()
+            for k, v in (live or {}).items():
+                netwatch._remote_live[k] = {"ts": time.time(), "data": v}
+        r = netwatch.web_app.test_client().get("/api/fleet")
+    return r
+
+
+def test_web_fleet_tab_registered():
+    assert '"fleet"' in netwatch.WEB_DASHBOARD_HTML  # in the JS TABS array
+    assert "function renderFleet(" in netwatch.WEB_DASHBOARD_HTML
+
+
+def test_api_fleet_returns_node(tmp_path):
+    r = _fleet_api(tmp_path, {"droplet": {"url": "https://x", "token": "t"}},
+                   live={"droplet": {"uptime": "3h", "honeypot": [], "alerts": []}})
+    assert r.status_code == 200
+    j = json.loads(r.data)
+    assert j["total"] == 1 and j["nodes"][0]["name"] == "droplet"
+    assert j["nodes"][0]["data"]["uptime"] == "3h" and j["poll"] == 12
+
+
+def test_api_fleet_empty(tmp_path):
+    r = _fleet_api(tmp_path, {})
+    j = json.loads(r.data)
+    assert j["nodes"] == [] and j["total"] == 0
+
+
+def test_api_fleet_free_caps_to_one_node(tmp_path):
+    r = _fleet_api(tmp_path, {"a": {"url": "https://a"}, "b": {"url": "https://b"}}, paying=False)
+    j = json.loads(r.data)
+    assert len(j["nodes"]) == 1 and j["total"] == 2 and j["paying"] is False
+
+
+def test_api_fleet_pro_shows_all_nodes(tmp_path):
+    r = _fleet_api(tmp_path, {"a": {"url": "https://a"}, "b": {"url": "https://b"}}, paying=True)
+    j = json.loads(r.data)
+    assert len(j["nodes"]) == 2 and j["paying"] is True
+
+
 def test_expose_pro_runs_deep_scan():
     fake = MagicMock()
     fake.json.return_value = {"query": "93.184.216.34"}
