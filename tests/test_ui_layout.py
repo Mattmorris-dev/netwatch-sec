@@ -55,10 +55,10 @@ def _frame_text(cols=80, max_content=35):
 class TestTabNavigation:
 
     def test_tabs_list_length(self):
-        assert len(netwatch.TABS) == 11
+        assert len(netwatch.TABS) == 12
 
     def test_tabs_list_content(self):
-        expected = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts", "osint", "proxy", "mesh"]
+        expected = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts", "osint", "proxy", "mesh", "fleet"]
         assert netwatch.TABS == expected
 
     def test_default_tab_is_all(self):

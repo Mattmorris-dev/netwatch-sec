@@ -159,6 +159,227 @@ def test_expose_rejects_spoofed_internal_ip():
     assert "Could not determine public IP" in _console_tail(4)
 
 
+def test_attacks_free_lists_abusers_hides_recon():
+    netwatch.honeypot_events.clear()
+    for i in range(4):
+        netwatch.honeypot_events.append({"time": f"01:0{i}", "service": "telnet",
+                                         "ip": "5.6.7.8", "summary": "root:****"})
+    netwatch.recon_reports["5.6.7.8"] = {"os_guess": "Linux", "ports": [22],
+                                         "geo": "NL", "org": "DigitalOcean"}
+    with patch.object(netwatch, "tier_at_least", return_value=False), \
+         patch.object(netwatch, "resolve_host", return_value="evil.example"):
+        netwatch._disp_attacks(["attacks"])
+    out = _console_tail(20)
+    assert "5.6.7.8" in out and "4 hits" in out
+    assert "Pro feature" in out          # upgrade CTA present
+    assert "DigitalOcean" not in out     # deep recon gated out
+
+
+def test_attacks_pro_shows_deep_recon():
+    netwatch.honeypot_events.clear()
+    netwatch.honeypot_events.append({"time": "01:00", "service": "telnet",
+                                     "ip": "5.6.7.8", "summary": "root:****"})
+    netwatch.recon_reports["5.6.7.8"] = {"os_guess": "Linux", "ports": [22, 23],
+                                         "geo": "NL", "org": "DigitalOcean"}
+    with patch.object(netwatch, "tier_at_least", return_value=True), \
+         patch.object(netwatch, "resolve_host", return_value="evil.example"):
+        netwatch._disp_attacks(["attacks"])
+    out = _console_tail(20)
+    assert "DigitalOcean" in out and "OS Linux" in out
+    assert "Pro feature" not in out
+
+
+# ─── remote node pull (droplet live view) ─────────────────────────────────
+
+def _remotes(tmp_path):
+    return patch.object(netwatch, "_remotes_cfg_path", return_value=str(tmp_path / "remotes.json"))
+
+
+def test_remote_add_list_rm(tmp_path):
+    with _remotes(tmp_path):
+        netwatch._disp_remote(["remote", "add", "droplet", "https://x.trycloudflare.com", "tok"])
+        assert netwatch._load_remotes()["droplet"]["url"] == "https://x.trycloudflare.com"
+        # config is chmod 0600 (holds the web token)
+        assert (tmp_path / "remotes.json").stat().st_mode & 0o777 == 0o600
+        netwatch._disp_remote(["remote", "list"])
+        assert "droplet" in _console_tail()
+        netwatch._disp_remote(["remote", "rm", "droplet"])
+        assert netwatch._load_remotes() == {}
+
+
+def test_remote_add_rejects_bad_scheme(tmp_path):
+    with _remotes(tmp_path):
+        netwatch._disp_remote(["remote", "add", "d", "ftp://nope", "t"])
+        assert "http" in _console_tail().lower()
+        assert netwatch._load_remotes() == {}
+
+
+def test_remote_second_node_gated_on_free(tmp_path):
+    with _remotes(tmp_path), patch.object(netwatch, "tier_at_least", return_value=False):
+        netwatch._disp_remote(["remote", "add", "a", "https://a", "t"])
+        netwatch._disp_remote(["remote", "add", "b", "https://b", "t"])  # 2nd blocked
+        assert "b" not in netwatch._load_remotes()
+        assert "Pro feature" in _console_tail()
+
+
+def test_remote_second_node_allowed_on_pro(tmp_path):
+    with _remotes(tmp_path), patch.object(netwatch, "tier_at_least", return_value=True):
+        netwatch._disp_remote(["remote", "add", "a", "https://a", "t"])
+        netwatch._disp_remote(["remote", "add", "b", "https://b", "t"])
+        assert set(netwatch._load_remotes()) == {"a", "b"}
+
+
+def test_remote_pull_auth_then_state():
+    fake = {"uptime": "2h", "host_count": 3, "total_packets": 9,
+            "total_bytes_fmt": "1KB", "iface": "eth0",
+            "honeypot": [{"ip": "6.6.6.6", "service": "telnet", "time": "01:00"}],
+            "alerts": [], "threat_dist": {"high": 1, "medium": 0, "low": 0, "clean": 2}}
+    sess = MagicMock()
+    sess.get.return_value = MagicMock(status_code=200, json=lambda: fake)
+    rl = MagicMock(); rl.Session.return_value = sess
+    with patch.object(netwatch, "req_lib", rl):
+        data = netwatch._remote_pull("https://drop/", "tok")
+    assert data["host_count"] == 3
+    # token was posted to /auth before pulling /api/state
+    assert sess.post.call_args[0][0].endswith("/auth")
+    assert sess.get.call_args[0][0].endswith("/api/state")
+
+
+def test_remote_pull_handles_http_error():
+    sess = MagicMock()
+    sess.get.return_value = MagicMock(status_code=401)
+    rl = MagicMock(); rl.Session.return_value = sess
+    with patch.object(netwatch, "req_lib", rl):
+        assert netwatch._remote_pull("https://drop", "tok")["_error"] == "HTTP 401"
+
+
+def test_remote_pull_handles_offline():
+    rl = MagicMock()
+    rl.Session.side_effect = Exception("conn refused")
+    with patch.object(netwatch, "req_lib", rl):
+        assert "_error" in netwatch._remote_pull("https://drop", "tok")
+
+
+def test_remote_pull_no_requests_lib():
+    with patch.object(netwatch, "req_lib", None):
+        assert netwatch._remote_pull("https://drop", "tok") is None
+
+
+def test_render_remote_state_error_and_empty():
+    netwatch.console_output.clear()
+    netwatch._render_remote_state("d", {"_error": "HTTP 500"})
+    assert "HTTP 500" in _console_tail()
+    netwatch._render_remote_state("d", None)
+    assert "no response" in _console_tail()
+
+
+# ─── audit regressions: hostile/malformed remote (droplet is exposed) ──────
+
+def test_render_remote_strips_terminal_escapes():
+    """A compromised node must not rewrite the operator's terminal (HIGH #1)."""
+    evil = "\x1b]0;pwned\x07\x1b[2Jclear"
+    data = {"uptime": "\x1b[31m1h", "iface": "eth0", "host_count": 1,
+            "total_packets": 1, "total_bytes_fmt": "1KB",
+            "honeypot": [{"ip": "1.1.1.1", "service": "telnet", "time": "01:00"}],
+            "alerts": [{"time": "01:01", "msg": evil}],
+            "threat_dist": {"high": 0, "medium": 0, "low": 0, "clean": 1}}
+    netwatch.console_output.clear()
+    netwatch._render_remote_state("droplet", data)
+    out = _console_tail(15)
+    # injected escapes stripped (screen-clear, OSC title, BEL)
+    assert "\x1b[2J" not in out and "\x1b]0;" not in out and "\x07" not in out
+    assert "clear" in out                                   # visible remote text survives
+
+
+def test_render_remote_survives_malformed_json():
+    """Hostile/partial JSON must degrade, not crash silently (MEDIUM #4)."""
+    for bad in (
+        {"total_packets": "not-a-number", "threat_dist": ["oops"],
+         "honeypot": {"not": "a list"}, "alerts": {"also": "bad"}},
+        {"honeypot": ["stringnotdict", 42], "alerts": [1, 2, 3], "uptime": "1h"},
+    ):
+        netwatch.console_output.clear()
+        netwatch._render_remote_state("d", bad)   # must not raise
+        assert "REMOTE: d" in _console_tail(15)
+
+
+def test_remote_add_refuses_token_over_http(tmp_path):
+    with _remotes(tmp_path):
+        netwatch._disp_remote(["remote", "add", "d", "http://1.2.3.4:9090", "secrettok"])
+        assert "http" in _console_tail().lower()
+        assert netwatch._load_remotes() == {}          # not saved
+    # http WITHOUT a token is allowed (LAN node, no secret)
+    with _remotes(tmp_path):
+        netwatch._disp_remote(["remote", "add", "lan", "http://10.0.0.9:9090"])
+        assert "lan" in netwatch._load_remotes()
+
+
+def test_remote_pull_refuses_token_over_http():
+    with patch.object(netwatch, "req_lib", MagicMock()) as rl:
+        res = netwatch._remote_pull("http://1.2.3.4:9090", "tok")
+        assert res["_error"] == "refusing to send token over http"
+        rl.Session.assert_not_called()
+
+
+def test_remote_add_rejects_reserved_name(tmp_path):
+    with _remotes(tmp_path):
+        netwatch._disp_remote(["remote", "add", "list", "https://x", "t"])
+        assert "reserved" in _console_tail().lower()
+        assert netwatch._load_remotes() == {}
+
+
+def test_new_commands_run_on_worker_not_input_thread():
+    """Network/DNS-heavy commands must be queued so the TUI never freezes (MEDIUM #3)."""
+    for cmd in ("attacks", "abusers", "threats", "remote", "droplet", "expose", "checkme"):
+        assert cmd in netwatch._BLOCKING_ACTIONS
+
+
+# ─── live fleet tab ───────────────────────────────────────────────────────
+
+def test_fleet_tab_registered():
+    assert "fleet" in netwatch.TABS
+
+
+def test_fleet_tab_empty_prompts_add(tmp_path):
+    with _remotes(tmp_path):
+        out = "\n".join(netwatch._section_fleet(30))
+    assert "remote add droplet" in out
+
+
+def test_fleet_tab_renders_live_snapshot(tmp_path):
+    import time
+    with _remotes(tmp_path):
+        netwatch._save_remotes({"droplet": {"url": "https://x", "token": "t"}})
+        with netwatch._remote_live_lock:
+            netwatch._remote_live["droplet"] = {"ts": time.time(), "data": {
+                "uptime": "3h", "host_count": 7, "total_packets": 42,
+                "total_bytes_fmt": "5KB", "iface": "eth0",
+                "threat_dist": {"high": 3, "medium": 0, "low": 0, "clean": 4},
+                "honeypot": [{"ip": "8.8.8.8", "service": "telnet", "time": "02:00"}],
+                "alerts": []}}
+        out = "\n".join(netwatch._section_fleet(40))
+    assert "droplet" in out and "3h" in out and "8.8.8.8" in out
+
+
+def test_fleet_tab_free_hides_extra_nodes(tmp_path):
+    import time
+    with _remotes(tmp_path), patch.object(netwatch, "tier_at_least", return_value=False):
+        netwatch._save_remotes({"a": {"url": "https://a"}, "b": {"url": "https://b"}})
+        with netwatch._remote_live_lock:
+            netwatch._remote_live.clear()
+        out = "\n".join(netwatch._section_fleet(40))
+    assert "more node" in out and "Pro feature" in out
+
+
+def test_remote_poller_starts_once():
+    netwatch._remote_poller_started = False
+    with patch.object(netwatch, "threading") as th:
+        netwatch._ensure_remote_poller()
+        netwatch._ensure_remote_poller()
+        assert th.Thread.call_count == 1
+    netwatch._remote_poller_started = False
+
+
 def test_expose_pro_runs_deep_scan():
     fake = MagicMock()
     fake.json.return_value = {"query": "93.184.216.34"}

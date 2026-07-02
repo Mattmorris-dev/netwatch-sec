@@ -496,6 +496,55 @@ def notify_attack(title, msg):
     return _send_webhook(_load_alerts_cfg().get("url"), title, msg)
 
 
+# ─── Remote nodes — pull LIVE state from another netwatch (e.g. a droplet) ──
+# Free: one remote node (view your own VPS). Pro: multi-node fleet aggregation.
+# Auth mirrors the web dashboard: POST /auth {token} → cookie → GET /api/state.
+_REMOTE_RESERVED = frozenset({"add", "rm", "remove", "list", "ls", "del", "delete"})
+
+
+def _remotes_cfg_path():
+    return os.path.join(os.path.expanduser("~"), ".config", "netwatch", "remotes.json")
+
+
+def _load_remotes():
+    try:
+        with open(_remotes_cfg_path()) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_remotes(cfg):
+    p = _remotes_cfg_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True, mode=0o700)
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # token is a secret
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f)
+
+
+def _remote_pull(url, token, timeout=8):
+    """Fetch a remote node's /api/state JSON. Returns dict, {"_error":...}, or None."""
+    if not req_lib or not url:
+        return None
+    from urllib.parse import urlparse
+    base = url.rstrip("/")
+    scheme = urlparse(base).scheme
+    if scheme not in ("http", "https"):
+        return {"_error": "url must be http(s)"}
+    if token and scheme != "https":
+        return {"_error": "refusing to send token over http"}
+    try:
+        sess = req_lib.Session()
+        if token:
+            sess.post(base + "/auth", json={"token": token}, timeout=timeout)
+        r = sess.get(base + "/api/state", timeout=timeout)
+        if r.status_code != 200:
+            return {"_error": f"HTTP {r.status_code}"}
+        return r.json()
+    except Exception as e:
+        return {"_error": e.__class__.__name__}
+
+
 def _maybe_notify_attack(service, ip, short):
     global _alert_last_global
     now = time.time()
@@ -2861,6 +2910,8 @@ _BLOCKING_ACTIONS = frozenset({
     "whois", "banner", "ssl", "ping", "track", "sniff", "subnet", "pcap",
     "ports", "find", "report", "blocked", "ifinfo", "exportips",
     "top", "ips", "new", "sus", "loud", "quiet", "whowatch",
+    # network/DNS-heavy: run on the worker so the TUI input loop never freezes
+    "attacks", "abusers", "threats", "remote", "droplet", "expose", "checkme",
 })
 
 
@@ -2908,7 +2959,7 @@ def dispatch_command(cmd):
     _redraw_event.set()
     return False
 current_tab = "all"
-TABS = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts", "osint", "proxy", "mesh"]
+TABS = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts", "osint", "proxy", "mesh", "fleet"]
 show_help_overlay = False
 osint_results = []
 MAX_OSINT = 50
@@ -3098,8 +3149,11 @@ _HELP_SECTIONS = [
     ]),
     ("Exposure & Alerts", None, [
         ("expose", "Self-check what the internet can see (Pro: deep scan)"),
+        ("attacks", "Honeypot attacks + top abusive hosts (Pro: deep recon)"),
         ("alert set <url>", "Send attacks to a Discord/Slack webhook"),
         ("alert test", "Send a test alert"), ("alert off", "Disable alerts"),
+        ("remote add <n> <url> <tok>", "Track a remote node (your droplet)"),
+        ("remote [name]", "Pull live data from a remote node (Pro: fleet)"),
         ("license", "Show tier / license status"),
     ]),
     ("System", None, [
@@ -3369,6 +3423,9 @@ def handle_command(cmd):
         "doctor": (1, _disp_doctor), "deps": (1, _disp_doctor), "check": (1, _disp_doctor),
         "expose": (1, _disp_expose), "checkme": (1, _disp_expose),
         "alert": (1, _disp_alerts),  # note: "alerts" (plural) is a TAB name
+        "attacks": (1, _disp_attacks), "abusers": (1, _disp_attacks),
+        "threats": (1, _disp_attacks),
+        "remote": (1, _disp_remote), "droplet": (1, _disp_remote),
     }
 
     if action in _DIRECT_CMDS:
@@ -3405,7 +3462,7 @@ def handle_command(cmd):
         return
 
     # Tab switching
-    _TAB_NAMES = {"hosts", "alerts", "dns", "proto", "honeypot", "nmap", "arp", "all", "osint"}
+    _TAB_NAMES = {"hosts", "alerts", "dns", "proto", "honeypot", "nmap", "arp", "all", "osint", "fleet"}
     if action in _TAB_NAMES:
         current_tab = action
         add_console(f"{CYAN}Switched to [{action.upper()}] view{RESET}")
@@ -4389,6 +4446,211 @@ def _disp_whowatch(parts):
         svcs = set(e["service"] for e in evts)
         last = evts[-1]["time"]
         add_console(f"  {RED}{ip:<18}{RESET} {len(evts)} events  last={last}  {', '.join(svcs)[:30]}  {hostname[:20]}")
+
+_ATTACK_SVC_LABELS = {
+    "credential": "HTTP-login", "telnet": "Telnet", "telnet_cmd": "Telnet-cmd",
+    "malware_attempt": "Malware", "ftp_upload": "FTP-upload", "ftp": "FTP",
+    "http": "HTTP", "rtsp": "RTSP", "attacker_basic_intel": "intel",
+}
+
+
+def _disp_attacks(parts):
+    """attacks — honeypot attack + abusive-host overview. FREE: who hit you, how
+    often, which services, reverse DNS + threat score. Paying tiers add
+    per-attacker deep recon (OS fingerprint, open ports, geo/ASN)."""
+    add_console(f"{BOLD}{RED}{'='*52}{RESET}")
+    add_console(f"{BOLD}{RED}  HONEYPOT ATTACKS & ABUSIVE HOSTS{RESET}")
+    add_console(f"{BOLD}{RED}{'='*52}{RESET}")
+    with lock:
+        events = list(honeypot_events)
+        recon = dict(recon_reports)
+        scores = {ip: hosts[ip].get("threat_score", 0) for ip in hosts}
+    if not events:
+        add_console(f"  {DIM}No honeypot attacks recorded yet — bait services are listening.{RESET}")
+        return
+    svc_counts, per_ip = {}, {}
+    for e in events:
+        svc = e.get("service", "?")
+        svc_counts[svc] = svc_counts.get(svc, 0) + 1
+        per_ip.setdefault(e.get("ip", "?"), []).append(e)
+    add_console(f"  {BOLD}Totals:{RESET} {len(events)} events · {len(per_ip)} unique hosts")
+    svc_line = "  ".join(f"{_ATTACK_SVC_LABELS.get(s, s)}:{c}"
+                         for s, c in sorted(svc_counts.items(), key=lambda x: -x[1]))
+    add_console(f"  {BOLD}By service:{RESET} {svc_line}")
+    add_console(f"  {BOLD}Top abusive hosts:{RESET}")
+    ranked = sorted(per_ip.items(), key=lambda x: len(x[1]), reverse=True)
+    paying = tier_at_least("pro")
+    for rank, (ip, evts) in enumerate(ranked[:10], 1):
+        svcs = ",".join(sorted(set(e.get("service", "?") for e in evts)))[:24]
+        last = evts[-1].get("time", "?")
+        hostname = resolve_host(ip)
+        score = scores.get(ip, 0)
+        add_console(f"   {rank:>2}. {RED}{ip:<16}{RESET} {len(evts):>3} hits  "
+                    f"{DIM}{last}{RESET}  {svcs}  {DIM}{hostname[:22]}{RESET}  score={score}")
+        if paying:
+            r = recon.get(ip)
+            if r:
+                add_console(f"       {CYAN}↳ OS {r.get('os_guess', '?')} · "
+                            f"{len(r.get('ports', []))} open · {r.get('geo', '?')} · "
+                            f"{r.get('org', '?')}{RESET}")
+            else:
+                add_console(f"       {DIM}↳ no deep recon cached — run: recon {ip}{RESET}")
+    if not paying:
+        add_console(f"  {PRO_UPGRADE_HINT}")
+        add_console(f"  {DIM}Pro: per-attacker deep recon — OS fingerprint, open ports, "
+                    f"geo/ASN, threat-intel score.{RESET}")
+
+
+def _remote_state_lines(name, data):
+    """Format a remote node's snapshot as console/tab lines. The remote is often
+    the exposed honeypot droplet — treat its response as UNTRUSTED: strip
+    control/ANSI from every remote string (or it could rewrite the terminal) and
+    isinstance-guard every field so malformed/hostile JSON degrades gracefully."""
+    def _rs(v, cap=70):
+        return _ansi_strip(str(v))[:cap]
+
+    def _num(v):
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+    if not data:
+        return [f"  {RED}{_rs(name, 40)}: no response (offline/unreachable).{RESET}"]
+    if data.get("_error"):
+        return [f"  {RED}{_rs(name, 40)}: {_rs(data['_error'], 40)} — check url/token.{RESET}"]
+    out = [f"  Uptime {_rs(data.get('uptime','?'), 24)} · "
+           f"{_num(data.get('host_count'))} hosts · "
+           f"{_num(data.get('total_packets')):,} pkts · "
+           f"{_rs(data.get('total_bytes_fmt','?'), 20)} · "
+           f"iface {_rs(data.get('iface','?'), 20)}"]
+    td = data.get("threat_dist", {})
+    if isinstance(td, dict) and td:
+        out.append(f"  Threats: {RED}high={_num(td.get('high'))}{RESET} "
+                   f"med={_num(td.get('medium'))} low={_num(td.get('low'))} "
+                   f"clean={_num(td.get('clean'))}")
+    hp = data.get("honeypot", [])
+    hp = [e for e in hp if isinstance(e, dict)] if isinstance(hp, list) else []
+    if hp:
+        by_ip = {}
+        for e in hp:
+            by_ip.setdefault(_rs(e.get("ip", "?"), 45), []).append(e)
+        out.append(f"  {BOLD}Recent honeypot hits:{RESET}")
+        for ip, evs in sorted(by_ip.items(), key=lambda x: -len(x[1]))[:8]:
+            svcs = _rs(",".join(sorted(set(str(e.get("service", "?")) for e in evs))), 24)
+            out.append(f"    {RED}{ip:<16}{RESET} {len(evs):>3} hits  {svcs}  "
+                       f"{DIM}{_rs(evs[-1].get('time',''), 12)}{RESET}")
+    else:
+        out.append(f"  {DIM}No honeypot hits in the current window.{RESET}")
+    al = data.get("alerts", [])
+    al = [a for a in al if isinstance(a, dict)] if isinstance(al, list) else []
+    if al:
+        out.append(f"  {BOLD}Latest alerts:{RESET}")
+        for a in al[-4:]:
+            out.append(f"    {DIM}{_rs(a.get('time',''), 12)}{RESET} {_rs(a.get('msg',''), 70)}")
+    return out
+
+
+def _render_remote_state(name, data):
+    add_console(f"{BOLD}{MAGENTA}◉ REMOTE: {_ansi_strip(str(name))[:40]}{RESET}  {DIM}(live from node){RESET}")
+    for ln in _remote_state_lines(name, data):
+        add_console(ln)
+
+
+# ─── Background poller for the live `fleet` tab ───────────────────────────
+_remote_live = {}
+_remote_live_lock = threading.Lock()
+_REMOTE_POLL_INTERVAL = 12.0
+_remote_poller_started = False
+
+
+def _remote_poll_loop():
+    while True:
+        try:
+            remotes = _load_remotes()
+            if remotes:
+                names = list(remotes) if tier_at_least("pro") else list(remotes)[:1]
+                for name in names:
+                    r = remotes[name]
+                    data = _remote_pull(r.get("url", ""), r.get("token", ""))
+                    with _remote_live_lock:
+                        _remote_live[name] = {"data": data, "ts": time.time()}
+                _redraw_event.set()
+        except Exception:
+            pass
+        time.sleep(_REMOTE_POLL_INTERVAL)
+
+
+def _ensure_remote_poller():
+    global _remote_poller_started
+    if _remote_poller_started:
+        return
+    _remote_poller_started = True
+    threading.Thread(target=_remote_poll_loop, daemon=True).start()
+
+
+def _disp_remote(parts):
+    """remote — pull LIVE state from a remote netwatch node (e.g. your droplet).
+      remote add <name> <url> [token]     remote rm <name>     remote list
+      remote [name]                       pull + show (default: the only node)
+    Free: one remote node. Pro: multi-node fleet aggregation + correlation."""
+    from urllib.parse import urlparse
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    cfg = _load_remotes()
+    if sub == "add":
+        if len(parts) < 4:
+            add_console("  usage: remote add <name> <url> [web-token]")
+            return
+        name, url = parts[2], parts[3]
+        token = parts[4] if len(parts) > 4 else ""
+        if name.lower() in _REMOTE_RESERVED:
+            add_console(f"  {RED}'{name}' is a reserved word — pick another name.{RESET}")
+            return
+        scheme = urlparse(url).scheme
+        if scheme not in ("http", "https"):
+            add_console(f"  {RED}url must be http(s)://host:port{RESET}")
+            return
+        # A web token is a bearer secret — never transmit it over cleartext.
+        if token and scheme != "https":
+            add_console(f"  {RED}Refusing to send a token over http:// — use https:// "
+                        f"(cloudflared tunnel or TLS).{RESET}")
+            return
+        if name not in cfg and cfg and not tier_at_least("pro"):
+            add_console(f"  {YELLOW}Free tier tracks 1 remote node.{RESET}")
+            add_console(f"  {PRO_UPGRADE_HINT}")
+            add_console(f"  {DIM}Pro: aggregate a fleet of nodes with cross-node correlation.{RESET}")
+            return
+        cfg[name] = {"url": url, "token": token}
+        _save_remotes(cfg)
+        add_console(f"  {GREEN}Remote '{name}' saved.{RESET}  Pull it: remote {name}")
+        return
+    if sub == "rm":
+        if len(parts) < 3 or parts[2] not in cfg:
+            add_console("  usage: remote rm <name>")
+            return
+        del cfg[parts[2]]
+        _save_remotes(cfg)
+        add_console(f"  {GREEN}Removed.{RESET}")
+        return
+    if sub in ("list", "ls") or (not sub and not cfg):
+        if not cfg:
+            add_console("  No remotes configured. Add your droplet:")
+            add_console(f"    {DIM}remote add droplet https://<tunnel-or-ip:9090> <web-token>{RESET}")
+            return
+        add_console(f"{BOLD}Configured remotes:{RESET}")
+        for n, r in cfg.items():
+            add_console(f"  {n:<12} {r.get('url','')}")
+        add_console(f"  {DIM}Pull one: remote <name>{RESET}")
+        return
+    # pull: an explicit name, or the single configured node
+    name = sub if sub in cfg else None
+    if not name:
+        if len(cfg) == 1:
+            name = next(iter(cfg))
+        else:
+            add_console(f"  Which remote? {', '.join(cfg) or '(none — remote add …)'}")
+            return
+    r = cfg[name]
+    add_console(f"  {DIM}Pulling live state from '{name}'…{RESET}")
+    _render_remote_state(name, _remote_pull(r.get("url", ""), r.get("token", "")))
+
 
 def _disp_summary(parts):
     add_console(f"{BOLD}{CYAN}{'='*50}{RESET}")
@@ -5519,11 +5781,44 @@ def _build_frame(cols=80, max_content=35, active_tab=None):
         lines.extend(_section_proxy(max_content))
     elif tab == "mesh":
         lines.extend(_section_mesh(max_content))
+    elif tab == "fleet":
+        lines.extend(_section_fleet(max_content))
     else:
         current_tab = "all"
         lines.append(f"  {DIM}(reset to all view){RESET}")
 
     return lines
+
+
+def _section_fleet(max_lines=30):
+    """Live view of remote node(s) — e.g. your droplet. Auto-refreshed by the
+    background poller. Free shows 1 node; Pro aggregates the whole fleet."""
+    remotes = _load_remotes()
+    out = [f"{BOLD}{MAGENTA}  REMOTE NODES — live{RESET}"]
+    if not remotes:
+        out.append(f"  {DIM}No remote nodes yet.{RESET}")
+        out.append(f"  Add your droplet:  {GREEN}remote add droplet https://<tunnel-or-ip:9090> <web-token>{RESET}")
+        out.append(f"  {DIM}This tab then auto-refreshes with its live data every "
+                   f"{int(_REMOTE_POLL_INTERVAL)}s.{RESET}")
+        return out
+    _ensure_remote_poller()
+    with _remote_live_lock:
+        live = dict(_remote_live)
+    paying = tier_at_least("pro")
+    shown = list(remotes) if paying else list(remotes)[:1]
+    for name in shown:
+        url = _ansi_strip(str(remotes[name].get("url", "")))[:44]
+        entry = live.get(name)
+        if not entry:
+            out.append(f"{BOLD}◉ {_ansi_strip(str(name))[:24]}{RESET} {DIM}{url}  connecting…{RESET}")
+            continue
+        age = int(time.time() - entry.get("ts", 0))
+        out.append(f"{BOLD}◉ {_ansi_strip(str(name))[:24]}{RESET} {DIM}{url}  ({age}s ago){RESET}")
+        out.extend(_remote_state_lines(name, entry.get("data")))
+        out.append("")
+    if not paying and len(remotes) > 1:
+        out.append(f"  {DIM}+{len(remotes)-1} more node(s) hidden.{RESET} {PRO_UPGRADE_HINT}")
+    return out[:max_lines] if max_lines and len(out) > max_lines else out
 
 
 def _section_mesh(limit=20):
