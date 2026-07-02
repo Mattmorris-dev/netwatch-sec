@@ -1172,5 +1172,5 @@ class TestEdgeCases:
 
     def test_all_tabs_valid_values(self):
         """TABS list contains all expected values."""
-        expected = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts", "osint", "proxy", "mesh"]
+        expected = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts", "osint", "proxy", "mesh", "fleet"]
         assert netwatch.TABS == expected
