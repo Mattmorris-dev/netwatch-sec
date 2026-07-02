@@ -2,6 +2,20 @@
 
 All notable changes to NetWatch are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.3.1 — 2026-07-02
+
+### Added
+- **Live `fleet` tab in the web dashboard** (`/api/fleet`) — auto-refreshing
+  remote-node view alongside the TUI fleet tab. All remote data HTML-escaped.
+- **Pro add-on wire-in** — with a valid license the app now detects and loads
+  the `netwatch_pro` submodules: startup banner shows `✦ PRO <tier> active`,
+  and `attacks` renders live MITRE ATT&CK technique tags. Free tier unchanged.
+- `attacks` / `expose` are now runnable from the web command bar.
+
+### Fixed
+- `publish.yml` uses `skip-existing` so a moved-tag re-run no longer hard-fails
+  on an already-published version.
+
 ## 1.3.0 — 2026-07-02
 
 ### Added

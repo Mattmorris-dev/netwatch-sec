@@ -71,7 +71,7 @@ for _i, _a in enumerate(sys.argv):
     if _a == "--token" and _i + 1 < len(sys.argv):
         _cli_token = sys.argv[_i + 1]
         break
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 # Honeypot listener ports — overridable via env so deployments can move to
 # standard ports (80/23/21/554) without local sed against the repo.
@@ -129,6 +129,38 @@ def tier_at_least(name):
 # Backward-compat module flag: True when Pro-or-higher is active at startup.
 # The deep-recon gate and existing tests reference this directly (patchable).
 PRO_ENABLED = current_tier() != "community"
+
+
+_pro_import_tried = False
+_pro_submods = {}
+
+
+def _pro_sub(name):
+    """Lazily import a `netwatch_pro.<name>` submodule IFF a paid license is
+    active and the add-on is installed; else None. This is the single seam that
+    lights up Pro features inside the free app. Never raises. Re-checks the
+    (cached) license each call so runtime activation works without a restart."""
+    if not tier_at_least("pro"):
+        return None
+    if name in _pro_submods:
+        return _pro_submods[name]
+    try:
+        import importlib
+        mod = importlib.import_module(f"netwatch_pro.{name}")
+    except Exception:
+        mod = None
+    _pro_submods[name] = mod
+    return mod
+
+
+def pro_active_modules():
+    """Names of Pro submodules that load under the current license — for the
+    startup banner and the `license` command. Empty on Free."""
+    if not tier_at_least("pro"):
+        return []
+    return [n for n in ("mitre", "webhooks", "threatintel", "siem", "autoblock",
+                        "geo_block", "reports", "fleet", "personality")
+            if _pro_sub(n) is not None]
 
 # ─── Colors ──────────────────────────────────────────────
 
@@ -4477,11 +4509,17 @@ def _disp_attacks(parts):
     svc_line = "  ".join(f"{_ATTACK_SVC_LABELS.get(s, s)}:{c}"
                          for s, c in sorted(svc_counts.items(), key=lambda x: -x[1]))
     add_console(f"  {BOLD}By service:{RESET} {svc_line}")
+    paying = tier_at_least("pro")
+    # Pro wire-in: light up ATT&CK enrichment from the installed add-on.
+    _mitre = _pro_sub("mitre") if paying else None
+    if paying:
+        mods = pro_active_modules()
+        add_console(f"  {GREEN}✦ PRO active{RESET} {DIM}({', '.join(mods) or 'license only'}){RESET}")
     add_console(f"  {BOLD}Top abusive hosts:{RESET}")
     ranked = sorted(per_ip.items(), key=lambda x: len(x[1]), reverse=True)
-    paying = tier_at_least("pro")
     for rank, (ip, evts) in enumerate(ranked[:10], 1):
-        svcs = ",".join(sorted(set(e.get("service", "?") for e in evts)))[:24]
+        ip_svcs = sorted(set(e.get("service", "?") for e in evts))
+        svcs = ",".join(ip_svcs)[:24]
         last = evts[-1].get("time", "?")
         hostname = resolve_host(ip)
         score = scores.get(ip, 0)
@@ -4495,6 +4533,15 @@ def _disp_attacks(parts):
                             f"{r.get('org', '?')}{RESET}")
             else:
                 add_console(f"       {DIM}↳ no deep recon cached — run: recon {ip}{RESET}")
+            if _mitre:
+                techs = set()
+                for svc in ip_svcs:
+                    try:
+                        techs.update(_mitre.techniques_for_event(svc))
+                    except Exception:
+                        pass
+                if techs:
+                    add_console(f"       {MAGENTA}↳ ATT&CK: {', '.join(sorted(techs))}{RESET}")
     if not paying:
         add_console(f"  {PRO_UPGRADE_HINT}")
         add_console(f"  {DIM}Pro: per-attacker deep recon — OS fingerprint, open ports, "
@@ -6675,6 +6722,7 @@ _WEB_SAFE_CMDS = {
     "decode", "tracked", "mac", "proxy",
     "ips", "top", "new", "sus", "loud", "quiet", "find", "ports", "services",
     "country", "timeline", "summary", "whowatch", "fullrecon",
+    "attacks", "abusers", "threats", "expose", "checkme",
     "tag", "note", "watch", "report", "exportips", "diffarp", "mesh",
     "scanall", "geoall", "whoisall", "reconall", "blockall", "sweep",
     "speed", "ifinfo", "help",
@@ -6709,7 +6757,7 @@ _web_cmd_lock = threading.Lock()
 _CMD_RATE_LIMIT = 20
 _CMD_RATE_WINDOW = 60
 _EXPENSIVE_CMDS = {"fullrecon", "scanall", "reconall", "blockall", "sweep", "geoall", "whoisall", "deep",
-                    "block", "unblock", "stealth", "pcap"}
+                    "block", "unblock", "stealth", "pcap", "expose", "checkme"}
 _EXPENSIVE_RATE_LIMIT = 3
 
 @web_app.route("/api/cmd", methods=["POST"])
@@ -8702,7 +8750,13 @@ def main():
         print(f"  {DIM}ProxyChains     : not active (outbound is direct){RESET}")
 
     print(f"  {DIM}Logs: {LOG_DIR}/{RESET}")
-    print(f"  {DIM}nmap: use 'scan <target>' via API or edit code{RESET}\n")
+    print(f"  {DIM}nmap: use 'scan <target>' via API or edit code{RESET}")
+    if tier_at_least("pro"):
+        _mods = pro_active_modules()
+        print(f"  {GREEN}✦ PRO {current_tier().upper()} active — {len(_mods)} modules: "
+              f"{', '.join(_mods) or 'license only'}{RESET}\n")
+    else:
+        print(f"  {DIM}Tier: Free — type 'license' for Pro features{RESET}\n")
 
     def shutdown(sig, frame):
         print(f"\n{YELLOW}[*] Shutting down NetWatch...{RESET}")
