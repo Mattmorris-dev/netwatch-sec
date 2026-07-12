@@ -2,6 +2,23 @@
 
 All notable changes to NetWatch are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.4.0 — 2026-07-12
+
+### Added
+- **`netwatch ask "<question>"`** — natural-language queries over this node's
+  harvested intel (Pro add-on required). The default provider is fully local:
+  answers are composed from retrieved, novelty-scored, cited evidence with
+  zero network egress; cloud/ollama providers are explicit opt-in only.
+- **Apiary shipper: edge-model fetch** — nodes can pull the distilled threat
+  scoring model from the fleet hub over the existing TLS channel
+  (`model_fetch`, default **off**; hub enroll token opts in), replacing
+  hand-deployed model files. The fetch pins the hub CA, refuses redirects,
+  validates the model before an atomic 0600 write, and falls back to the
+  current model on any failure.
+- **Fleet tab: Cortex card** — when the hub publishes a Cortex brain snapshot,
+  the fleet view (TUI + web) shows fleet-wide novelty/threat stats. Credentials
+  harvested by the honeypot are never included in the snapshot.
+
 ## 1.3.2 — 2026-07-02
 
 ### Fixed

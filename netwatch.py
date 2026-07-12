@@ -71,7 +71,7 @@ for _i, _a in enumerate(sys.argv):
     if _a == "--token" and _i + 1 < len(sys.argv):
         _cli_token = sys.argv[_i + 1]
         break
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 
 # Honeypot listener ports — overridable via env so deployments can move to
 # standard ports (80/23/21/554) without local sed against the repo.
@@ -159,7 +159,8 @@ def pro_active_modules():
     if not tier_at_least("pro"):
         return []
     return [n for n in ("mitre", "webhooks", "threatintel", "siem", "autoblock",
-                        "geo_block", "reports", "fleet", "personality")
+                        "geo_block", "reports", "fleet", "collector", "analytics",
+                        "gateway", "personality", "ask")
             if _pro_sub(n) is not None]
 
 # ─── Colors ──────────────────────────────────────────────
@@ -3210,6 +3211,9 @@ _HELP_SECTIONS = [
         ("alert test", "Send a test alert"), ("alert off", "Disable alerts"),
         ("remote add <n> <url> <tok>", "Track a remote node (your droplet)"),
         ("remote [name]", "Pull live data from a remote node (Pro: fleet)"),
+        ("join <hub> <id> <key>", "Ship this node's events to a fleet hub (Free)"),
+        ("collector", "Run/inspect the fleet hub — Apiary (Pro)"),
+        ("ask <question>", "NL query over intel — local brain, no key (Pro)"),
         ("license", "Show tier / license status"),
     ]),
     ("System", None, [
@@ -3482,6 +3486,8 @@ def handle_command(cmd):
         "attacks": (1, _disp_attacks), "abusers": (1, _disp_attacks),
         "threats": (1, _disp_attacks),
         "remote": (1, _disp_remote), "droplet": (1, _disp_remote),
+        "join": (1, _disp_join), "collector": (1, _disp_collector),
+        "ask": (2, _disp_ask),
     }
 
     if action in _DIRECT_CMDS:
@@ -4724,6 +4730,292 @@ def _disp_remote(parts):
     _render_remote_state(name, _remote_pull(r.get("url", ""), r.get("token", "")))
 
 
+# Apiary federation: running instances (a node's shipper / a hub's collector).
+_apiary_shipper = None
+_apiary_collector = None
+
+
+def _disp_join(parts):
+    """join — contribute this node's events to a fleet hub (Free feature).
+      join <https://hub:8443> <node_id> <key>   configure + start shipping
+      join status                                shipper state
+      join off                                   stop shipping
+    Any node can ship its attack data up. Running the hub is Pro (see: collector)."""
+    global _apiary_shipper
+    from urllib.parse import urlparse
+    try:
+        import netwatch_shipper as _ship
+    except Exception as e:
+        add_console(f"  {RED}shipper unavailable: {type(e).__name__}{RESET}")
+        return
+    # One-shot enrollment token from `collector keygen <name> <hub-url>` — a single
+    # paste that configures hub URL + creds + pins the hub CA automatically.
+    if len(parts) > 1 and parts[1].startswith("nwj_"):
+        try:
+            cfg = _ship.configure_from_token(parts[1])
+            if _apiary_shipper is not None:
+                _apiary_shipper.stop()
+            _apiary_shipper = _ship.Shipper(cfg)
+            _apiary_shipper.start_background()
+        except ValueError as e:
+            add_console(f"  {RED}bad enrollment token: {e}{RESET}")
+            return
+        except Exception as e:
+            add_console(f"  {RED}join failed: {type(e).__name__}{RESET}")
+            return
+        hub = _ansi_strip(str(cfg.get('hub_url', '')))[:60]
+        nid = _ansi_strip(str(cfg.get('node_id', '')))[:40]
+        pinned = f" {DIM}(CA pinned){RESET}" if cfg.get("ca_cert") else ""
+        add_console(f"  {GREEN}Joined {hub} as '{nid}'.{RESET}{pinned} Shipping events.")
+        return
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    if sub == "status":
+        if not _ship.is_configured():
+            add_console("  Not joined to a hub. Join one:")
+            add_console(f"    {DIM}join https://<hub:8443> <node_id> <key>{RESET}")
+            return
+        cfg = _ship.load_config()
+        running = _apiary_shipper is not None
+        state = f"{GREEN}shipping{RESET}" if running else f"{YELLOW}configured (not running){RESET}"
+        add_console(f"{BOLD}Apiary shipper{RESET}")
+        add_console(f"  hub:     {cfg.get('hub_url','')}")
+        add_console(f"  node_id: {cfg.get('node_id','')}")
+        add_console(f"  payload: {'full (opt-in)' if cfg.get('payload_optin') else 'attack-vectors only'}")
+        add_console(f"  status:  {state}")
+        return
+    if sub == "off":
+        if _apiary_shipper is not None:
+            _apiary_shipper.stop()
+            _apiary_shipper = None
+            add_console(f"  {GREEN}Shipping stopped.{RESET}")
+        else:
+            add_console("  Not shipping.")
+        return
+    if len(parts) < 4:
+        add_console("  usage: join <https://hub:8443> <node_id> <key> [hub-ca.pem]")
+        return
+    hub, node_id, key = parts[1], parts[2], parts[3]
+    ca = parts[4] if len(parts) > 4 else ""
+    if urlparse(hub).scheme != "https":
+        add_console(f"  {RED}hub must be https:// — refusing to ship node key over http.{RESET}")
+        return
+    cfg = _ship.load_config()
+    cfg.update({"hub_url": hub, "node_id": node_id, "node_key": key})
+    if ca:
+        cfg["ca_cert"] = ca                 # pin the hub CA (from `collector keygen`)
+    _ship.save_config(cfg)
+    if not ca and "ca_cert" not in cfg:
+        add_console(f"  {YELLOW}No hub CA pinned — a self-signed hub will fail verification "
+                    f"(events spool).{RESET} Pass the hub's cert: join … <hub-ca.pem>")
+    if _apiary_shipper is not None:
+        _apiary_shipper.stop()
+    _apiary_shipper = _ship.Shipper(cfg)
+    _apiary_shipper.start_background()
+    add_console(f"  {GREEN}Joined {hub} as '{node_id}'. Shipping events.{RESET}")
+
+
+def _disp_ask(parts):
+    """ask — natural-language query over harvested intel (Pro feature).
+      ask <question>                    answer locally (no API key, no network)
+      ask --provider anthropic <q>      opt-in LLM (redacted evidence only)
+    Default is the local brain: your own trained intel answers, zero egress."""
+    if not tier_at_least("pro"):
+        add_console(f"  {YELLOW}Natural-language `ask` is a Pro feature.{RESET}")
+        add_console(f"  {PRO_UPGRADE_HINT}")
+        return
+    mod = _pro_sub("ask")
+    if mod is None:
+        add_console(f"  {RED}Pro add-on not installed.{RESET}")
+        return
+    tokens = parts[1:]
+    provider = "local"
+    if "--provider" in tokens:
+        i = tokens.index("--provider")
+        if i + 1 < len(tokens):
+            provider = tokens[i + 1].lower()
+            del tokens[i:i + 2]
+        else:
+            del tokens[i:i + 1]
+    question = " ".join(tokens).strip()
+    if not question:
+        add_console("  usage: ask <question>  [--provider local|anthropic|ollama]")
+        return
+    try:
+        res = mod.ask(question, provider=provider,
+                      source_path=os.path.join(LOG_DIR, "all_events.json"))
+    except Exception as e:
+        add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+        return
+    add_console(f"{BOLD}{CYAN}ask{RESET} {DIM}(provider: {_ansi_strip(str(res.get('provider')))}){RESET}")
+    for line in str(res.get("answer", "")).splitlines():
+        add_console(f"  {_ansi_strip(line)}")
+    llm = res.get("llm")
+    if isinstance(llm, dict):
+        if llm.get("error"):
+            add_console(f"  {YELLOW}LLM provider unavailable: {_ansi_strip(str(llm['error']))}{RESET}")
+        elif llm.get("summary"):
+            add_console(f"  {BOLD}LLM summary:{RESET} {_ansi_strip(str(llm['summary']))[:400]}")
+
+
+def _disp_collector(parts):
+    """collector — run/inspect the fleet hub, Apiary (Pro feature).
+      collector                    registered nodes + contributed event counts
+      collector start              start the ingest server (background, TLS :8443)
+      collector keygen <name>      mint a node credential (shown once)
+      collector revoke <node_id>   revoke a node's key
+      collector model <path>       stage a distilled edge model for nodes to pull
+      collector model              show the staged edge model (sha/size)
+    The hub aggregates the fleet; nodes ship for free (see: join)."""
+    global _apiary_collector
+    if not tier_at_least("pro"):
+        add_console(f"  {YELLOW}The fleet hub (Apiary collector) is a Pro feature.{RESET}")
+        add_console(f"  {PRO_UPGRADE_HINT}")
+        add_console(f"  {DIM}Free nodes can still ship to a hub you run elsewhere: join <hub> …{RESET}")
+        return
+    mod = _pro_sub("collector")
+    if mod is None:
+        add_console(f"  {RED}Pro add-on not installed.{RESET}")
+        return
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    if sub == "keygen":
+        if len(parts) < 3:
+            add_console("  usage: collector keygen <node-name> [https://hub-url:8443]")
+            return
+        try:
+            node_id, key = mod.mint_node_key(parts[2])
+        except Exception as e:
+            add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+            return
+        add_console(f"  {GREEN}Node '{node_id}' minted.{RESET} {DIM}(key shown once, not recoverable){RESET}")
+        hub_url = parts[3] if len(parts) > 3 else ""
+        if hub_url.startswith("https://"):
+            token = mod.make_enroll_token(hub_url, node_id, key, mod.hub_ca_pem())
+            add_console(f"  {BOLD}One-shot enroll — paste this on the node:{RESET}")
+            add_console(f"    {GREEN}join {token}{RESET}")
+            add_console(f"  {DIM}(sets hub + credentials and pins the CA in one step){RESET}")
+        else:
+            add_console(f"    node_id: {BOLD}{node_id}{RESET}")
+            add_console(f"    key:     {BOLD}{key}{RESET}")
+            ca = mod.hub_ca_path()
+            if ca:
+                add_console(f"    hub CA:  {DIM}{ca}{RESET}  {DIM}(copy to the node){RESET}")
+            add_console(f"  {DIM}On the node:  join https://<this-hub:8443> {node_id} {key}"
+                        f"{' <hub-ca.pem>' if ca else ''}{RESET}")
+            add_console(f"  {DIM}Easier: pass the hub URL for a one-paste token → "
+                        f"collector keygen {parts[2]} https://<hub:8443>{RESET}")
+        return
+    if sub == "revoke":
+        if len(parts) < 3:
+            add_console("  usage: collector revoke <node_id>")
+            return
+        try:
+            ok = mod.NodeRegistry().revoke(parts[2])
+        except Exception as e:
+            add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+            return
+        add_console(f"  {GREEN}Revoked '{parts[2]}'.{RESET}" if ok else f"  {YELLOW}No such node.{RESET}")
+        return
+    if sub == "start":
+        if _apiary_collector is not None:
+            add_console("  Collector already running.")
+            return
+        try:
+            _apiary_collector = mod.Collector()
+            _apiary_collector.start_background()
+        except Exception as e:
+            add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+            return
+        add_console(f"  {GREEN}Collector ingesting on :{mod.DEFAULT_PORT} (TLS).{RESET}")
+        add_console(f"  {DIM}Front it with cloudflared/WireGuard; nodes join with a minted key.{RESET}")
+        return
+    if sub == "model":
+        # Stage / inspect the distilled Cortex edge model that nodes pull via GET /model.
+        coll = _apiary_collector or mod.Collector()
+        if len(parts) > 2:
+            try:
+                info = coll.stage_model(parts[2])
+            except Exception as e:
+                add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+                return
+            add_console(f"  {GREEN}Edge model staged.{RESET} {info['bytes']}B  "
+                        f"sha:{info['sha256'][:12]}…")
+            add_console(f"  {DIM}Nodes with model_fetch on will pull it from GET /model.{RESET}")
+            return
+        try:
+            st = coll.model_status()
+        except Exception as e:
+            add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+            return
+        if not st.get("staged"):
+            add_console(f"  {YELLOW}No edge model staged.{RESET}")
+            add_console(f"  {DIM}Stage one:  collector model <path-to-edge_model.json>{RESET}")
+            return
+        add_console(f"{BOLD}Staged edge model:{RESET} {st['bytes']}B  "
+                    f"sha:{st['sha256'][:12]}…  {st['mtime']}")
+        add_console(f"  {DIM}{st['path']}{RESET}")
+        return
+    if sub == "threat":
+        # Phase 3: cross-node live threat merge (fleetThreat).
+        gw = _pro_sub("gateway")
+        if gw is None:
+            add_console(f"  {RED}gateway module unavailable.{RESET}")
+            return
+        min_t = 0
+        if len(parts) > 2 and parts[2].isdigit():
+            min_t = int(parts[2])
+        try:
+            rows = gw.fleet_threat(min_threat=min_t)
+        except Exception as e:
+            add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+            return
+        if not rows:
+            add_console("  No fleet nodes reachable, or none above threshold.")
+            add_console(f"  {DIM}Add nodes to ~/.config/netwatch/fleet.json (ip, api_token).{RESET}")
+            return
+        add_console(f"{BOLD}Fleet threat (merged across nodes, max score):{RESET}")
+        for r in rows[:20]:
+            add_console(f"  {r['ip']:<18} threat:{r['threat']:<4} hits:{r['packets']:<7} "
+                        f"seen-on:{','.join(r['nodes']) or '-'}")
+        return
+    # default: fleet status
+    fleet_mod = _pro_sub("fleet")
+    try:
+        rows = fleet_mod.Fleet().hub_status() if fleet_mod else []
+    except Exception as e:
+        add_console(f"  {RED}{type(e).__name__}{RESET}")
+        return
+    if not rows:
+        add_console("  No nodes have joined this hub yet.")
+        add_console(f"  {DIM}Mint one:  collector keygen <name>{RESET}")
+        return
+    add_console(f"{BOLD}Apiary — nodes reporting to this hub:{RESET}")
+    for r in rows:
+        flag = f" {RED}[revoked]{RESET}" if r.get("revoked") else ""
+        add_console(f"  {r['node_id']:<16} today:{r['events_today']:<6} "
+                    f"total:{r['events_total']:<8} last:{r.get('last_seen') or '-'}{flag}")
+    # Phase 4: fleet rollup (aggregate of harvested events across all nodes).
+    an = _pro_sub("analytics")
+    if an is not None:
+        try:
+            roll = an.fleet_rollup(days=7)
+        except Exception:
+            roll = None
+        if roll and roll.get("total_events"):
+            add_console(f"{BOLD}Fleet rollup (7d):{RESET} {roll['total_events']} events across "
+                        f"{roll['nodes_active']} active node(s)")
+            if roll["top_services"]:
+                svc = "  ".join(f"{s}:{c}" for s, c in roll["top_services"][:5])
+                add_console(f"  {DIM}top services:{RESET} {svc}")
+            if roll["top_sources"]:
+                src = "  ".join(f"{s}({c})" for s, c in roll["top_sources"][:5])
+                add_console(f"  {DIM}top sources: {RESET} {src}")
+            cx = roll.get("cortex")
+            if cx:
+                add_console(f"{BOLD}Cortex brain:{RESET} {cx.get('attackers', 0)} attackers over "
+                            f"{cx.get('trained_on', 0)} events · peak novelty {cx.get('peak_score', 0)}")
+    add_console(f"  {DIM}cross-node threat merge:  collector threat [min-score]{RESET}")
+
+
 def _disp_summary(parts):
     add_console(f"{BOLD}{CYAN}{'='*50}{RESET}")
     add_console(f"{BOLD}{CYAN}  NETWORK SUMMARY{RESET}")
@@ -5883,34 +6175,96 @@ def _build_frame(cols=80, max_content=35, active_tab=None):
     return lines
 
 
+_apiary_roll_cache = {"data": None, "ts": 0.0}
+_apiary_roll_lock = threading.Lock()
+
+
+def _apiary_rollup_cached(days=7, ttl=20):
+    """Shared cached fleet rollup for BOTH the `fleet` TUI tab and /api/fleet, so
+    the redraw / web-refresh loops don't re-read the store each time. Returns the
+    raw rollup dict, or None (Free, no collector, empty store, or error)."""
+    an = _pro_sub("analytics")
+    if an is None:
+        return None
+    now = time.time()
+    with _apiary_roll_lock:
+        if (_apiary_roll_cache["data"] is not None
+                and now - _apiary_roll_cache["ts"] < ttl):
+            return _apiary_roll_cache["data"]
+    try:
+        roll = an.fleet_rollup(days=days)
+    except Exception:
+        return None
+    with _apiary_roll_lock:
+        _apiary_roll_cache["data"] = roll
+        _apiary_roll_cache["ts"] = now
+    return roll
+
+
+def _apiary_fleet_lines(max_nodes=8):
+    """TUI formatting of the cached hub rollup. [] when there's nothing to show."""
+    roll = _apiary_rollup_cached()
+    if not roll or not roll.get("total_events"):
+        return []
+    lines = [f"{BOLD}{MAGENTA}  APIARY HUB — fleet rollup (7d){RESET}",
+             f"  {DIM}{roll['total_events']} events · {roll['nodes_active']} active node(s){RESET}"]
+    for n in roll["nodes"][:max_nodes]:
+        flag = f" {RED}[revoked]{RESET}" if n.get("revoked") else ""
+        nm = _ansi_strip(str(n.get("name") or n.get("node_id") or "?"))[:20]
+        last = _ansi_strip(str(n.get("last_seen") or "-"))[:19]
+        lines.append(f"  ◦ {nm:<20} events:{n.get('events', 0):<7} last:{last}{flag}")
+    if roll.get("top_services"):
+        svc = "  ".join(f"{_ansi_strip(str(s))[:12]}:{c}" for s, c in roll["top_services"][:5])
+        lines.append(f"  {DIM}top services:{RESET} {svc}")
+    if roll.get("top_sources"):
+        src = "  ".join(f"{_ansi_strip(str(s))[:15]}({c})" for s, c in roll["top_sources"][:5])
+        lines.append(f"  {DIM}top sources: {RESET} {src}")
+    cx = roll.get("cortex")
+    if cx:
+        lines.append(f"  {BOLD}{YELLOW}CORTEX brain{RESET} {DIM}· {cx.get('attackers', 0)} attackers "
+                     f"over {cx.get('trained_on', 0)} events · peak novelty {cx.get('peak_score', 0)}{RESET}")
+        for a in (cx.get("top_attackers") or [])[:3]:
+            svc = ",".join(_ansi_strip(str(s))[:10] for s in (a.get("services") or [])[:3])
+            lines.append(f"    {_ansi_strip(str(a.get('ip', '?')))[:15]:<15} "
+                         f"novelty:{a.get('score', 0):<3} hits:{a.get('hits', 0):<5} {DIM}{svc}{RESET}")
+    return lines
+
+
 def _section_fleet(max_lines=30):
-    """Live view of remote node(s) — e.g. your droplet. Auto-refreshed by the
-    background poller. Free shows 1 node; Pro aggregates the whole fleet."""
+    """Fleet view: pull-based remote node(s) (`remote add …`) plus the push-based
+    Apiary hub rollup (nodes that `join`ed this collector). Free shows 1 remote;
+    Pro aggregates the whole fleet and shows the Apiary rollup."""
     remotes = _load_remotes()
-    out = [f"{BOLD}{MAGENTA}  REMOTE NODES — live{RESET}"]
-    if not remotes:
-        out.append(f"  {DIM}No remote nodes yet.{RESET}")
-        out.append(f"  Add your droplet:  {GREEN}remote add droplet https://<tunnel-or-ip:9090> <web-token>{RESET}")
-        out.append(f"  {DIM}This tab then auto-refreshes with its live data every "
-                   f"{int(_REMOTE_POLL_INTERVAL)}s.{RESET}")
-        return out
-    _ensure_remote_poller()
-    with _remote_live_lock:
-        live = dict(_remote_live)
     paying = tier_at_least("pro")
-    shown = list(remotes) if paying else list(remotes)[:1]
-    for name in shown:
-        url = _ansi_strip(str(remotes[name].get("url", "")))[:44]
-        entry = live.get(name)
-        if not entry:
-            out.append(f"{BOLD}◉ {_ansi_strip(str(name))[:24]}{RESET} {DIM}{url}  connecting…{RESET}")
-            continue
-        age = int(time.time() - entry.get("ts", 0))
-        out.append(f"{BOLD}◉ {_ansi_strip(str(name))[:24]}{RESET} {DIM}{url}  ({age}s ago){RESET}")
-        out.extend(_remote_state_lines(name, entry.get("data")))
-        out.append("")
-    if not paying and len(remotes) > 1:
-        out.append(f"  {DIM}+{len(remotes)-1} more node(s) hidden.{RESET} {PRO_UPGRADE_HINT}")
+    apiary = _apiary_fleet_lines() if paying else []
+    out = []
+    if remotes:
+        out.append(f"{BOLD}{MAGENTA}  REMOTE NODES — live{RESET}")
+        _ensure_remote_poller()
+        with _remote_live_lock:
+            live = dict(_remote_live)
+        shown = list(remotes) if paying else list(remotes)[:1]
+        for name in shown:
+            url = _ansi_strip(str(remotes[name].get("url", "")))[:44]
+            entry = live.get(name)
+            if not entry:
+                out.append(f"{BOLD}◉ {_ansi_strip(str(name))[:24]}{RESET} {DIM}{url}  connecting…{RESET}")
+                continue
+            age = int(time.time() - entry.get("ts", 0))
+            out.append(f"{BOLD}◉ {_ansi_strip(str(name))[:24]}{RESET} {DIM}{url}  ({age}s ago){RESET}")
+            out.extend(_remote_state_lines(name, entry.get("data")))
+            out.append("")
+        if not paying and len(remotes) > 1:
+            out.append(f"  {DIM}+{len(remotes)-1} more node(s) hidden.{RESET} {PRO_UPGRADE_HINT}")
+    if apiary:
+        if out:
+            out.append("")
+        out.extend(apiary)
+    if not out:
+        out.append(f"{BOLD}{MAGENTA}  FLEET{RESET}")
+        out.append(f"  {DIM}No fleet nodes yet.{RESET}")
+        out.append(f"  Track a node:  {GREEN}remote add droplet https://<tunnel-or-ip:9090> <web-token>{RESET}")
+        out.append(f"  Or run a hub:  {GREEN}collector{RESET} {DIM}— nodes join it: join <hub> <id> <key>{RESET}")
     return out[:max_lines] if max_lines and len(out) > max_lines else out
 
 
@@ -6731,10 +7085,25 @@ def web_fleet():
             "age": int(now - entry["ts"]) if entry and entry.get("ts") else None,
             "data": (entry or {}).get("data"),
         })
+    payload = {"nodes": nodes, "total": len(remotes), "paying": paying,
+               "poll": int(_REMOTE_POLL_INTERVAL)}
+    if paying:
+        roll = _apiary_rollup_cached()
+        if roll and roll.get("total_events"):
+            # Aggregate only — omit roll["recent"] so raw events (which may carry
+            # payload) are never shipped to the browser.
+            payload["apiary"] = {
+                "total_events": roll.get("total_events", 0),
+                "nodes_active": roll.get("nodes_active", 0),
+                "nodes": roll.get("nodes", []),
+                "top_services": roll.get("top_services", []),
+                "top_sources": roll.get("top_sources", []),
+                # Cortex brain aggregate — already trimmed/sanitized upstream and
+                # carries no creds or raw events (safe for the browser).
+                "cortex": roll.get("cortex"),
+            }
     return web_app.response_class(
-        json.dumps({"nodes": nodes, "total": len(remotes), "paying": paying,
-                    "poll": int(_REMOTE_POLL_INTERVAL)}, default=str),
-        mimetype="application/json")
+        json.dumps(payload, default=str), mimetype="application/json")
 
 @web_app.route("/api/stream")
 def web_stream():
@@ -7265,8 +7634,8 @@ function _fleetPaint(){
   const body=document.getElementById("fleet-body");if(!body)return;
   const d=_fleetCache||{nodes:[]};
   const cnt=document.getElementById("fleet-count");if(cnt)cnt.textContent="("+(d.total||0)+")";
-  if(!d.nodes||!d.nodes.length){
-    body.innerHTML=_empty("No remote nodes","In the terminal run:  remote add droplet https://<tunnel-or-ip:9090> <web-token>  — then this tab shows its live data.");
+  if((!d.nodes||!d.nodes.length)&&!d.apiary){
+    body.innerHTML=_empty("No fleet nodes","Track a node:  remote add droplet https://<tunnel-or-ip:9090> <web-token>  —  or run a hub:  collector  (nodes join it with:  join <hub> <id> <key>).");
     return;
   }
   let h="";
@@ -7297,7 +7666,38 @@ function _fleetPaint(){
     }
   }
   if(!d.paying&&d.total>1){h+=`<div class="empty">+${d.total-1} more node(s) hidden — upgrade to Pro for full fleet view.</div>`;}
+  if(d.apiary){h+=_renderApiary(d.apiary);}
   body.innerHTML=h;
+}
+function _renderApiary(ap){
+  let h=`<div class="section-title">APIARY HUB — fleet rollup <span class="count">${Number(ap.total_events||0).toLocaleString()} events · ${Number(ap.nodes_active||0)} active</span></div>`;
+  const nodes=Array.isArray(ap.nodes)?ap.nodes:[];
+  if(nodes.length){
+    h+=`<table><tr><th>Node</th><th style="width:80px">Events</th><th>Last seen</th></tr>`;
+    nodes.slice(0,12).forEach(n=>{
+      const rev=n&&n.revoked?` <span style="color:var(--red)">[revoked]</span>`:"";
+      h+=`<tr><td>${esc(String((n&&(n.name||n.node_id))||"?"))}${rev}</td><td>${Number((n&&n.events)||0).toLocaleString()}</td><td style="color:var(--dim)">${esc(String((n&&n.last_seen)||"-"))}</td></tr>`;
+    });
+    h+=`</table>`;
+  }
+  const svc=Array.isArray(ap.top_services)?ap.top_services:[];
+  if(svc.length){h+=`<div class="meta">Top services: ${svc.slice(0,6).map(x=>esc(String(x[0]))+":"+Number(x[1]||0)).join("  ")}</div>`;}
+  const src=Array.isArray(ap.top_sources)?ap.top_sources:[];
+  if(src.length){h+=`<div class="meta">Top sources: ${src.slice(0,6).map(x=>esc(String(x[0]))+"("+Number(x[1]||0)+")").join("  ")}</div>`;}
+  const cx=ap.cortex;
+  if(cx){
+    h+=`<div class="section-title">CORTEX brain <span class="count">${Number(cx.attackers||0).toLocaleString()} attackers · ${Number(cx.trained_on||0).toLocaleString()} events · peak novelty ${Number(cx.peak_score||0)}</span></div>`;
+    const at=Array.isArray(cx.top_attackers)?cx.top_attackers:[];
+    if(at.length){
+      h+=`<table><tr><th>Attacker</th><th style="width:70px">Novelty</th><th style="width:60px">Hits</th><th>Services</th></tr>`;
+      at.slice(0,8).forEach(a=>{
+        const svcs=Array.isArray(a&&a.services)?a.services.map(s=>esc(String(s))).join(", "):"";
+        h+=`<tr><td>${esc(String((a&&a.ip)||"?"))}</td><td>${Number((a&&a.score)||0)}</td><td>${Number((a&&a.hits)||0).toLocaleString()}</td><td style="color:var(--dim)">${svcs}</td></tr>`;
+      });
+      h+=`</table>`;
+    }
+  }
+  return h;
 }
 function renderReplay(){
   let s=`<div class="section-title">SESSION REPLAY
@@ -8728,11 +9128,67 @@ def _cli_subcommand(argv):
             print(PRO_UPGRADE_HINT)
             return 0
         return _lic_main(argv)
+    if cmd == "collector":
+        # Run the Apiary fleet hub in the foreground (systemd-friendly). Pro only.
+        if not tier_at_least("pro"):
+            print("The fleet hub (collector) is a Pro feature.")
+            print(PRO_UPGRADE_HINT)
+            return 1
+        mod = _pro_sub("collector")
+        if mod is None:
+            print("Pro add-on not installed — pip install netwatch-pro")
+            return 1
+        print(f"Starting Apiary collector on :{mod.DEFAULT_PORT} …  (Ctrl-C to stop)")
+        try:
+            mod.Collector().serve_forever()
+        except KeyboardInterrupt:
+            return 0
+        except Exception as e:
+            print(f"collector failed: {type(e).__name__}: {e}")
+            return 1
+        return 0
+    if cmd == "ask":
+        # NL query over harvested intel. Local by default (no key, no network).
+        if not tier_at_least("pro"):
+            print("Natural-language `ask` is a Pro feature.")
+            print(PRO_UPGRADE_HINT)
+            return 1
+        mod = _pro_sub("ask")
+        if mod is None:
+            print("Pro add-on not installed — pip install netwatch-pro")
+            return 1
+        rest = argv[1:]
+        provider = "local"
+        if "--provider" in rest:
+            i = rest.index("--provider")
+            if i + 1 < len(rest):
+                provider = rest[i + 1].lower()
+                del rest[i:i + 2]
+            else:
+                del rest[i:i + 1]
+        question = " ".join(rest).strip()
+        if not question:
+            print('usage: netwatch ask "<question>" [--provider local|anthropic|ollama]')
+            return 1
+        try:
+            res = mod.ask(question, provider=provider,
+                          source_path=os.path.join(LOG_DIR, "all_events.json"))
+        except Exception as e:
+            print(f"ask failed: {type(e).__name__}: {e}")
+            return 1
+        print(res.get("answer", ""))
+        llm = res.get("llm")
+        if isinstance(llm, dict):
+            if llm.get("error"):
+                print(f"\n[LLM provider unavailable: {llm['error']}]")
+            elif llm.get("summary"):
+                print(f"\nLLM summary: {llm['summary']}")
+        return 0
     return 0
 
 
-_CLI_SUBCOMMANDS = ("activate", "register", "license", "status",
-                    "--version", "-V", "version")
+_CLI_SUBCOMMANDS = ("activate", "register", "license", "status", "collector",
+                    "ask", "--version", "-V", "version")
 
 
 def main():

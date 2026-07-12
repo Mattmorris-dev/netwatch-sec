@@ -66,6 +66,20 @@ def reset_global_state():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_log_dir(tmp_path, monkeypatch):
+    """Redirect LOG_DIR/PCAP_DIR to a per-test tmp dir so tests never write to
+    the real logs/ (which can hold root-owned files from a prior `sudo netwatch`
+    run — an unwritable all_events.json then fails every test that logs an event).
+    Mirrors the explicit `patch.object(netwatch, "LOG_DIR", tmp_path)` that many
+    tests already do; here it is applied to every test uniformly."""
+    d = tmp_path / "nwlogs"
+    (d / "pcaps").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(netwatch, "LOG_DIR", str(d))
+    monkeypatch.setattr(netwatch, "PCAP_DIR", str(d / "pcaps"))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def mock_getaddrinfo(request):
     """Return a public IP for any DNS lookup so SSRF validators pass in tests."""
     if "integration" in (request.node.get_closest_marker("skipif") and "network" or ""):
