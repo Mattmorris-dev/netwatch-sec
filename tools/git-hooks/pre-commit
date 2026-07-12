@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# netwatch (free/public repo) secret guard — refuse to commit anything that must
+# never be public. This repo is the OPEN side (PyPI netwatch-sec); the danger here
+# is not the signing key (it lives only in netwatch-pro) but leaking a *credential*
+# into a public commit: a private key, an Anthropic/API token, an activated license
+# blob, or a node enroll token (nwj_...) that bundles hub creds + CA.
+#
+# Installed via:  git config core.hooksPath tools/git-hooks
+# Emergency bypass (be sure):  git commit --no-verify
+
+fail=0
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+
+# 1. Block secret files by path.
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+        *.key|*.pem|*id_rsa|*id_ed25519|*.keygen_private.key)
+            echo "BLOCKED: key/cert file staged: $f" >&2; fail=1 ;;
+        *.license|*license.blob|*.env|.env)
+            echo "BLOCKED: secret/license/env file staged: $f" >&2; fail=1 ;;
+    esac
+done <<EOF
+$staged
+EOF
+
+# 2. Scan staged *added* content for secret material.
+added=$(git diff --cached -U0 | grep -E '^\+' | sed 's/^\+//')
+
+# 2a. Any PRIVATE KEY block pasted into a tracked file.
+if printf '%s\n' "$added" | grep -Eq -- '-----BEGIN ([A-Z0-9 ]*)?PRIVATE KEY-----'; then
+    echo "BLOCKED: staged content contains a PRIVATE KEY block." >&2; fail=1
+fi
+# 2b. Anthropic / common provider API keys.
+if printf '%s\n' "$added" | grep -Eq 'sk-ant-[A-Za-z0-9_-]{20,}'; then
+    echo "BLOCKED: staged content contains an Anthropic API key (sk-ant-...)." >&2; fail=1
+fi
+if printf '%s\n' "$added" | grep -Eq '(AKIA|ASIA)[A-Z0-9]{16}'; then
+    echo "BLOCKED: staged content contains an AWS access key id." >&2; fail=1
+fi
+# 2c. A node enroll token — bundles hub URL + per-node key + CA; never publish one.
+if printf '%s\n' "$added" | grep -Eq 'nwj_[A-Za-z0-9_-]{24,}'; then
+    echo "BLOCKED: staged content contains an Apiary enroll token (nwj_...)." >&2; fail=1
+fi
+# 2d. An activated license blob (base64url(json-payload).base64url(sig)). The JSON
+#     payload always starts with `{"...` so the blob starts `ey...`, same shape as
+#     a JWT — this catches both the license and any stray JWT/bearer token.
+if printf '%s\n' "$added" | grep -Eq 'ey[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{40,}'; then
+    echo "BLOCKED: staged content looks like a license blob or JWT (ey....sig)." >&2; fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "" >&2
+    echo "Secret guard tripped. Unstage with:  git restore --staged <file>" >&2
+    echo "If this is a false positive, review carefully, then:  git commit --no-verify" >&2
+    exit 1
+fi
+exit 0
