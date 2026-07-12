@@ -526,6 +526,37 @@ sudo systemctl enable --now netwatch
 
 No TTY detected (SSH pipe, systemd, Docker) = headless mode. Web dashboard only on `:9090`. All honeypots and traffic monitoring still active.
 
+## NetWatch Pro
+
+The core you're reading about is **free and open source (AGPL-3.0)** — all four
+honeypots, live capture, session replay, the TUI and web dashboard. It stays
+free, forever.
+
+**NetWatch Pro** is an optional paid add-on for people running NetWatch across
+more than one box or in front of a team. It layers fleet, intelligence, and
+reporting on top of the free core — the free package detects a valid license and
+unlocks these; without one it simply keeps running as Free.
+
+| | Free | Pro | Business | Enterprise |
+|---|---|---|---|---|
+| Honeypots · capture · replay · dashboards | ✓ | ✓ | ✓ | ✓ |
+| Apiary fleet (multi-node aggregation) | | ✓ | ✓ | ✓ |
+| Threat intel enrichment · MITRE ATT&CK · IP watchlist | | ✓ | ✓ | ✓ |
+| `ask` — natural-language queries over your intel | | ✓ | ✓ | ✓ |
+| Signed PDF incident reports · alerts (Slack/SMS/PagerDuty) | | ✓ | ✓ | ✓ |
+| SIEM forwarding · webhooks | | | ✓ | ✓ |
+| Compliance control-coverage reports · SSO | | | | ✓ |
+| Nodes | 1 | 1 | 25 | negotiated |
+| Price | $0 | $20/mo · $200/yr | $99/mo · $990/yr | custom |
+
+Pricing and terms live in [PRICING.md](https://github.com/mattymomo1993/netwatch-pro).
+Already have a key:
+
+```bash
+netwatch activate <your-license-key>
+netwatch license          # confirm the tier and expiry
+```
+
 ## Support
 
 NetWatch is built and maintained solo. If it saves you time or protects your network, consider tipping — it keeps the lights on and pays for the tools that go into the next release.

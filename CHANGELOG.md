@@ -5,6 +5,12 @@ All notable changes to NetWatch are documented here. Format follows [Keep a Chan
 ## 1.4.0 — 2026-07-12
 
 ### Added
+- **NetWatch Pro — paid plans.** The free AGPL core (honeypots, capture, replay,
+  dashboards) stays free forever; an optional paid add-on layers fleet
+  aggregation, threat-intel enrichment, `ask`, signed reports/alerts, SIEM
+  forwarding, and compliance reporting on top. Free/Pro/Business/Enterprise
+  tiers — see the README and `netwatch activate <key>`. The free package detects
+  a valid license and unlocks Pro features; without one it runs unchanged as Free.
 - **`netwatch ask "<question>"`** — natural-language queries over this node's
   harvested intel (Pro add-on required). The default provider is fully local:
   answers are composed from retrieved, novelty-scored, cited evidence with
