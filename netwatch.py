@@ -71,7 +71,7 @@ for _i, _a in enumerate(sys.argv):
     if _a == "--token" and _i + 1 < len(sys.argv):
         _cli_token = sys.argv[_i + 1]
         break
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 # Honeypot listener ports — overridable via env so deployments can move to
 # standard ports (80/23/21/554) without local sed against the repo.
@@ -92,6 +92,8 @@ _TIER_ALIASES = {"free": "community", "business": "team"}  # marketing → inter
 
 # Upgrade CTA. No waitlist — points at pricing + the real activation command.
 PRO_UPGRADE_HINT = "🔒 Pro feature — see PRICING.md · activate: netwatch activate <key>"
+BUSINESS_UPGRADE_HINT = "🔒 Business feature — see PRICING.md · activate: netwatch activate <key>"
+ENTERPRISE_UPGRADE_HINT = "🔒 Enterprise feature — see PRICING.md · activate: netwatch activate <key>"
 
 
 def _license_tier():
@@ -111,7 +113,14 @@ def _license_tier():
 
 
 def current_tier():
-    """Live effective tier. NETWATCH_PRO=1 forces 'pro' (dev override)."""
+    """Live effective tier. Dev overrides: NETWATCH_TIER=<tier> forces any tier
+    for smoke-testing free-side gating (pro modules still verify the real
+    license — fail closed); NETWATCH_PRO=1 forces 'pro' (legacy override)."""
+    forced = os.environ.get("NETWATCH_TIER", "").strip().lower()
+    if forced:
+        forced = _TIER_ALIASES.get(forced, forced)
+        if forced in _TIER_ORDER:
+            return forced
     if os.environ.get("NETWATCH_PRO") == "1":
         return "pro"
     return _license_tier() or "community"
@@ -151,6 +160,35 @@ def _pro_sub(name):
         mod = None
     _pro_submods[name] = mod
     return mod
+
+
+def _maybe_start_pro_scheduler():
+    """Start the Business scheduled-report loop iff tier >= team. The only free-
+    side logic is this seam call; the loop lives in netwatch_pro.report_sched."""
+    if not tier_at_least("team"):
+        return
+    mod = _pro_sub("report_sched")
+    if mod is None:
+        return
+    try:
+        mod.ensure_background(os.path.join(LOG_DIR, "all_events.json"))
+    except Exception:
+        pass
+
+
+def audit_emit(action, detail=None, actor="local"):
+    """Tamper-evident audit-trail seam (Enterprise). No-op below Enterprise —
+    no surprise disk writes for non-payers — and NEVER raises or blocks the
+    caller: the audit trail is evidence, not a point of failure."""
+    if not tier_at_least("enterprise"):
+        return
+    mod = _pro_sub("audit")
+    if mod is None:
+        return
+    try:
+        mod.append(action, detail or {}, actor)
+    except Exception:
+        pass
 
 
 def pro_active_modules():
@@ -393,6 +431,49 @@ def _rotate_log(filepath):
     except OSError:
         pass
 
+# ─── Cortex local feed ───────────────────────────────────────────────────
+# Every honeypot event a free node sees also flows into the LOCAL Cortex brain
+# with zero egress: we mirror the attack vector into the Apiary store that
+# Cortex already reads (~/.config/netwatch/apiary_data/local/<date>.json). If a
+# Cortex install is present, its scheduled retrain picks the events up
+# automatically — no join, no hub, no network. Set NETWATCH_CORTEX_FEED=0 to
+# opt out, =1 to force on even without a detected Cortex.
+_CORTEX_STORE_DIR = os.path.join(os.path.expanduser("~"), ".config", "netwatch",
+                                 "apiary_data", "local")
+_cortex_feed_state = {"checked": False, "on": False}
+
+
+def _cortex_feed_enabled():
+    env = os.environ.get("NETWATCH_CORTEX_FEED")
+    if env == "0":
+        return False
+    if env == "1":
+        return True
+    if not _cortex_feed_state["checked"]:
+        # Auto-on when a local Cortex is detectable (its store dir or the repo).
+        _cortex_feed_state["on"] = (
+            os.path.isdir(os.path.expanduser("~/agents/cortex"))
+            or os.path.isdir(os.path.dirname(_CORTEX_STORE_DIR)))
+        _cortex_feed_state["checked"] = True
+    return _cortex_feed_state["on"]
+
+
+def _cortex_feed_event(entry):
+    """Mirror one honeypot event (attack-vector fields only) into the local
+    Cortex store. Best-effort — never raises into the honeypot path."""
+    if not _cortex_feed_enabled():
+        return
+    try:
+        os.makedirs(_CORTEX_STORE_DIR, exist_ok=True, mode=0o700)
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        vec = {"timestamp": entry.get("timestamp"), "service": entry.get("service"),
+               "source_ip": entry.get("source_ip"), "source_port": entry.get("source_port")}
+        with open(os.path.join(_CORTEX_STORE_DIR, f"{day}.json"), "a") as f:
+            f.write(json.dumps(vec) + "\n")
+    except OSError:
+        pass
+
+
 def log_event(service, ip, data):
     truncated = _truncate_data(data)
     entry = {
@@ -412,6 +493,7 @@ def log_event(service, ip, data):
         _rotate_log(all_log)
         with open(all_log, "a") as f:
             f.write(line)
+    _cortex_feed_event(entry)                    # local brain feed, zero egress
 
     short = _short_summary(service, ip, data)
     with lock:
@@ -3487,7 +3569,8 @@ def handle_command(cmd):
         "threats": (1, _disp_attacks),
         "remote": (1, _disp_remote), "droplet": (1, _disp_remote),
         "join": (1, _disp_join), "collector": (1, _disp_collector),
-        "ask": (2, _disp_ask),
+        "ask": (2, _disp_ask), "users": (1, _disp_users),
+        "audit": (1, _disp_audit), "compliance": (1, _disp_compliance),
     }
 
     if action in _DIRECT_CMDS:
@@ -3597,6 +3680,7 @@ def _disp_rotate_token():
         _persist_web_token(new_token, _TOKEN_PATH)
         redacted = f"{new_token[:6]}…{new_token[-4:]}"
         add_console(f"{GREEN}Web token rotated: {redacted}  (full token in {_TOKEN_PATH}){RESET}")
+        audit_emit("web.token_rotate")
     except Exception as e:
         add_console(f"{RED}Token rotation failed: {_safe_error(e)}{RESET}")
 
@@ -4322,12 +4406,14 @@ def _disp_block(parts):
     add_console(f"{RED}BLOCKED: {ip} (iptables DROP in+out){RESET}")
     with lock:
         alerts.append({"time": datetime.now().strftime("%H:%M:%S"), "msg": f"BLOCKED: {ip}"})
+    audit_emit("net.block", {"ip": ip})
 
 def _disp_unblock(parts):
     ip = parts[1]
     if not _validate_ip_or_error(ip): return
     _iptables_rule("-D", ip)
     add_console(f"{GREEN}UNBLOCKED: {ip}{RESET}")
+    audit_emit("net.unblock", {"ip": ip})
 
 def _disp_blocked(parts):
     result = subprocess.run(["iptables", "-L", "-n", "--line-numbers"], capture_output=True, text=True)
@@ -4734,12 +4820,45 @@ def _disp_remote(parts):
 _apiary_shipper = None
 _apiary_collector = None
 
+# Hive nudge state, cached so render loops never stat config files per frame.
+_hive_status_cache = {"ts": 0.0, "joined": False, "nudge_off": False}
+
+
+def _hive_status(ttl=60.0):
+    """{"joined": bool, "nudge_off": bool} for the hive nudge surfaces (TUI
+    banner, startup line, web fleet tab). Cached with a TTL; never raises."""
+    now = time.time()
+    if now - _hive_status_cache["ts"] > ttl:
+        joined, nudge_off = False, os.environ.get("NETWATCH_NO_NUDGE") == "1"
+        try:
+            import netwatch_shipper as _ship
+            cfg = _ship.load_config()
+            joined = bool(cfg.get("hub_url") and cfg.get("node_id")
+                          and cfg.get("node_key"))
+            nudge_off = nudge_off or bool(cfg.get("hive_nudge_off"))
+        except Exception:
+            pass
+        _hive_status_cache.update({"ts": now, "joined": joined,
+                                   "nudge_off": nudge_off})
+    return _hive_status_cache
+
+
+def _hive_nudge_line():
+    """One dim line inviting an un-joined node into the hive, or None."""
+    st = _hive_status()
+    if st["joined"] or st["nudge_off"]:
+        return None
+    return (f"  {DIM}Join the hive — burned once, blocked everywhere.  "
+            f"Type: join community   (silence: join nudge off){RESET}")
+
 
 def _disp_join(parts):
     """join — contribute this node's events to a fleet hub (Free feature).
+      join community [hub-url]                   join the hive — burned once, blocked everywhere
       join <https://hub:8443> <node_id> <key>   configure + start shipping
       join status                                shipper state
       join off                                   stop shipping
+      join nudge off|on                          silence / restore the hive banner
     Any node can ship its attack data up. Running the hub is Pro (see: collector)."""
     global _apiary_shipper
     from urllib.parse import urlparse
@@ -4747,6 +4866,35 @@ def _disp_join(parts):
         import netwatch_shipper as _ship
     except Exception as e:
         add_console(f"  {RED}shipper unavailable: {type(e).__name__}{RESET}")
+        return
+    if len(parts) > 1 and parts[1].lower() in ("community", "--community"):
+        # Opt-in community hive: attack-vector fields only, never payloads.
+        hub = parts[2] if len(parts) > 2 else None
+        try:
+            cfg = _ship.enroll_community(hub)
+        except ValueError as e:
+            add_console(f"  {RED}{e}{RESET}")
+            return
+        except Exception as e:
+            add_console(f"  {RED}hive join failed: {type(e).__name__}{RESET}")
+            return
+        if _apiary_shipper is not None:
+            _apiary_shipper.stop()
+        _apiary_shipper = _ship.Shipper(cfg)
+        _apiary_shipper.start_background()
+        _hive_status_cache["ts"] = 0.0          # banner drops on next frame
+        audit_emit("apiary.join", {"hub": cfg.get("hub_url", ""), "community": True})
+        add_console(f"  {GREEN}Joined the hive as "
+                    f"'{_ansi_strip(str(cfg.get('node_id', '')))[:40]}'.{RESET} "
+                    f"Shipping attack vectors (no payloads).")
+        add_console(f"  {DIM}Burned once, blocked everywhere. Leave anytime: join off{RESET}")
+        return
+    if len(parts) > 2 and parts[1].lower() == "nudge":
+        cfg = _ship.load_config()
+        cfg["hive_nudge_off"] = parts[2].lower() != "on"
+        _ship.save_config(cfg)
+        _hive_status_cache["ts"] = 0.0
+        add_console(f"  Hive banner {'off' if cfg['hive_nudge_off'] else 'on'}.")
         return
     # One-shot enrollment token from `collector keygen <name> <hub-url>` — a single
     # paste that configures hub URL + creds + pins the hub CA automatically.
@@ -4766,6 +4914,7 @@ def _disp_join(parts):
         hub = _ansi_strip(str(cfg.get('hub_url', '')))[:60]
         nid = _ansi_strip(str(cfg.get('node_id', '')))[:40]
         pinned = f" {DIM}(CA pinned){RESET}" if cfg.get("ca_cert") else ""
+        audit_emit("apiary.join", {"hub": cfg.get("hub_url", ""), "community": False})
         add_console(f"  {GREEN}Joined {hub} as '{nid}'.{RESET}{pinned} Shipping events.")
         return
     sub = parts[1].lower() if len(parts) > 1 else "status"
@@ -4857,6 +5006,235 @@ def _disp_ask(parts):
             add_console(f"  {BOLD}LLM summary:{RESET} {_ansi_strip(str(llm['summary']))[:400]}")
 
 
+def _compliance_snapshot():
+    """Free-side evidence dict fed to the Pro compliance module (pro never
+    imports the free app). Every field is derived from live free-tier state or
+    a guarded _pro_sub probe."""
+    with lock:
+        events_seen = len(honeypot_events)
+        attacks = sum(1 for h in hosts.values() if h.get("threat_score", 0) > 0)
+    try:
+        blocked = subprocess.run(["iptables", "-L", "-n"], capture_output=True,
+                                 text=True, timeout=5).stdout.count("DROP")
+    except Exception:
+        blocked = 0
+    users_n = 0
+    nonadmin = 0
+    wa = _pro_sub("webauth")
+    if wa is not None:
+        try:
+            rows = wa.list_users()
+            users_n = len(rows)
+            nonadmin = sum(1 for r in rows if r.get("role") != "admin")
+        except Exception:
+            pass
+    audit_ok = True
+    am = _pro_sub("audit")
+    if am is not None:
+        try:
+            audit_ok = bool(am.verify().get("ok", True))
+        except Exception:
+            audit_ok = True
+    seats = _hub_seats()
+    return {
+        "events_seen": events_seen,
+        "attacks_detected": attacks,
+        "ips_blocked": blocked,
+        "honeypot_ports": len([p for p in (HTTP_PORT, TELNET_PORT, FTP_PORT, RTSP_PORT) if p]),
+        "nmap_results": len(nmap_results),
+        "alerts_configured": _alerts_configured(),
+        "web_token_set": bool(WEB_TOKEN),
+        "users_configured": users_n,
+        "nonadmin_users": nonadmin,
+        "audit_enabled": tier_at_least("enterprise") and am is not None,
+        "audit_ok": audit_ok,
+        "signed_reports": os.path.isdir(os.path.expanduser("~/netwatch-reports")),
+        "retention_days": int(os.environ.get("NETWATCH_RETENTION_DAYS", "30")),
+        "hub_tls": True,
+        "seat_enforced": bool(seats),
+        "siem_configured": os.path.exists(os.path.expanduser("~/.config/netwatch/siem.json")),
+        "threat_intel": os.path.exists(os.path.expanduser("~/.config/netwatch/watchlist.json")),
+        "geo_block": os.path.exists(os.path.expanduser("~/.config/netwatch/geoblock.json")),
+    }
+
+
+def _alerts_configured():
+    try:
+        return os.path.exists(os.path.expanduser("~/.config/netwatch/alerts.json"))
+    except Exception:
+        return False
+
+
+def _disp_compliance(parts):
+    """compliance — auditor control-coverage report (Enterprise feature).
+      compliance [--framework soc2|pci|nist|cis]   text control matrix
+      compliance pdf <path> [--framework …]         signed PDF evidence bundle
+    Maps live NetWatch state to SOC2 / PCI-DSS / NIST 800-53 / CIS controls."""
+    if not tier_at_least("enterprise"):
+        add_console(f"  {YELLOW}Compliance reports are an Enterprise feature.{RESET}")
+        add_console(f"  {ENTERPRISE_UPGRADE_HINT}")
+        return
+    mod = _pro_sub("compliance")
+    if mod is None:
+        add_console(f"  {RED}Pro add-on not installed.{RESET}")
+        return
+    fw = None
+    if "--framework" in parts:
+        i = parts.index("--framework")
+        if i + 1 < len(parts):
+            fw = parts[i + 1].lower()
+    snap = _compliance_snapshot()
+    try:
+        report = mod.compliance_report(snapshot=snap, framework=fw)
+        if len(parts) > 1 and parts[1].lower() == "pdf":
+            out = parts[2] if len(parts) > 2 and not parts[2].startswith("--") \
+                else os.path.expanduser("~/netwatch-reports/compliance.pdf")
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            res = mod.compliance_pdf(report, out, snapshot=snap)
+            audit_emit("compliance.report", {"framework": report.get("framework"),
+                                             "pdf": os.path.basename(out)})
+            add_console(f"  {GREEN}Signed compliance PDF: {_ansi_strip(str(res['pdf_path']))}{RESET}")
+            add_console(f"  {DIM}sha256:{str(res.get('sha256'))[:16]}…  sig:{_ansi_strip(str(res.get('sig_path')))}{RESET}")
+            return
+        for line in mod.report_text(report).splitlines():
+            add_console(f"  {_ansi_strip(line)}")
+    except Exception as e:
+        add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+
+
+def _disp_audit(parts):
+    """audit — tamper-evident action log (Enterprise feature).
+      audit                list recent audit records
+      audit verify         re-check the hash chain for tampering
+    Every block, login, join, user-change and license action is chained."""
+    if not tier_at_least("enterprise"):
+        add_console(f"  {YELLOW}The tamper-evident audit trail is an Enterprise feature.{RESET}")
+        add_console(f"  {ENTERPRISE_UPGRADE_HINT}")
+        return
+    mod = _pro_sub("audit")
+    if mod is None:
+        add_console(f"  {RED}Pro add-on not installed.{RESET}")
+        return
+    sub = parts[1].lower() if len(parts) > 1 else "list"
+    try:
+        if sub == "verify":
+            res = mod.verify()
+            if res.get("ok"):
+                add_console(f"  {GREEN}✓ Audit chain intact — {res.get('records', 0)} records.{RESET}")
+            else:
+                add_console(f"  {RED}✗ TAMPER DETECTED: {_ansi_strip(str(res.get('error')))}{RESET}")
+            return
+        rows = mod.list_records(20)
+        if not rows:
+            add_console("  No audit records yet.")
+            return
+        add_console(f"{BOLD}Audit trail (last {len(rows)}):{RESET}")
+        for r in rows:
+            ts = _ansi_strip(str(r.get("ts", "")))[:19]
+            actor = _ansi_strip(str(r.get("actor", "")))[:10]
+            action = _ansi_strip(str(r.get("action", "")))[:22]
+            detail = _ansi_strip(json.dumps(r.get("detail", {})))[:40]
+            add_console(f"  {DIM}{ts}{RESET} {actor:<10} {BOLD}{action:<22}{RESET} {DIM}{detail}{RESET}")
+        v = mod.verify()
+        add_console(f"  {GREEN}✓ chain intact{RESET}" if v.get("ok")
+                    else f"  {RED}✗ {_ansi_strip(str(v.get('error')))}{RESET}")
+    except Exception as e:
+        add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+
+
+def _disp_users(parts):
+    """users — team accounts for the web dashboard (Business feature).
+      users                        list users and roles
+      users add <name> <role>      create user (random password shown once)
+      users rm <name>              remove user
+      users role <name> <role>     change role (admin|operator|viewer)
+    Roles: viewer read-only · operator can block/capture · admin everything."""
+    if not tier_at_least("team"):
+        add_console(f"  {YELLOW}Team accounts (RBAC) are a Business feature.{RESET}")
+        add_console(f"  {BUSINESS_UPGRADE_HINT}")
+        return
+    wa = _pro_sub("webauth")
+    if wa is None:
+        add_console(f"  {RED}Pro add-on not installed.{RESET}")
+        return
+    sub = parts[1].lower() if len(parts) > 1 else "list"
+    try:
+        if sub == "add" and len(parts) >= 4:
+            pw = wa.generate_password()
+            res = wa.add_user(parts[2], pw, parts[3].lower())
+            audit_emit("web.user_add", {"user": res["user"], "role": res["role"]})
+            add_console(f"  {GREEN}User '{res['user']}' created ({res['role']}).{RESET}")
+            add_console(f"  password: {BOLD}{pw}{RESET}  {DIM}(shown once — share over a trusted channel){RESET}")
+            return
+        if sub == "rm" and len(parts) >= 3:
+            ok = wa.remove_user(parts[2])
+            if ok:
+                audit_emit("web.user_rm", {"user": parts[2]})
+            add_console(f"  {GREEN}Removed '{parts[2]}'.{RESET}" if ok
+                        else f"  {YELLOW}No such user.{RESET}")
+            return
+        if sub == "role" and len(parts) >= 4:
+            ok = wa.set_role(parts[2], parts[3].lower())
+            if ok:
+                audit_emit("web.user_role", {"user": parts[2], "role": parts[3].lower()})
+            add_console(f"  {GREEN}'{parts[2]}' is now {parts[3].lower()}.{RESET}" if ok
+                        else f"  {YELLOW}No such user.{RESET}")
+            return
+        if sub != "list":
+            add_console("  usage: users [add <name> <role> | rm <name> | role <name> <role>]")
+            return
+        rows = wa.list_users()
+        if not rows:
+            add_console("  No team users yet. The fixed web token remains the admin login.")
+            add_console(f"  {DIM}Create one:  users add alice operator{RESET}")
+            return
+        add_console(f"{BOLD}Team users (web dashboard):{RESET}")
+        for r in rows:
+            add_console(f"  {_ansi_strip(str(r['user'])):<20} {r['role']:<9} "
+                        f"{DIM}{_ansi_strip(str(r.get('created', '')))[:19]}{RESET}")
+        add_console(f"  {DIM}The fixed web token is always an admin break-glass login.{RESET}")
+    except ValueError as e:
+        add_console(f"  {RED}{e}{RESET}")
+    except Exception as e:
+        add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+
+
+def _hub_seats():
+    """Hub seat usage {used, limit} from the Pro collector, or None. Never
+    raises — seats are decoration on every surface that shows them."""
+    mod = _pro_sub("collector")
+    if mod is None:
+        return None
+    try:
+        s = mod.NodeRegistry().seats_summary()
+        return s if isinstance(s, dict) and "used" in s else None
+    except Exception:
+        return None
+
+
+def _fmt_seats(seats):
+    lim = seats.get("limit")
+    return f"{seats.get('used', 0)}/{'unlimited' if lim is None else lim} nodes"
+
+
+# Where to send an operator who wants more hub seats. Overridable so the store
+# URL can change without a code release.
+SEATS_BUY_URL = os.environ.get("NETWATCH_SEATS_URL", "https://mattmorris.dev/netwatch/pricing")
+
+
+def _seat_full_cta():
+    """Upsell shown when the hub hits its seat cap. Pro can buy add-on nodes;
+    bigger fleets move up a tier."""
+    tier = current_tier()
+    if tier == "pro":
+        add_console(f"  {YELLOW}Add nodes to Pro:{RESET} +$25/yr each, or Business for 25 — {SEATS_BUY_URL}")
+    elif tier == "team":
+        add_console(f"  {YELLOW}Need more than 25 nodes?{RESET} Enterprise is unlimited — {SEATS_BUY_URL}")
+    else:
+        add_console(f"  {DIM}Seats scale with tier: Pro 1 · Business 25 · Enterprise unlimited — {SEATS_BUY_URL}{RESET}")
+    add_console(f"  {DIM}After buying, activate the new key: netwatch activate <key>  (free a seat now: collector revoke <node_id>){RESET}")
+
+
 def _disp_collector(parts):
     """collector — run/inspect the fleet hub, Apiary (Pro feature).
       collector                    registered nodes + contributed event counts
@@ -4884,7 +5262,12 @@ def _disp_collector(parts):
         try:
             node_id, key = mod.mint_node_key(parts[2])
         except Exception as e:
-            add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+            if type(e).__name__ == "SeatLimitExceeded":
+                # Free repo can't import the class — match by name.
+                add_console(f"  {RED}{e}{RESET}")
+                _seat_full_cta()
+            else:
+                add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
             return
         add_console(f"  {GREEN}Node '{node_id}' minted.{RESET} {DIM}(key shown once, not recoverable){RESET}")
         hub_url = parts[3] if len(parts) > 3 else ""
@@ -4984,15 +5367,22 @@ def _disp_collector(parts):
     except Exception as e:
         add_console(f"  {RED}{type(e).__name__}{RESET}")
         return
+    seats = _hub_seats()
     if not rows:
         add_console("  No nodes have joined this hub yet.")
         add_console(f"  {DIM}Mint one:  collector keygen <name>{RESET}")
+        if seats:
+            add_console(f"  {DIM}Seats: {_fmt_seats(seats)}{RESET}")
         return
     add_console(f"{BOLD}Apiary — nodes reporting to this hub:{RESET}")
     for r in rows:
         flag = f" {RED}[revoked]{RESET}" if r.get("revoked") else ""
         add_console(f"  {r['node_id']:<16} today:{r['events_today']:<6} "
                     f"total:{r['events_total']:<8} last:{r.get('last_seen') or '-'}{flag}")
+    if seats:
+        full = seats.get("limit") is not None and seats.get("used", 0) >= seats["limit"]
+        color = RED if full else DIM
+        add_console(f"  {color}Seats: {_fmt_seats(seats)}{RESET}")
     # Phase 4: fleet rollup (aggregate of harvested events across all nodes).
     an = _pro_sub("analytics")
     if an is not None:
@@ -5069,7 +5459,56 @@ def _disp_timeline(parts):
         for n in ip_notes[target]:
             add_console(f"    {DIM}{n}{RESET}")
 
+def _disp_report_schedule(parts):
+    """report schedule daily|weekly|off|status · report run-now (Business)."""
+    if not tier_at_least("team"):
+        add_console(f"  {YELLOW}Scheduled signed reports are a Business feature.{RESET}")
+        add_console(f"  {BUSINESS_UPGRADE_HINT}")
+        return
+    mod = _pro_sub("report_sched")
+    if mod is None:
+        add_console(f"  {RED}Pro add-on not installed.{RESET}")
+        return
+    src = os.path.join(LOG_DIR, "all_events.json")
+    sub = parts[1].lower()
+    try:
+        if sub in ("run", "run-now"):
+            add_console(f"  {DIM}Generating signed digest…{RESET}")
+            res = mod.run_now(src)
+            add_console(f"  {GREEN}Report: {_ansi_strip(str(res['pdf_path']))}{RESET} "
+                        f"{DIM}({res['events']} events, sha:{str(res.get('sha256'))[:12]}…){RESET}")
+            return
+        if len(parts) > 2 and parts[2].lower() == "off":
+            mod.disable()
+            add_console(f"  {GREEN}Scheduled reports disabled.{RESET}")
+            return
+        if len(parts) > 2 and parts[2].lower() == "status":
+            st = mod.status()
+            add_console(f"{BOLD}Report schedule:{RESET} {st['cadence']}  "
+                        f"hour:{st['hour']}  last:{st.get('last_run') or '-'}")
+            if st.get("email"):
+                add_console(f"  email: {', '.join(_ansi_strip(str(e)) for e in st['email'])}")
+            return
+        if len(parts) > 2 and parts[2].lower() in ("daily", "weekly"):
+            emails = [p for p in parts[3:] if "@" in p]
+            hour = next((int(p) for p in parts[3:] if p.isdigit()), 6)
+            mod.configure(parts[2].lower(), hour=hour, email=emails)
+            audit_emit("report.schedule", {"cadence": parts[2].lower(), "hour": hour})
+            add_console(f"  {GREEN}Scheduled {parts[2].lower()} signed digest at {hour:02d}:00 UTC.{RESET}")
+            add_console(f"  {DIM}Delivered to disk (~/netwatch-reports) + any emails set.{RESET}")
+            return
+        add_console("  usage: report schedule daily|weekly [hour] [email…] | "
+                    "report schedule off|status | report run-now")
+    except ValueError as e:
+        add_console(f"  {RED}{e}{RESET}")
+    except Exception as e:
+        add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+
+
 def _disp_report(parts):
+    if len(parts) > 1 and parts[1].lower() in ("schedule", "run", "run-now"):
+        _disp_report_schedule(parts)
+        return
     target = parts[1]
     add_console(f"{BOLD}{RED}GENERATING REPORT: {target}...{RESET}")
     def _run():
@@ -6111,6 +6550,10 @@ def _build_frame(cols=80, max_content=35, active_tab=None):
         svc_line += f"{color}{name}{RESET} "
     lines.append(svc_line)
 
+    nudge = _hive_nudge_line()
+    if nudge:
+        lines.append(nudge)
+
     # Tab bar
     lines.append(_tab_bar(cols, active=tab))
     lines.append(f"{DIM}  {'─'*min(76, w)}{RESET}")
@@ -6208,6 +6651,11 @@ def _apiary_fleet_lines(max_nodes=8):
         return []
     lines = [f"{BOLD}{MAGENTA}  APIARY HUB — fleet rollup (7d){RESET}",
              f"  {DIM}{roll['total_events']} events · {roll['nodes_active']} active node(s){RESET}"]
+    seats = _hub_seats()
+    if seats:
+        full = seats.get("limit") is not None and seats.get("used", 0) >= seats["limit"]
+        lines.append(f"  {RED if full else DIM}seats: {_fmt_seats(seats)}"
+                     f"{' — FULL' if full else ''}{RESET}")
     for n in roll["nodes"][:max_nodes]:
         flag = f" {RED}[revoked]{RESET}" if n.get("revoked") else ""
         nm = _ansi_strip(str(n.get("name") or n.get("node_id") or "?"))[:20]
@@ -6891,14 +7339,23 @@ button{width:100%;background:#ff3333;color:#080a0e;border:none;padding:10px;bord
 font-family:inherit;font-size:13px;font-weight:700;cursor:pointer;letter-spacing:1px}
 button:hover{background:#ff5555}
 .err{color:#ff3333;font-size:11px;margin-top:8px;min-height:16px}
+.div{color:#333;font-size:10px;margin:14px 0 10px;letter-spacing:1px}
 </style></head><body><div class="box"><h1>NETWATCH</h1><div class="sub">Enter access token to continue</div>
 <input id="tok" type="password" placeholder="Token" autocomplete="off" autofocus>
+<div class="div">— or sign in (Business) —</div>
+<input id="usr" type="text" placeholder="Username" autocomplete="username">
+<input id="pwd" type="password" placeholder="Password" autocomplete="current-password">
 <button onclick="go()">AUTHENTICATE</button><div class="err" id="err"></div></div>
 <script>
-document.getElementById("tok").addEventListener("keydown",e=>{if(e.key==="Enter")go()});
-async function go(){const t=document.getElementById("tok").value.trim();if(!t)return;
-try{const r=await fetch("/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:t})});
-if(r.ok){location.reload()}else{document.getElementById("err").textContent="Invalid token"}}
+for(const id of ["tok","usr","pwd"])document.getElementById(id).addEventListener("keydown",e=>{if(e.key==="Enter")go()});
+async function go(){
+const t=document.getElementById("tok").value.trim();
+const u=document.getElementById("usr").value.trim();
+const p=document.getElementById("pwd").value;
+let body=null;
+if(t)body={token:t};else if(u&&p)body={user:u,pass:p};else return;
+try{const r=await fetch("/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+if(r.ok){location.reload()}else{document.getElementById("err").textContent="Invalid credentials"}}
 catch(e){document.getElementById("err").textContent="Connection error"}}
 </script></body></html>"""
 
@@ -6911,6 +7368,57 @@ def _verify_web_cookie(cookie_val):
     except Exception:
         return False
 
+
+# ─── Team sessions (Business tier) ───────────────────────────────────────
+# The fixed token stays the break-glass ADMIN credential and its cookie path is
+# untouched. Business adds named users (netwatch_pro.webauth) whose logins mint
+# a separate short-lived `nw_sess` cookie carrying the role. Role is re-gated on
+# tier at EVERY request, so a lapsed license kills sessions immediately.
+_SESSION_TTL = 12 * 3600
+
+
+def _mint_session(user, role):
+    blob = json.dumps({"u": str(user)[:32], "r": str(role),
+                       "exp": time.time() + _SESSION_TTL})
+    return _fernet.encrypt(blob.encode()).decode()
+
+
+def _role_from_cookies(tok_val, sess_val):
+    """Role from raw cookie values (usable outside a request context — the SSE
+    generator revalidates with captured values)."""
+    if _verify_web_cookie(tok_val):
+        return "admin"
+    if not sess_val:
+        return None
+    try:
+        d = json.loads(_fernet.decrypt(sess_val.encode(), ttl=_SESSION_TTL).decode())
+    except Exception:
+        return None
+    if not isinstance(d, dict) or d.get("exp", 0) < time.time():
+        return None
+    if not tier_at_least("team"):        # license lapse → sessions die
+        return None
+    if d.get("r") not in ("admin", "operator", "viewer"):
+        return None
+    # Re-validate against the live user store every request: the cookie only
+    # proves authentication — the store is the authority on the current role, so
+    # a removed or demoted user loses access immediately, not at cookie expiry.
+    wa = _pro_sub("webauth")
+    if wa is None:
+        return None                      # can't validate → fail closed
+    try:
+        return wa.current_role(d.get("u", ""))   # None if the user is gone
+    except Exception:
+        return None
+
+
+def _session_role(req):
+    """Effective role for a request: 'admin' via the token cookie (unchanged
+    behaviour), else the nw_sess role when valid + Business tier, else None."""
+    return _role_from_cookies(req.cookies.get("nw_token", ""),
+                              req.cookies.get("nw_sess", ""))
+
+
 @web_app.before_request
 def _web_auth():
     client = ipaddress.ip_address(request.remote_addr)
@@ -6919,7 +7427,7 @@ def _web_auth():
     if request.path == "/auth" and request.method == "POST":
         return None
     if WEB_TOKEN:
-        if not _verify_web_cookie(request.cookies.get("nw_token", "")):
+        if _session_role(request) is None:
             return _LOGIN_HTML, 401
     if request.method == "POST":
         origin = request.headers.get("Origin", "")
@@ -6936,9 +7444,9 @@ def _web_auth():
                               or _origin_lc.startswith("http://127.0.0.1:"))
         if _cf_origin and origin == f"https://{_cf_origin}":
             pass
-        elif origin.startswith("https://") and origin.endswith(".trycloudflare.com") and _verify_web_cookie(request.cookies.get("nw_token", "")):
+        elif origin.startswith("https://") and origin.endswith(".trycloudflare.com") and _session_role(request) is not None:
             pass
-        elif _loopback_any_port and _verify_web_cookie(request.cookies.get("nw_token", "")):
+        elif _loopback_any_port and _session_role(request) is not None:
             pass
         elif origin not in _allowed_origins:
             return "CSRF rejected", 403
@@ -6976,12 +7484,29 @@ def web_auth():
             _auth_attempts[ip] = (1, now)
     else:
         _auth_attempts[ip] = (1, now)
-    token = request.json.get("token", "")
-    if _hmac.compare_digest(token, WEB_TOKEN):
+    body = request.json if isinstance(request.json, dict) else {}
+    token = body.get("token", "")
+    if token and _hmac.compare_digest(token, WEB_TOKEN):
         resp = jsonify({"ok": True})
         encrypted = _fernet.encrypt(WEB_TOKEN.encode()).decode()
         resp.set_cookie("nw_token", encrypted, httponly=True, samesite="Lax", secure=request.is_secure, path="/")
         return resp
+    user, pw = str(body.get("user", "")), str(body.get("pass", ""))
+    if user and pw and tier_at_least("team"):
+        wa = _pro_sub("webauth")
+        if wa is not None:
+            try:
+                role = wa.verify(user, pw)
+            except Exception:
+                role = None
+            if role:
+                resp = jsonify({"ok": True, "role": role})
+                resp.set_cookie("nw_sess", _mint_session(user, role),
+                                httponly=True, samesite="Lax",
+                                secure=request.is_secure, path="/")
+                audit_emit("web.login", {"user": user, "role": role,
+                                         "ip": request.remote_addr})
+                return resp
     return "Unauthorized", 401
 
 def _state_snapshot():
@@ -7043,6 +7568,7 @@ def _state_snapshot():
         "mesh_msgs": len(mesh_messages),
         "mesh_nodes": len(mesh_nodes),
         "threat_dist": threat_dist,
+        "hive_joined": _hive_status()["joined"],
     }
 
 @web_app.route("/")
@@ -7088,6 +7614,9 @@ def web_fleet():
     payload = {"nodes": nodes, "total": len(remotes), "paying": paying,
                "poll": int(_REMOTE_POLL_INTERVAL)}
     if paying:
+        seats = _hub_seats()
+        if seats:
+            payload["seats"] = seats
         roll = _apiary_rollup_cached()
         if roll and roll.get("total_events"):
             # Aggregate only — omit roll["recent"] so raw events (which may carry
@@ -7105,6 +7634,68 @@ def web_fleet():
     return web_app.response_class(
         json.dumps(payload, default=str), mimetype="application/json")
 
+@web_app.route("/api/users", methods=["GET", "POST"])
+def web_users():
+    # Business tier, admin role only. Thin delegation to netwatch_pro.webauth —
+    # the free repo holds no user store and no Pro logic.
+    if _session_role(request) != "admin":
+        return jsonify({"error": "admin role required"}), 403
+    if not tier_at_least("team"):
+        return jsonify({"enabled": False,
+                        "hint": "Team accounts are a Business feature — see PRICING.md"}), 402
+    wa = _pro_sub("webauth")
+    if wa is None:
+        return jsonify({"error": "Pro add-on not installed"}), 501
+    try:
+        if request.method == "GET":
+            return jsonify({"enabled": True, "users": wa.list_users()})
+        body = request.json if isinstance(request.json, dict) else {}
+        op = str(body.get("op", ""))
+        name = str(body.get("user", ""))
+        if op == "add":
+            res = wa.add_user(name, str(body.get("pass", "")),
+                              str(body.get("role", "viewer")))
+            audit_emit("web.user_add", {"user": name, "role": res.get("role")})
+            return jsonify({"ok": True, **res})
+        if op == "rm":
+            ok = wa.remove_user(name)
+            if ok:
+                audit_emit("web.user_rm", {"user": name})
+            return jsonify({"ok": bool(ok)})
+        if op == "role":
+            ok = wa.set_role(name, str(body.get("role", "")))
+            if ok:
+                audit_emit("web.user_role", {"user": name,
+                                             "role": str(body.get("role", ""))})
+            return jsonify({"ok": bool(ok)})
+        return jsonify({"error": "op must be add|rm|role"}), 400
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        # ProFeatureRequired lands here too — surface the upgrade message.
+        return jsonify({"error": str(e)}), 403
+
+
+@web_app.route("/api/audit")
+def web_audit():
+    # Enterprise + operator role. Read-only view of the tamper-evident trail.
+    role = _session_role(request)
+    if role is None or _ROLE_RANK.get(role, 0) < _ROLE_RANK["operator"]:
+        return jsonify({"error": "operator role required"}), 403
+    if not tier_at_least("enterprise"):
+        return jsonify({"enabled": False,
+                        "hint": "The audit trail is an Enterprise feature — see PRICING.md"})
+    mod = _pro_sub("audit")
+    if mod is None:
+        return jsonify({"enabled": False, "hint": "Pro add-on not installed"})
+    try:
+        return jsonify({"enabled": True,
+                        "records": mod.list_records(100),
+                        "verify": mod.verify()})
+    except Exception as e:
+        return jsonify({"enabled": True, "records": [], "verify": {"ok": False, "error": str(e)}})
+
+
 @web_app.route("/api/stream")
 def web_stream():
     global _sse_count
@@ -7113,13 +7704,14 @@ def web_stream():
             return "Too many streams", 429
         _sse_count += 1
     cookie_val = request.cookies.get("nw_token", "")
+    sess_val = request.cookies.get("nw_sess", "")
     def generate():
         global _sse_count
         _iter = 0
         try:
             while True:
                 _iter += 1
-                if _iter % 15 == 0 and WEB_TOKEN and not _verify_web_cookie(cookie_val):
+                if _iter % 15 == 0 and WEB_TOKEN and _role_from_cookies(cookie_val, sess_val) is None:
                     break
                 yield f"data: {_cached_snapshot()}\n\n"
                 time.sleep(2)
@@ -7143,7 +7735,19 @@ _WEB_SAFE_CMDS = {
     "speed", "ifinfo", "help",
     "block", "unblock", "pcap", "track", "untrack", "conns", "sniff",
     "trackdns", "tracking", "stealth", "clear", "export",
+    "join", "compliance", "audit",
 }
+
+# RBAC (Business): minimum role per web command. Anything not listed is
+# viewer-safe (read-only). The fixed token maps to admin, so Free/Pro single-
+# token setups see no change at all.
+_ROLE_RANK = {"viewer": 0, "operator": 1, "admin": 2}
+_CMD_MIN_ROLE = {c: "operator" for c in (
+    "block", "unblock", "blockall", "pcap", "track", "untrack", "sniff",
+    "trackdns", "stealth", "tag", "note", "watch", "clear", "export",
+    "proxy", "report", "join", "scanall", "geoall", "whoisall", "reconall",
+    "sweep", "mesh", "expose", "compliance", "audit",
+)}
 
 _OUTBOUND_CMDS = {"geo", "whois", "dnsinfo", "crt", "headers", "asn", "abuse",
                    "ssl", "secheaders", "techstack", "health", "etrace", "ping",
@@ -7201,6 +7805,16 @@ def web_cmd():
     _cmd_rate[rip] = (cnt + 1, ecnt + (1 if action in _EXPENSIVE_CMDS else 0), wstart)
     if action not in _WEB_SAFE_CMDS:
         return jsonify({"error": f"command '{action}' not recognized — type 'help' for available commands"})
+    role = _session_role(request) or "viewer"
+    # Anything that emits outbound traffic (active nmap/recon, external lookups)
+    # is at least operator — a shared viewer credential must not be usable to
+    # launder scans/probes at third parties. Explicit _CMD_MIN_ROLE wins if higher.
+    need = _CMD_MIN_ROLE.get(action, "viewer")
+    if action in _OUTBOUND_CMDS and _ROLE_RANK[need] < _ROLE_RANK["operator"]:
+        need = "operator"
+    if _ROLE_RANK.get(role, 0) < _ROLE_RANK[need]:
+        return jsonify({"error": f"'{action}' requires the {need} role "
+                                 f"(you are {role})"}), 403
     if action in _OUTBOUND_CMDS and len(parts) >= 2:
         target = parts[1]
         if _is_internal_target(target):
@@ -7470,7 +8084,7 @@ background:rgba(0,212,255,.1);color:var(--cyan);border:1px solid rgba(0,212,255,
   <div class="close-hint">Esc to close</div>
 </div>
 <script>
-const TABS=["all","hosts","proto","dns","honeypot","scan","nmap","arp","alerts","osint","proxy","mesh","fleet","replay","help"];
+const TABS=["all","hosts","proto","dns","honeypot","scan","nmap","arp","alerts","osint","proxy","mesh","fleet","replay","audit","help"];
 let tab="all",D={};
 function $(s){return document.querySelector(s)}
 function $$(s){return document.querySelectorAll(s)}
@@ -7630,15 +8244,23 @@ async function _fleetRefresh(){
   catch(e){_fleetCache={nodes:[],total:0};}
   _fleetPaint();
 }
+function _hiveNudge(){
+  // One-line invite to join the community hive. Server says joined via
+  // /api/state (D.hive_joined); dismissal is per-browser (localStorage).
+  try{
+    if((typeof D==="object"&&D&&D.hive_joined)||localStorage.getItem("nw_hive_nudge")==="off")return "";
+  }catch(e){return "";}
+  return `<div class="meta" style="border:1px solid var(--dim);border-radius:4px;padding:6px 10px;margin-bottom:10px">🐝 Join the hive — burned once, blocked everywhere. Run <b>join community</b> in the command bar. <a href="#" onclick="localStorage.setItem('nw_hive_nudge','off');_fleetPaint();return false" style="color:var(--dim)">dismiss</a></div>`;
+}
 function _fleetPaint(){
   const body=document.getElementById("fleet-body");if(!body)return;
   const d=_fleetCache||{nodes:[]};
   const cnt=document.getElementById("fleet-count");if(cnt)cnt.textContent="("+(d.total||0)+")";
   if((!d.nodes||!d.nodes.length)&&!d.apiary){
-    body.innerHTML=_empty("No fleet nodes","Track a node:  remote add droplet https://<tunnel-or-ip:9090> <web-token>  —  or run a hub:  collector  (nodes join it with:  join <hub> <id> <key>).");
+    body.innerHTML=_hiveNudge()+_empty("No fleet nodes","Track a node:  remote add droplet https://<tunnel-or-ip:9090> <web-token>  —  or run a hub:  collector  (nodes join it with:  join <hub> <id> <key>).");
     return;
   }
-  let h="";
+  let h=_hiveNudge();
   for(const n of d.nodes){
     h+=`<div class="section-title">◉ ${esc(n.name)} <span class="count">${esc(n.url)}${n.age!=null?" · "+n.age+"s ago":""}</span></div>`;
     const data=n.data;
@@ -7666,6 +8288,11 @@ function _fleetPaint(){
     }
   }
   if(!d.paying&&d.total>1){h+=`<div class="empty">+${d.total-1} more node(s) hidden — upgrade to Pro for full fleet view.</div>`;}
+  if(d.seats&&typeof d.seats==="object"){
+    const lim=d.seats.limit,used=Number(d.seats.used||0);
+    const full=(lim!=null&&used>=Number(lim));
+    h+=`<div class="meta" style="${full?"color:var(--red)":""}">Hub seats: ${used}/${lim==null?"unlimited":Number(lim)}${full?" — FULL (revoke a node or upgrade)":""}</div>`;
+  }
   if(d.apiary){h+=_renderApiary(d.apiary);}
   body.innerHTML=h;
 }
@@ -8002,11 +8629,39 @@ function render(){
     html+=renderFleet();
   }else if(tab==="replay"){
     html+=renderReplay();
+  }else if(tab==="audit"){
+    html+=renderAudit();
   }else if(tab==="help"){
     html+=renderHelp();
   }
   c.innerHTML=html;
   if(tab==="all"){initCharts();updateCharts()}
+  if(tab==="audit"){loadAudit()}
+}
+
+let _auditCache=null;
+async function loadAudit(){
+  try{const r=await fetch("/api/audit",{credentials:"same-origin"});_auditCache=await r.json();}
+  catch(e){_auditCache={error:"fetch failed"};}
+  const el=document.getElementById("audit-body");if(el)el.innerHTML=_auditPaint();
+}
+function _auditPaint(){
+  const d=_auditCache;if(!d)return `<div class="empty">loading…</div>`;
+  if(d.error)return `<div class="empty" style="color:var(--red)">${esc(String(d.error))}</div>`;
+  if(d.enabled===false)return _empty("Audit trail (Enterprise)",esc(String(d.hint||"Enterprise feature")));
+  const recs=Array.isArray(d.records)?d.records:[];
+  const v=d.verify||{};
+  let h=v.ok?`<div class="meta" style="color:var(--green)">✓ Hash chain intact — ${Number(v.records||recs.length)} records</div>`
+            :`<div class="meta" style="color:var(--red)">✗ TAMPER DETECTED: ${esc(String(v.error||"chain broken"))}</div>`;
+  if(!recs.length)return h+_empty("No audit records yet","Actions like block, login, and license changes are chained here.");
+  h+=`<table><tr><th style="width:150px">Time</th><th style="width:80px">Actor</th><th style="width:150px">Action</th><th>Detail</th></tr>`;
+  recs.slice().reverse().forEach(r=>{
+    h+=`<tr><td style="color:var(--dim)">${esc(String(r.ts||"").slice(0,19))}</td><td>${esc(String(r.actor||""))}</td><td>${esc(String(r.action||""))}</td><td style="color:var(--dim)">${esc(JSON.stringify(r.detail||{}))}</td></tr>`;
+  });
+  return h+`</table>`;
+}
+function renderAudit(){
+  return `<div class="section-title">AUDIT TRAIL <span class="count">tamper-evident</span></div><div id="audit-body"><div class="empty">loading…</div></div>`;
 }
 
 function updateHeader(){
@@ -9184,11 +9839,223 @@ def _cli_subcommand(argv):
             elif llm.get("summary"):
                 print(f"\nLLM summary: {llm['summary']}")
         return 0
+    if cmd == "join":
+        # Headless join (configure only — shipping starts on the next
+        # `netwatch <iface>` run, or immediately inside the TUI's own `join`).
+        try:
+            import netwatch_shipper as _ship
+        except Exception as e:
+            print(f"shipper unavailable: {type(e).__name__}")
+            return 1
+        rest = argv[1:]
+        if rest and rest[0] == "status":
+            cfg = _ship.load_config()
+            if not _ship.is_configured():
+                print("Not joined to a hub.")
+                print("  join the hive:   netwatch join --community")
+                print("  join your hub:   netwatch join <nwj_token>")
+                return 0
+            print(f"hub:     {cfg.get('hub_url', '')}")
+            print(f"node_id: {cfg.get('node_id', '')}")
+            print(f"mode:    {'community (attack vectors only)' if cfg.get('community') else 'fleet node'}")
+            return 0
+        if rest and rest[0] in ("--community", "community"):
+            hub = rest[1] if len(rest) > 1 else None
+            try:
+                cfg = _ship.enroll_community(hub)
+            except ValueError as e:
+                print(f"error: {e}")
+                return 1
+            except Exception as e:
+                print(f"hive join failed: {type(e).__name__}: {e}")
+                return 1
+            print(f"Joined the hive as '{cfg.get('node_id', '')}' — attack vectors only, no payloads.")
+            print("Shipping starts with the app:  sudo netwatch")
+            return 0
+        if rest and rest[0].startswith("nwj_"):
+            try:
+                cfg = _ship.configure_from_token(rest[0])
+            except ValueError as e:
+                print(f"bad enrollment token: {e}")
+                return 1
+            print(f"Joined {cfg.get('hub_url', '')} as '{cfg.get('node_id', '')}'"
+                  f"{' (CA pinned)' if cfg.get('ca_cert') else ''}.")
+            print("Shipping starts with the app:  sudo netwatch")
+            return 0
+        print("usage: netwatch join --community [hub-url]")
+        print("       netwatch join <nwj_token>")
+        print("       netwatch join status")
+        return 1
+    if cmd == "users":
+        # Team accounts for the web dashboard (Business tier).
+        if not tier_at_least("team"):
+            print("Team accounts (RBAC) are a Business feature.")
+            print(BUSINESS_UPGRADE_HINT)
+            return 1
+        wa = _pro_sub("webauth")
+        if wa is None:
+            print("Pro add-on not installed — pip install netwatch-pro")
+            return 1
+        rest = argv[1:]
+        try:
+            if not rest or rest[0] == "list":
+                rows = wa.list_users()
+                if not rows:
+                    print("No team users yet — the fixed web token remains the admin login.")
+                    print("  create one:  netwatch users add alice operator")
+                    return 0
+                for r in rows:
+                    print(f"{r['user']:<20} {r['role']:<9} {r.get('created', '')[:19]}")
+                return 0
+            if rest[0] == "add" and len(rest) >= 3:
+                pw = None
+                if "--password" in rest:
+                    i = rest.index("--password")
+                    if i + 1 < len(rest):
+                        pw = rest[i + 1]
+                if pw is None:
+                    import getpass
+                    pw = getpass.getpass(f"password for {rest[1]}: ")
+                res = wa.add_user(rest[1], pw, rest[2].lower())
+                audit_emit("web.user_add", {"user": res["user"], "role": res["role"]})
+                print(f"user '{res['user']}' created ({res['role']})")
+                return 0
+            if rest[0] == "rm" and len(rest) >= 2:
+                ok = wa.remove_user(rest[1])
+                if ok:
+                    audit_emit("web.user_rm", {"user": rest[1]})
+                print("removed" if ok else "no such user")
+                return 0 if ok else 1
+            if rest[0] == "role" and len(rest) >= 3:
+                ok = wa.set_role(rest[1], rest[2].lower())
+                if ok:
+                    audit_emit("web.user_role", {"user": rest[1], "role": rest[2].lower()})
+                print("updated" if ok else "no such user")
+                return 0 if ok else 1
+        except ValueError as e:
+            print(f"error: {e}")
+            return 1
+        except Exception as e:
+            print(f"error: {type(e).__name__}: {e}")
+            return 1
+        print("usage: netwatch users [list | add <name> <role> [--password <pw>] | "
+              "rm <name> | role <name> <role>]")
+        return 1
+    if cmd == "report":
+        # Scheduled signed digests (Business). `report` with no schedule verb is
+        # a TUI-only per-IP command — CLI only handles the scheduling forms.
+        if not tier_at_least("team"):
+            print("Scheduled signed reports are a Business feature.")
+            print(BUSINESS_UPGRADE_HINT)
+            return 1
+        mod = _pro_sub("report_sched")
+        if mod is None:
+            print("Pro add-on not installed — pip install netwatch-pro")
+            return 1
+        src = os.path.join(LOG_DIR, "all_events.json")
+        rest = argv[1:]
+        try:
+            if rest and rest[0] == "run-now":
+                res = mod.run_now(src)
+                print(f"report: {res['pdf_path']}  ({res['events']} events, "
+                      f"sha:{str(res.get('sha256'))[:16]}…)")
+                return 0
+            if rest and rest[0] == "schedule":
+                if len(rest) > 1 and rest[1] == "off":
+                    mod.disable()
+                    print("scheduled reports disabled")
+                    return 0
+                if len(rest) > 1 and rest[1] == "status":
+                    st = mod.status()
+                    print(f"cadence: {st['cadence']}  hour: {st['hour']}  "
+                          f"last_run: {st.get('last_run') or '-'}")
+                    return 0
+                if len(rest) > 1 and rest[1] in ("daily", "weekly"):
+                    emails, hour = [], 6
+                    for a in rest[2:]:
+                        if a.startswith("--email") and "=" in a:
+                            emails.append(a.split("=", 1)[1])
+                        elif "@" in a:
+                            emails.append(a)
+                        elif a.isdigit():
+                            hour = int(a)
+                    mod.configure(rest[1], hour=hour, email=emails)
+                    audit_emit("report.schedule", {"cadence": rest[1], "hour": hour})
+                    print(f"scheduled {rest[1]} signed digest at {hour:02d}:00 UTC")
+                    return 0
+        except ValueError as e:
+            print(f"error: {e}")
+            return 1
+        except Exception as e:
+            print(f"error: {type(e).__name__}: {e}")
+            return 1
+        print("usage: netwatch report schedule daily|weekly [hour] [--email=a@b] | "
+              "report schedule off|status | report run-now")
+        return 1
+    if cmd == "audit":
+        # Tamper-evident audit trail (Enterprise).
+        if not tier_at_least("enterprise"):
+            print("The tamper-evident audit trail is an Enterprise feature.")
+            print(ENTERPRISE_UPGRADE_HINT)
+            return 1
+        mod = _pro_sub("audit")
+        if mod is None:
+            print("Pro add-on not installed — pip install netwatch-pro")
+            return 1
+        rest = argv[1:]
+        if rest and rest[0] == "verify":
+            res = mod.verify()
+            if res.get("ok"):
+                print(f"OK — chain intact, {res.get('records', 0)} records")
+                return 0
+            print(f"TAMPER DETECTED: {res.get('error')}")
+            return 1
+        n = int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else 50
+        for r in mod.list_records(n):
+            print(f"{r.get('ts', ''):<20} {r.get('actor', ''):<8} "
+                  f"{r.get('action', ''):<22} {json.dumps(r.get('detail', {}))}")
+        return 0
+    if cmd == "compliance":
+        # Auditor control-coverage report (Enterprise).
+        if not tier_at_least("enterprise"):
+            print("Compliance reports are an Enterprise feature.")
+            print(ENTERPRISE_UPGRADE_HINT)
+            return 1
+        mod = _pro_sub("compliance")
+        if mod is None:
+            print("Pro add-on not installed — pip install netwatch-pro")
+            return 1
+        rest = argv[1:]
+        fw = None
+        if "--framework" in rest:
+            i = rest.index("--framework")
+            if i + 1 < len(rest):
+                fw = rest[i + 1].lower()
+        pdf_out = None
+        if "--pdf" in rest:
+            i = rest.index("--pdf")
+            if i + 1 < len(rest):
+                pdf_out = rest[i + 1]
+        snap = _compliance_snapshot()
+        try:
+            report = mod.compliance_report(snapshot=snap, framework=fw)
+            if pdf_out:
+                os.makedirs(os.path.dirname(os.path.abspath(pdf_out)), exist_ok=True)
+                res = mod.compliance_pdf(report, pdf_out, snapshot=snap)
+                print(f"signed compliance PDF: {res['pdf_path']}  "
+                      f"(sha256:{str(res.get('sha256'))[:16]}…)")
+            else:
+                print(mod.report_text(report))
+            return 0
+        except Exception as e:
+            print(f"error: {type(e).__name__}: {e}")
+            return 1
     return 0
 
 
 _CLI_SUBCOMMANDS = ("activate", "register", "license", "status", "collector",
-                    "ask", "--version", "-V", "version")
+                    "ask", "join", "users", "report", "audit", "compliance",
+                    "--version", "-V", "version")
 
 
 def main():
@@ -9259,6 +10126,9 @@ def main():
               f"{', '.join(_mods) or 'license only'}{RESET}\n")
     else:
         print(f"  {DIM}Tier: Free — type 'license' for Pro features{RESET}\n")
+    _hs = _hive_status()
+    if not _hs["joined"] and not _hs["nudge_off"]:
+        print(f"  {DIM}Join the hive — burned once, blocked everywhere: join community{RESET}\n")
 
     def shutdown(sig, frame):
         print(f"\n{YELLOW}[*] Shutting down NetWatch...{RESET}")
@@ -9321,6 +10191,7 @@ def main():
 
     # Time-series sampling for charts
     threading.Thread(target=_sample_timeseries, daemon=True).start()
+    _maybe_start_pro_scheduler()
 
     # Meshtastic mesh radio
     if _HAS_MESH:

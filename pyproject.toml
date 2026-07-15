@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netwatch-sec"
-version = "1.4.0"
+version = "1.5.0"
 description = "All-in-one network security dashboard: honeypots, traffic capture, OSINT, scanning, mesh alerts."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -60,7 +60,10 @@ Issues = "https://github.com/Mattmorris-dev/netwatch-sec/issues"
 netwatch = "netwatch:main"
 
 [tool.setuptools]
-py-modules = ["netwatch"]
+# All four top-level modules must ship: netwatch.py imports replay at import
+# time, and the shipper/crowdsec modules are loaded on demand — a wheel with
+# only "netwatch" breaks on a clean install.
+py-modules = ["netwatch", "replay", "netwatch_shipper", "netwatch_crowdsec"]
 
 [tool.setuptools.packages.find]
 exclude = ["tests*", "docs*", "logs*", "ftp_root*", ".claude*", "pro_beta*",

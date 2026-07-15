@@ -2,6 +2,58 @@
 
 All notable changes to NetWatch are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.5.0 — 2026-07-15
+
+### Added
+- **Feed the hive (Free).** `netwatch join --community` opts a free node into a
+  shared community hub — attack-vector fields only, never request payloads, over
+  CA-pinned HTTPS. An opt-in nudge appears in the TUI header, startup banner, and
+  web fleet tab until you join or silence it (`join nudge off` / `NETWATCH_NO_NUDGE`).
+  The hub side adds a fail-closed open-enrollment mode (off by default; requires an
+  enroll token, per-IP + global rate limits, and a community cap) that never lets a
+  community node consume a paid seat and re-strips their events server-side.
+- **Node seat enforcement (Business value).** The Apiary hub now enforces the
+  license's `max_nodes` at mint time; defaults when unset are Pro 1 / Business 25 /
+  Enterprise unlimited. Seats-used/total show in the TUI + web fleet tabs and
+  `netwatch license`; revoking a node frees a seat.
+- **Team accounts + RBAC (Business).** The web dashboard gains named users with
+  `admin` / `operator` / `viewer` roles (scrypt-hashed store), managed via
+  `netwatch users …` (CLI + TUI). Role checks gate mutating web commands and the
+  new `/api/users` admin endpoint. The fixed web token remains an admin break-glass
+  login, so single-token setups are unchanged.
+- **Scheduled signed reports (Business).** `netwatch report schedule daily|weekly`
+  auto-generates a signed PDF digest of the window's events, delivered via the
+  existing email/webhook sinks and dropped to `~/netwatch-reports`. `report run-now`
+  triggers one on demand.
+- **Tamper-evident audit trail (Enterprise).** A hash-chained, append-only audit
+  log records block/unblock, logins, token rotation, joins, user changes, node
+  mint/revoke, license activation, and report generation. `netwatch audit verify`
+  detects any mutation, reorder, or truncation; a new web audit tab and
+  `/api/audit` surface it.
+- **Compliance pack expansion (Enterprise).** The compliance report grows from 5 to
+  28 controls across SOC 2, PCI-DSS, NIST 800-53, and CIS, each checked against live
+  NetWatch state, with a `--framework` filter and a signed PDF evidence bundle
+  (`netwatch compliance report --framework soc2 --pdf out.pdf`).
+- **Automatic local Cortex feed (Free).** When a Cortex install is present, every
+  honeypot event is mirrored (attack-vector fields only — no payloads/credentials)
+  into the local Apiary store Cortex already reads, so the local threat brain learns
+  from your honeypot automatically with zero network egress. Opt out with
+  `NETWATCH_CORTEX_FEED=0`.
+- **Buy additional Pro hub seats.** Pro stays 1 node; add nodes at +$25/yr each (an
+  explicit node count on the license overrides the tier default). The seat-full
+  message points to the purchase/upgrade path.
+
+### Fixed
+- **Packaging:** the wheel now ships `replay`, `netwatch_shipper`, and
+  `netwatch_crowdsec` alongside `netwatch` — previously a clean PyPI install was
+  missing modules that `netwatch` imports.
+
+### Changed
+- `NETWATCH_TIER=<tier>` dev override to exercise free-side tier gating without a
+  license (paid modules still verify the real license and fail closed).
+- Business/Enterprise gate decorators are centralized in `netwatch_license` and use
+  the cached license load.
+
 ## 1.4.0 — 2026-07-12
 
 ### Added

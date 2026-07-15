@@ -24,12 +24,14 @@ import hashlib
 import json
 import logging
 import os
+import re
 import ssl
 import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 log = logging.getLogger("netwatch.shipper")
 
@@ -50,6 +52,83 @@ _MAX_MODEL_BYTES = 64 * 1024  # match the hub cap — never read an unbounded bo
 
 # Fields kept when payload is NOT opted in — the attack vector, no request body.
 _VECTOR_FIELDS = ("timestamp", "service", "source_ip", "source_port")
+
+# ─── Community hive ("burned once, blocked everywhere") ─────────────────────
+# The public community hub. Empty until the project pins one — then joining is
+# just `netwatch join --community`. Both are overridable so self-hosted hives
+# work today: NETWATCH_COMMUNITY_HUB / NETWATCH_COMMUNITY_TOKEN.
+DEFAULT_COMMUNITY_HUB = os.environ.get("NETWATCH_COMMUNITY_HUB", "")
+# Pinned CA for the community hub (PEM). Empty → system CAs (real cert on the
+# hub). Non-empty → pinned, self-signed hubs work without touching system trust.
+COMMUNITY_CA_PEM = ""
+
+_NODE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z")   # mirror the hub's slug rule
+
+
+def enroll_community(hub_url: str | None = None, token: str = "",
+                     name: str = "", config_path: Path = CONFIG_PATH) -> dict:
+    """Self-enroll this node on a community hive hub (POST /enroll) and persist
+    the returned credentials. Opt-IN only — nothing calls this automatically.
+
+    Hardened like the rest of the shipper: https-only, no redirects, pinned CA
+    when COMMUNITY_CA_PEM is set, bounded response, validated fields. Only
+    attack-vector fields ever ship for a community node (hub re-strips too)."""
+    hub = (hub_url or DEFAULT_COMMUNITY_HUB).strip()
+    if not hub:
+        raise ValueError("no community hub configured — pass a hub URL or set "
+                         "NETWATCH_COMMUNITY_HUB")
+    parsed = urlparse(hub)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("community hub must be https://")
+    token = (token or os.environ.get("NETWATCH_COMMUNITY_TOKEN", "")).strip()
+    if not token:
+        raise ValueError("community hub needs an enroll token — set "
+                         "NETWATCH_COMMUNITY_TOKEN (published with the hive)")
+    ctx = ssl.create_default_context()
+    if COMMUNITY_CA_PEM:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.check_hostname = True
+        ctx.load_verify_locations(cadata=COMMUNITY_CA_PEM)
+    body = json.dumps({"token": token,
+                       "name": re.sub(r"[^a-z0-9_-]", "-",
+                                      (name or os.uname().nodename).lower())[:32]}).encode()
+    req = urllib.request.Request(
+        hub.rstrip("/") + "/enroll", data=body, method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        with _https_get(ctx, req, timeout=10) as resp:
+            raw = resp.read(8192)
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read(512)).get("error", "")
+        except Exception:
+            pass
+        raise ValueError(f"hive enrollment refused ({e.code}"
+                         f"{': ' + detail if detail else ''})")
+    except (urllib.error.URLError, OSError, ssl.SSLError) as e:
+        raise ValueError(f"hive unreachable: {getattr(e, 'reason', e)}")
+    try:
+        info = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        raise ValueError("hive sent a malformed response")
+    node_id = str(info.get("node_id", ""))
+    key = str(info.get("key", ""))
+    if not _NODE_ID_RE.match(node_id) or not key or len(key) > 512:
+        raise ValueError("hive sent invalid credentials")
+    cfg = load_config(config_path)
+    cfg.update({"hub_url": hub, "node_id": node_id, "node_key": key,
+                "community": True})
+    cfg.pop("payload_optin", None)             # community nodes never ship payloads
+    if COMMUNITY_CA_PEM:
+        ca_path = CONFIG_DIR / "apiary_hub_ca.pem"
+        ca_path.parent.mkdir(parents=True, exist_ok=True)
+        ca_path.write_text(COMMUNITY_CA_PEM)
+        os.chmod(ca_path, 0o600)
+        cfg["ca_cert"] = str(ca_path)
+    save_config(cfg, config_path)
+    return cfg
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict:
@@ -167,6 +246,10 @@ class Shipper:
         self.batch = int(self.cfg.get("batch", BATCH))
         self.flush_interval = float(self.cfg.get("flush_interval", FLUSH_INTERVAL))
         self.payload_optin = bool(self.cfg.get("payload_optin", False))
+        if self.cfg.get("community"):
+            # Community nodes contribute the attack vector only — payload opt-in
+            # can never apply, even if someone hand-edits the config.
+            self.payload_optin = False
         # Edge-model pull: OFF by default (opt-in). When on, periodically GET the
         # hub's distilled model and install it where the local cortex agent reads.
         self.model_fetch = bool(self.cfg.get("model_fetch", False))
