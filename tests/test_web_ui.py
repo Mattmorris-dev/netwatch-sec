@@ -1468,3 +1468,153 @@ class TestIptablesValidation:
         netwatch.handle_command("unblock $(whoami)")
         output = " ".join(netwatch.console_output)
         assert "Invalid" in output
+
+
+# ─── Team auth + RBAC (Business tier) ────────────────────────────────────
+
+
+class TestRBAC:
+    ORIGIN = {"Origin": None}  # filled per-call
+
+    def _origin(self):
+        return {"Origin": f"http://127.0.0.1:{netwatch.WEB_PORT}"}
+
+    def _login_as(self, client, monkeypatch, role, user="alice"):
+        """Password login via mocked webauth → real nw_sess cookie."""
+        fake = MagicMock()
+        fake.verify.return_value = role
+        fake.current_role.return_value = role      # live-store revalidation
+        monkeypatch.setattr(netwatch, "_pro_sub",
+                            lambda name: fake if name == "webauth" else None)
+        monkeypatch.setattr(netwatch, "tier_at_least",
+                            lambda t: t in ("pro", "team", "business"))
+        r = client.post("/auth", json={"user": user, "pass": "pw123456"},
+                        headers=self._origin())
+        assert r.status_code == 200
+        return fake
+
+    def test_password_login_sets_session(self, web_client, monkeypatch):
+        self._login_as(web_client, monkeypatch, "viewer")
+        assert web_client.get("/api/state").status_code == 200
+
+    def test_password_login_rejected_on_free(self, web_client, monkeypatch):
+        fake = MagicMock()
+        fake.verify.return_value = "admin"
+        monkeypatch.setattr(netwatch, "_pro_sub",
+                            lambda name: fake if name == "webauth" else None)
+        monkeypatch.setattr(netwatch, "tier_at_least", lambda t: False)
+        r = web_client.post("/auth", json={"user": "alice", "pass": "pw123456"},
+                            headers=self._origin())
+        assert r.status_code == 401
+        fake.verify.assert_not_called()
+
+    def test_bad_password_401(self, web_client, monkeypatch):
+        fake = MagicMock()
+        fake.verify.return_value = None
+        monkeypatch.setattr(netwatch, "_pro_sub",
+                            lambda name: fake if name == "webauth" else None)
+        monkeypatch.setattr(netwatch, "tier_at_least", lambda t: True)
+        r = web_client.post("/auth", json={"user": "alice", "pass": "nope"},
+                            headers=self._origin())
+        assert r.status_code == 401
+
+    def test_viewer_blocked_from_block(self, web_client, monkeypatch):
+        self._login_as(web_client, monkeypatch, "viewer")
+        r = web_client.post("/api/cmd", json={"cmd": "block 203.0.113.9"},
+                            headers=self._origin())
+        assert r.status_code == 403
+        assert "operator" in r.get_json()["error"]
+
+    def test_viewer_allowed_readonly(self, web_client, monkeypatch):
+        self._login_as(web_client, monkeypatch, "viewer")
+        r = web_client.post("/api/cmd", json={"cmd": "attackers"},
+                            headers=self._origin())
+        assert r.status_code == 200
+
+    def test_operator_can_block_not_users(self, web_client, monkeypatch):
+        self._login_as(web_client, monkeypatch, "operator")
+        r = web_client.post("/api/cmd", json={"cmd": "blocked"},
+                            headers=self._origin())
+        assert r.status_code == 200
+        r2 = web_client.get("/api/users")
+        assert r2.status_code == 403
+
+    def test_admin_session_reaches_users_api(self, web_client, monkeypatch):
+        fake = self._login_as(web_client, monkeypatch, "admin")
+        fake.list_users.return_value = [{"user": "alice", "role": "admin",
+                                         "created": ""}]
+        r = web_client.get("/api/users")
+        assert r.status_code == 200
+        assert r.get_json()["users"][0]["user"] == "alice"
+
+    def test_token_cookie_is_admin_everywhere(self, authed_client, monkeypatch):
+        # The fixed token keeps full access — Free/Pro behaviour unchanged.
+        monkeypatch.setattr(netwatch, "tier_at_least", lambda t: False)
+        r = authed_client.post("/api/cmd", json={"cmd": "blocked"},
+                               headers={"Origin": f"http://127.0.0.1:{netwatch.WEB_PORT}"})
+        assert r.status_code == 200
+
+    def test_users_api_402_below_business_for_token_admin(self, authed_client,
+                                                          monkeypatch):
+        monkeypatch.setattr(netwatch, "tier_at_least", lambda t: False)
+        r = authed_client.get("/api/users")
+        assert r.status_code == 402
+        assert r.get_json()["enabled"] is False
+
+    def test_license_lapse_kills_session(self, web_client, monkeypatch):
+        self._login_as(web_client, monkeypatch, "admin")
+        monkeypatch.setattr(netwatch, "tier_at_least", lambda t: False)
+        r = web_client.get("/api/state")
+        assert r.status_code == 401
+
+    def test_expired_session_rejected(self, web_client, monkeypatch):
+        self._login_as(web_client, monkeypatch, "viewer")
+        real_time = time.time
+        monkeypatch.setattr(netwatch.time, "time",
+                            lambda: real_time() + netwatch._SESSION_TTL + 60)
+        r = web_client.get("/api/state")
+        assert r.status_code == 401
+
+    def test_forged_session_cookie_rejected(self, web_client, monkeypatch):
+        monkeypatch.setattr(netwatch, "tier_at_least", lambda t: True)
+        web_client.set_cookie("nw_sess", "garbage-not-fernet")
+        r = web_client.get("/api/state")
+        assert r.status_code == 401
+
+    def test_role_tampering_needs_key(self, web_client, monkeypatch):
+        # A session minted with a bogus role string is refused even if signed.
+        monkeypatch.setattr(netwatch, "tier_at_least", lambda t: True)
+        web_client.set_cookie("nw_sess", netwatch._mint_session("x", "root"))
+        r = web_client.get("/api/state")
+        assert r.status_code == 401
+
+    def test_removed_user_session_dies_immediately(self, web_client, monkeypatch):
+        # M2: after login, if the user is removed from the store, the existing
+        # cookie stops working on the very next request (no 12h TTL window).
+        fake = self._login_as(web_client, monkeypatch, "operator")
+        assert web_client.post("/api/cmd", json={"cmd": "blocked"},
+                               headers=self._origin()).status_code == 200
+        fake.current_role.return_value = None          # admin removed the user
+        r = web_client.get("/api/state")
+        assert r.status_code == 401
+
+    def test_demoted_user_loses_rights_immediately(self, web_client, monkeypatch):
+        # Operator demoted to viewer mid-session → can no longer block.
+        fake = self._login_as(web_client, monkeypatch, "operator")
+        fake.current_role.return_value = "viewer"      # demoted in the store
+        r = web_client.post("/api/cmd", json={"cmd": "block 203.0.113.9"},
+                            headers=self._origin())
+        assert r.status_code == 403
+
+    def test_viewer_blocked_from_active_scan(self, web_client, monkeypatch):
+        # M3: outbound/active recon requires operator — no scan-laundering by viewer.
+        self._login_as(web_client, monkeypatch, "viewer")
+        for cmd in ("scan 203.0.113.9", "recon example.com", "whois example.com"):
+            r = web_client.post("/api/cmd", json={"cmd": cmd}, headers=self._origin())
+            assert r.status_code == 403, cmd
+
+    def test_operator_allowed_active_scan(self, web_client, monkeypatch):
+        self._login_as(web_client, monkeypatch, "operator")
+        r = web_client.post("/api/cmd", json={"cmd": "whois example.com"},
+                            headers=self._origin())
+        assert r.status_code == 200

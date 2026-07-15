@@ -129,3 +129,46 @@ def test_api_fleet_includes_cortex(monkeypatch):
     netwatch._apiary_roll_cache["data"] = None
     assert data["apiary"]["cortex"]["peak_score"] == 97
     assert data["apiary"]["cortex"]["top_attackers"][0]["ip"] == "185.223.235.44"
+
+
+def test_api_fleet_includes_seats(monkeypatch):
+    monkeypatch.setattr(netwatch, "tier_at_least", lambda t: True)
+    monkeypatch.setattr(netwatch, "_load_remotes", lambda: {})
+    monkeypatch.setattr(netwatch, "_pro_sub", lambda name: None)
+    monkeypatch.setattr(netwatch, "_hub_seats", lambda: {"used": 3, "limit": 25})
+    netwatch.web_app.config["TESTING"] = True
+    with netwatch.web_app.test_client() as c:
+        c.post("/auth", json={"token": netwatch.WEB_TOKEN},
+               headers={"Origin": f"http://127.0.0.1:{netwatch.WEB_PORT}"})
+        data = c.get("/api/fleet").get_json()
+    assert data["seats"] == {"used": 3, "limit": 25}
+
+
+def test_api_fleet_seats_omitted_when_unavailable(monkeypatch):
+    monkeypatch.setattr(netwatch, "tier_at_least", lambda t: True)
+    monkeypatch.setattr(netwatch, "_load_remotes", lambda: {})
+    monkeypatch.setattr(netwatch, "_pro_sub", lambda name: None)
+    monkeypatch.setattr(netwatch, "_hub_seats", lambda: None)
+    netwatch.web_app.config["TESTING"] = True
+    with netwatch.web_app.test_client() as c:
+        c.post("/auth", json={"token": netwatch.WEB_TOKEN},
+               headers={"Origin": f"http://127.0.0.1:{netwatch.WEB_PORT}"})
+        data = c.get("/api/fleet").get_json()
+    assert "seats" not in data
+
+
+def test_hub_seats_never_raises(monkeypatch):
+    class _Boom:
+        class NodeRegistry:
+            def __init__(self):
+                raise RuntimeError("no registry")
+    monkeypatch.setattr(netwatch, "_pro_sub",
+                        lambda name: _Boom if name == "collector" else None)
+    assert netwatch._hub_seats() is None
+    monkeypatch.setattr(netwatch, "_pro_sub", lambda name: None)
+    assert netwatch._hub_seats() is None
+
+
+def test_fmt_seats():
+    assert netwatch._fmt_seats({"used": 3, "limit": 25}) == "3/25 nodes"
+    assert netwatch._fmt_seats({"used": 7, "limit": None}) == "7/unlimited nodes"
