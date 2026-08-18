@@ -2,6 +2,22 @@
 
 All notable changes to NetWatch are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.6.0 — 2026-08-17
+
+### Added
+- **Camera Sentry (Pro).** Physical security joins network security: point
+  NetWatch at USB/Pi cameras or rtsp/http(s) IP cams
+  (`~/.config/netwatch/cameras.json`) and it watches them with a frame-diff
+  motion pipeline plus optional HOG person recognition. Alerts flow through
+  the same channels as honeypot events (Slack/email/SMS/PagerDuty) with an
+  optional JPEG snapshot to an HTTPS webhook; live MJPEG feeds render on the
+  new `/cam` dashboard panel (behind the existing token/allowlist auth,
+  capped concurrent viewers) and a `cam` TUI verb shows sentry status.
+  OpenCV ships as an opt-in extra — `pip install "netwatch-pro[camera]"` —
+  so the base install stays lean. Nothing is written to disk unless a
+  snapshot dir is explicitly configured, and RTSP credentials are redacted
+  from every log line, event and status payload.
+
 ## 1.5.0 — 2026-07-15
 
 ### Added

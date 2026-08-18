@@ -71,7 +71,7 @@ for _i, _a in enumerate(sys.argv):
     if _a == "--token" and _i + 1 < len(sys.argv):
         _cli_token = sys.argv[_i + 1]
         break
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 # Honeypot listener ports — overridable via env so deployments can move to
 # standard ports (80/23/21/554) without local sed against the repo.
@@ -176,6 +176,22 @@ def _maybe_start_pro_scheduler():
         pass
 
 
+def _maybe_start_camera_sentry():
+    """Start the Pro Camera Sentry iff tier >= pro and cameras are configured
+    (~/.config/netwatch/cameras.json). The only free-side logic is this seam
+    call; detection, alerting and the MJPEG feed live in netwatch_pro.camera."""
+    if not tier_at_least("pro"):
+        return
+    mod = _pro_sub("camera")
+    if mod is None:
+        return
+    try:
+        if mod.ensure_background():
+            print(f"  {GREEN}Camera Sentry   : watching (see /cam on the dashboard){RESET}")
+    except Exception as e:
+        print(f"  {YELLOW}Camera Sentry   : not started — {e}{RESET}")
+
+
 def audit_emit(action, detail=None, actor="local"):
     """Tamper-evident audit-trail seam (Enterprise). No-op below Enterprise —
     no surprise disk writes for non-payers — and NEVER raises or blocks the
@@ -198,7 +214,7 @@ def pro_active_modules():
         return []
     return [n for n in ("mitre", "webhooks", "threatintel", "siem", "autoblock",
                         "geo_block", "reports", "fleet", "collector", "analytics",
-                        "gateway", "personality", "ask")
+                        "gateway", "personality", "ask", "camera")
             if _pro_sub(n) is not None]
 
 # ─── Colors ──────────────────────────────────────────────
@@ -3296,6 +3312,7 @@ _HELP_SECTIONS = [
         ("join <hub> <id> <key>", "Ship this node's events to a fleet hub (Free)"),
         ("collector", "Run/inspect the fleet hub — Apiary (Pro)"),
         ("ask <question>", "NL query over intel — local brain, no key (Pro)"),
+        ("cam", "Camera Sentry status — CCTV motion/person alerts (Pro)"),
         ("license", "Show tier / license status"),
     ]),
     ("System", None, [
@@ -3571,6 +3588,7 @@ def handle_command(cmd):
         "join": (1, _disp_join), "collector": (1, _disp_collector),
         "ask": (2, _disp_ask), "users": (1, _disp_users),
         "audit": (1, _disp_audit), "compliance": (1, _disp_compliance),
+        "cam": (1, _disp_cam), "cameras": (1, _disp_cam),
     }
 
     if action in _DIRECT_CMDS:
@@ -5063,6 +5081,43 @@ def _alerts_configured():
         return os.path.exists(os.path.expanduser("~/.config/netwatch/alerts.json"))
     except Exception:
         return False
+
+
+def _disp_cam(parts):
+    """cam — Camera Sentry status (Pro): cameras, alert counts, recent events.
+    Configure sources in ~/.config/netwatch/cameras.json; live view at /cam."""
+    if not tier_at_least("pro"):
+        add_console(f"  {YELLOW}Camera Sentry is a Pro feature.{RESET}")
+        add_console(f"  {PRO_UPGRADE_HINT}")
+        return
+    mod = _pro_sub("camera")
+    if mod is None:
+        add_console(f"  {RED}Pro add-on not installed.{RESET}")
+        return
+    try:
+        st = mod.status()
+    except Exception as e:
+        add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+        return
+    if not st.get("running"):
+        add_console(f"  {DIM}Camera Sentry not running — add sources to "
+                    f"~/.config/netwatch/cameras.json and restart.{RESET}")
+        return
+    add_console(f"{BOLD}{CYAN}CAMERA SENTRY{RESET}  {DIM}viewers: {st.get('viewers', 0)}  "
+                f"person detect: {'on' if st.get('person_detect') else 'off'}{RESET}")
+    for c in st.get("cameras", []):
+        state = f"{GREEN}live{RESET}" if c.get("online") else f"{RED}offline{RESET}"
+        line = (f"  cam{c.get('id')}  {state}  {DIM}{_ansi_strip(str(c.get('source')))}{RESET}  "
+                f"frames: {c.get('frames', 0)}  alerts: {c.get('alerts', 0)}")
+        if c.get("last_alert"):
+            line += f"  last: {_ansi_strip(str(c.get('last_alert')))}"
+        add_console(line)
+    ev = st.get("events", [])[-8:]
+    if ev:
+        add_console(f"  {DIM}recent:{RESET}")
+        for e in ev:
+            add_console(f"    {DIM}{_ansi_strip(str(e))}{RESET}")
+    add_console(f"  {DIM}live view: /cam on the web dashboard{RESET}")
 
 
 def _disp_compliance(parts):
@@ -7573,7 +7628,9 @@ def _state_snapshot():
 
 @web_app.route("/")
 def web_index():
-    return render_template_string(WEB_DASHBOARD_HTML)
+    return render_template_string(
+        WEB_DASHBOARD_HTML,
+        cam_enabled=tier_at_least("pro") and _pro_sub("camera") is not None)
 
 _snapshot_cache = {"data": None, "ts": 0}
 _SNAPSHOT_TTL = 2.0
@@ -7735,7 +7792,7 @@ _WEB_SAFE_CMDS = {
     "speed", "ifinfo", "help",
     "block", "unblock", "pcap", "track", "untrack", "conns", "sniff",
     "trackdns", "tracking", "stealth", "clear", "export",
-    "join", "compliance", "audit",
+    "join", "compliance", "audit", "cam", "cameras",
 }
 
 # RBAC (Business): minimum role per web command. Anything not listed is
@@ -8022,6 +8079,7 @@ background:rgba(0,212,255,.1);color:var(--cyan);border:1px solid rgba(0,212,255,
 <body>
 <div id="header">
   <h1>NETWATCH</h1>
+  {% if cam_enabled %}<a href="/cam" title="Camera Sentry (Pro)" style="color:var(--green);font-size:11px;text-decoration:none;border:1px solid var(--border);border-radius:3px;padding:3px 8px">&#9673; CAM</a>{% endif %}
   <span class="stat"><b id="s-pkts">0</b> pkts</span>
   <span class="stat"><b id="s-bytes">0B</b></span>
   <span class="stat"><b id="s-hosts">0</b> hosts</span>
@@ -9147,6 +9205,131 @@ def web_replay_player(session_id):
                                   session_id=session_id,
                                   protocol=_replay_proto_arg())
 
+# ── Camera Sentry (Pro) — live CCTV panel ────────────────
+# All three routes sit behind _web_auth (allowlist + token/RBAC) like every
+# other web_app route; they are GET-only so no new CSRF surface.
+
+_CAM_HTML = r"""<!DOCTYPE html><html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetWatch · Camera Sentry</title>
+<style>
+ body{background:#0a0e0a;color:#cfe;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:24px}
+ h1{color:#7df58a;font-weight:400;letter-spacing:1px;margin:0 0 4px}
+ .sub{color:#5a8;margin-bottom:24px;font-size:11px}
+ a{color:#7df58a;text-decoration:none}
+ a:hover{color:#fff;background:#143}
+ .nav{margin-bottom:16px}
+ .nav a{padding:4px 10px;border:1px solid #2a4;border-radius:3px;margin-right:8px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+ .cam{background:#0e1810;border:1px solid #143;border-radius:4px;overflow:hidden}
+ .cam img{width:100%;display:block;aspect-ratio:16/9;object-fit:cover;background:#000}
+ .cam .bar{display:flex;justify-content:space-between;padding:6px 10px;font-size:11px}
+ .on{color:#7df58a}.off{color:#f87}
+ .empty{padding:40px;text-align:center;color:#588}
+ h2{color:#5a8;font-weight:400;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin:24px 0 8px}
+ ul{list-style:none;padding:0;margin:0}
+ li{padding:3px 0;border-bottom:1px solid #0f1a10;color:#9cb;font-size:11px}
+</style></head><body>
+<div class="nav"><a href="/">&larr; dashboard</a><a href="/cam" id="refresh">&#8635; refresh</a></div>
+<h1>CAMERA SENTRY</h1>
+<div class="sub">Live feeds — motion + person detection alerts flow into your configured channels</div>
+<div id="grid" class="grid"><div class="empty">loading&hellip;</div></div>
+<h2>Recent events</h2>
+<ul id="events"><li>loading&hellip;</li></ul>
+<script>
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let mounted=false;
+async function load(){
+  let st;
+  try{
+    const r=await fetch('/api/cam/status');
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    st=await r.json();
+  }catch(e){
+    document.getElementById('grid').innerHTML=`<div class="empty">Failed to load status: ${esc(e.message||e)}</div>`;return;
+  }
+  if(!mounted){
+    mounted=true;
+    const g=document.getElementById('grid');
+    if(!st.cameras.length){g.innerHTML='<div class="empty">No cameras configured — add sources to ~/.config/netwatch/cameras.json and restart</div>';}
+    else g.innerHTML=st.cameras.map(c=>
+      `<div class="cam"><img src="/api/cam/stream/${esc(c.id)}" alt="camera ${esc(c.id)}">`+
+      `<div class="bar"><span>CAM ${esc(c.id)} &middot; ${esc(c.source)}</span>`+
+      `<span id="cs-${esc(c.id)}"></span></div></div>`).join('');
+  }
+  for(const c of st.cameras){
+    const el=document.getElementById('cs-'+c.id);
+    if(el)el.innerHTML=(c.online?'<span class="on">&#9679; live</span>':'<span class="off">&#9679; offline</span>')+
+      ` &middot; ${esc(c.alerts)} alert${c.alerts===1?'':'s'}`;
+  }
+  document.getElementById('events').innerHTML=
+    (st.events&&st.events.length?st.events.slice().reverse().map(e=>`<li>${esc(e)}</li>`).join(''):'<li>none yet</li>');
+}
+load();setInterval(load,5000);
+</script></body></html>"""
+
+_CAM_UPSELL_HTML = r"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>NetWatch · Camera Sentry</title>
+<style>body{background:#0a0e0a;color:#cfe;font:13px ui-monospace,Menlo,monospace;margin:0;padding:24px}
+h1{color:#7df58a;font-weight:400}a{color:#7df58a}.nav a{padding:4px 10px;border:1px solid #2a4;border-radius:3px}
+p{color:#9cb;max-width:60ch}</style></head><body>
+<div class="nav"><a href="/">&larr; dashboard</a></div>
+<h1>CAMERA SENTRY</h1>
+<p>Multi-camera CCTV monitoring with motion + person detection, live MJPEG feeds
+and alerts through Slack/email/SMS/PagerDuty.</p>
+<p>{{ hint }}</p>
+</body></html>"""
+
+
+@web_app.route("/cam")
+def web_cam_page():
+    mod = _pro_sub("camera")
+    if not tier_at_least("pro") or mod is None:
+        return render_template_string(_CAM_UPSELL_HTML, hint=PRO_UPGRADE_HINT)
+    return render_template_string(_CAM_HTML)
+
+
+@web_app.route("/api/cam/status")
+def web_cam_status():
+    mod = _pro_sub("camera")
+    if mod is None:
+        return jsonify({"error": "camera sentry unavailable"}), 404
+    try:
+        return jsonify(mod.status())
+    except Exception as e:
+        # Surface only the pro-upsell message; never leak internal error text.
+        if type(e).__name__ == "ProFeatureRequired":
+            return jsonify({"error": str(e)}), 403
+        return jsonify({"error": "camera sentry unavailable"}), 404
+
+
+@web_app.route("/api/cam/stream/<int:cam_id>")
+def web_cam_stream(cam_id):
+    mod = _pro_sub("camera")
+    if mod is None:
+        return "camera sentry unavailable", 404
+    try:
+        frames = mod.mjpeg_stream(cam_id)
+    except RuntimeError as e:
+        return str(e), 429 if "viewer" in str(e) else 503
+    except Exception:
+        return "camera sentry unavailable", 404
+    cookie_val = request.cookies.get("nw_token", "")
+    sess_val = request.cookies.get("nw_sess", "")
+
+    def generate():
+        n = 0
+        for chunk in frames:
+            n += 1
+            # Long-lived stream: re-check the session every ~15s, same as /api/stream.
+            if n % 75 == 0 and WEB_TOKEN and _role_from_cookies(cookie_val, sess_val) is None:
+                break
+            yield chunk
+    return web_app.response_class(
+        generate(), mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 def _replay_extra_dirs():
     """Extra capture dirs to merge into replay listings (e.g. droplet rsync).
 
@@ -9839,6 +10022,37 @@ def _cli_subcommand(argv):
             elif llm.get("summary"):
                 print(f"\nLLM summary: {llm['summary']}")
         return 0
+    if cmd == "cam":
+        # Camera Sentry status from the shell (Pro). Read-only; live view is /cam.
+        if not tier_at_least("pro"):
+            print("Camera Sentry is a Pro feature.")
+            print(PRO_UPGRADE_HINT)
+            return 1
+        mod = _pro_sub("camera")
+        if mod is None:
+            print("Pro add-on not installed — pip install netwatch-pro")
+            return 1
+        try:
+            st = mod.status()
+        except Exception as e:
+            print(f"cam failed: {type(e).__name__}: {e}")
+            return 1
+        if not st.get("running"):
+            print("Camera Sentry not running — add sources to "
+                  "~/.config/netwatch/cameras.json and restart.")
+            return 0
+        print(f"CAMERA SENTRY  viewers: {st.get('viewers', 0)}  "
+              f"person detect: {'on' if st.get('person_detect') else 'off'}")
+        for c in st.get("cameras", []):
+            state = "live" if c.get("online") else "offline"
+            line = (f"  cam{c.get('id')}  {state}  {_ansi_strip(str(c.get('source')))}  "
+                    f"frames: {c.get('frames', 0)}  alerts: {c.get('alerts', 0)}")
+            if c.get("last_alert"):
+                line += f"  last: {_ansi_strip(str(c.get('last_alert')))}"
+            print(line)
+        for e in st.get("events", [])[-8:]:
+            print(f"    {_ansi_strip(str(e))}")
+        return 0
     if cmd == "join":
         # Headless join (configure only — shipping starts on the next
         # `netwatch <iface>` run, or immediately inside the TUI's own `join`).
@@ -10054,7 +10268,7 @@ def _cli_subcommand(argv):
 
 
 _CLI_SUBCOMMANDS = ("activate", "register", "license", "status", "collector",
-                    "ask", "join", "users", "report", "audit", "compliance",
+                    "ask", "cam", "join", "users", "report", "audit", "compliance",
                     "--version", "-V", "version")
 
 
@@ -10192,6 +10406,7 @@ def main():
     # Time-series sampling for charts
     threading.Thread(target=_sample_timeseries, daemon=True).start()
     _maybe_start_pro_scheduler()
+    _maybe_start_camera_sentry()
 
     # Meshtastic mesh radio
     if _HAS_MESH:
