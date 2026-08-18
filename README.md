@@ -16,7 +16,7 @@
 [![Kali](https://img.shields.io/badge/Kali-557C94?logo=kalilinux&logoColor=white)](https://www.kali.org/)
 [![Platform: Debian](https://img.shields.io/badge/platform-debian-A81D33?logo=debian&logoColor=white)](https://www.debian.org/)
 [![Tests](https://img.shields.io/badge/tests-2304-brightgreen.svg)](tests/)
-[![Version](https://img.shields.io/badge/version-1.5.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.6.0-blue.svg)](CHANGELOG.md)
 [![Status: Active](https://img.shields.io/badge/status-active-brightgreen.svg)]()
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pr0xy_22)
 
@@ -543,6 +543,7 @@ unlocks these; without one it simply keeps running as Free.
 | Apiary fleet (multi-node aggregation) | | ✓ | ✓ | ✓ |
 | Threat intel enrichment · MITRE ATT&CK · IP watchlist | | ✓ | ✓ | ✓ |
 | `ask` — natural-language queries over your intel | | ✓ | ✓ | ✓ |
+| Camera Sentry — CCTV motion + person detection, `/cam` live feeds | | ✓ | ✓ | ✓ |
 | Signed PDF incident reports · alerts (Slack/SMS/PagerDuty) | | ✓ | ✓ | ✓ |
 | SIEM forwarding · webhooks | | | ✓ | ✓ |
 | Compliance control-coverage reports · SSO | | | | ✓ |
