@@ -16,6 +16,7 @@ Run: sudo python3 netwatch.py [interface]
 import os
 import re
 import sys
+import unicodedata
 import ssl
 import time
 import json
@@ -24,6 +25,7 @@ import socket
 import select
 import struct
 import signal
+import atexit
 import random
 import queue
 import secrets
@@ -32,7 +34,7 @@ import threading
 import subprocess
 from datetime import datetime, timezone
 from collections import defaultdict, deque
-from flask import Flask, Response, request, render_template_string, redirect, jsonify
+from flask import Flask, Response, request, render_template_string, redirect, jsonify, g
 from markupsafe import escape as _escape
 
 try:
@@ -65,13 +67,27 @@ except PermissionError:
     pass
 
 SERIAL = random.randint(1000, 9999)
-IFACE = sys.argv[1] if len(sys.argv) > 1 else "wlan0"
+
+# Parse argv into positionals + flags, skipping the value that follows --token so
+# a flag first arg (e.g. `netwatch.py --console`) never gets used as the iface.
 _cli_token = None
-for _i, _a in enumerate(sys.argv):
-    if _a == "--token" and _i + 1 < len(sys.argv):
-        _cli_token = sys.argv[_i + 1]
-        break
-VERSION = "1.6.0"
+_positional = []
+_skip_next = False
+for _i, _a in enumerate(sys.argv[1:]):
+    if _skip_next:
+        _skip_next = False
+        continue
+    if _a == "--token":
+        if _i + 2 < len(sys.argv):
+            _cli_token = sys.argv[_i + 2]
+        _skip_next = True
+        continue
+    if _a.startswith("-"):
+        continue
+    _positional.append(_a)
+IFACE = _positional[0] if _positional else "wlan0"
+_MODE_FLAGS = {a for a in sys.argv[1:] if a.startswith("--")}
+VERSION = "1.6.1"
 
 # Honeypot listener ports — overridable via env so deployments can move to
 # standard ports (80/23/21/554) without local sed against the repo.
@@ -80,6 +96,37 @@ HTTP_PORT   = int(os.environ.get("NETWATCH_HTTP_PORT",   "8080"))
 TELNET_PORT = int(os.environ.get("NETWATCH_TELNET_PORT", "2323"))
 FTP_PORT    = int(os.environ.get("NETWATCH_FTP_PORT",    "2121"))
 RTSP_PORT   = int(os.environ.get("NETWATCH_RTSP_PORT",   "8554"))
+
+# ─── Run mode: console (viewer) / sensor (local honeypot) / both ──────────
+# console : no local honeypot listeners or sniffers bind. The dashboard is fed
+#           by a remote node (e.g. an internet-facing droplet) via console
+#           ingest — use this when the box is behind NAT and sees no real
+#           traffic (all it would otherwise log is loopback noise).
+# sensor  : legacy behaviour — local honeypot + passive monitors bind; no ingest.
+# both    : local honeypot AND remote console ingest — watch the droplet while
+#           still detecting probes against THIS box (the local-safety toggle).
+# Precedence: NETWATCH_MODE env > CLI flags > default 'sensor' (backward-safe:
+# the droplet keeps capturing; the Pi launcher opts into console).
+def _resolve_run_mode():
+    base = os.environ.get("NETWATCH_MODE", "").strip().lower()
+    if base not in ("console", "sensor", "both"):
+        base = "sensor"
+    console = "--console" in _MODE_FLAGS
+    local = "--local-honeypot" in _MODE_FLAGS
+    if "--sensor" in _MODE_FLAGS:
+        return "sensor"
+    if console:
+        return "both" if (local or base == "both") else "console"
+    if local:
+        return "both" if base in ("console", "both") else "sensor"
+    return base
+RUN_MODE = _resolve_run_mode()
+RUN_LOCAL_HONEYPOT = RUN_MODE in ("sensor", "both")   # bind listeners + sniffers
+RUN_CONSOLE_INGEST = RUN_MODE in ("console", "both")  # pull a remote node's events
+# Where console mode reads the remote node's flat NDJSON event log from. Kept
+# fresh out-of-band (the cortex droplet sync / Apiary hub store).
+CONSOLE_SRC = os.path.expanduser(
+    os.environ.get("NETWATCH_CONSOLE_SRC", "~/.cache/cortex/droplet_events.json"))
 
 # ─── Tier gate (Free / Pro / Business / Enterprise) ───────────────────────
 # Free is the default. Paid tiers unlock when a signed license is installed —
@@ -144,6 +191,26 @@ _pro_import_tried = False
 _pro_submods = {}
 
 
+NETWATCH_CONFIG_DIR_ENV = "NETWATCH_CONFIG_DIR"
+
+
+def _config_dir():
+    """Where NetWatch keeps config and credentials.
+
+    `sudo netwatch` runs as root, where `~` is /root, while `netwatch cam list`
+    runs as you — so a home-relative path is really two directories and the two
+    never see each other's cameras, users or tokens. NETWATCH_CONFIG_DIR names
+    the one both should use (the launcher points it at the invoking user's
+    home); unset, it stays the historical ~/.config/netwatch. Read at call time
+    so it can be redirected after import. Mirrors netwatch_pro._paths."""
+    return os.path.expanduser(
+        os.environ.get(NETWATCH_CONFIG_DIR_ENV, "").strip() or "~/.config/netwatch")
+
+
+def _config_path(name):
+    return os.path.join(_config_dir(), name)
+
+
 def _pro_sub(name):
     """Lazily import a `netwatch_pro.<name>` submodule IFF a paid license is
     active and the add-on is installed; else None. This is the single seam that
@@ -176,6 +243,25 @@ def _maybe_start_pro_scheduler():
         pass
 
 
+# True once main() has started the long-running app. One-shot CLI runs
+# (`netwatch cam add …`) leave it False: they must not spin up camera threads
+# they are about to abandon at process exit.
+_APP_RUNNING = False
+
+
+def _stop_camera_sentry_at_exit():
+    """Stop watcher threads before the interpreter tears down. cv2 blocks in
+    native code, and exiting mid-read makes the C++ runtime print
+    'terminate called without an active exception' over the operator's shell."""
+    mod = _pro_sub("camera")
+    if mod is None:
+        return
+    try:
+        mod.stop_background()
+    except Exception:
+        pass
+
+
 def _maybe_start_camera_sentry():
     """Start the Pro Camera Sentry iff tier >= pro and cameras are configured
     (~/.config/netwatch/cameras.json). The only free-side logic is this seam
@@ -187,6 +273,7 @@ def _maybe_start_camera_sentry():
         return
     try:
         if mod.ensure_background():
+            atexit.register(_stop_camera_sentry_at_exit)
             print(f"  {GREEN}Camera Sentry   : watching (see /cam on the dashboard){RESET}")
     except Exception as e:
         print(f"  {YELLOW}Camera Sentry   : not started — {e}{RESET}")
@@ -214,7 +301,8 @@ def pro_active_modules():
         return []
     return [n for n in ("mitre", "webhooks", "threatintel", "siem", "autoblock",
                         "geo_block", "reports", "fleet", "collector", "analytics",
-                        "gateway", "personality", "ask", "camera")
+                        "gateway", "personality", "ask", "camera",
+                        "enterprise_auth", "sso_oidc")
             if _pro_sub(n) is not None]
 
 # ─── Colors ──────────────────────────────────────────────
@@ -262,7 +350,8 @@ def _capped_append(lst, item, cap):
 
 # Honeypot
 honeypot_events = []
-MAX_EVENTS = 100
+MAX_EVENTS = 1000   # in-memory ring; raised so a restart + console ingest can
+                    # show a real backlog instead of the last handful of hits
 MAX_CONNS_PER_SERVICE = 50
 _service_conns = defaultdict(int)
 
@@ -292,11 +381,17 @@ def _clip_visible(s, width):
             out.append(m.group(0))
             i = m.end()
             continue
-        if vis >= width:
+        # Count TERMINAL columns, not code points: a CJK/emoji glyph is 2 cols,
+        # a combining mark 0. Counting 1-per-codepoint let a wide-glyph line
+        # (attacker-derived hostname/org/geo) pass the width check and still wrap.
+        ch = s[i]
+        w = 0 if unicodedata.combining(ch) else (
+            2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1)
+        if vis + w > width:
             truncated = True
             break
-        out.append(s[i])
-        vis += 1
+        out.append(ch)
+        vis += w
         i += 1
     res = ''.join(out)
     if truncated:
@@ -490,6 +585,82 @@ def _cortex_feed_event(entry):
         pass
 
 
+# ─── Console ingest (feed the dashboard from a remote honeypot node) ──────
+def _console_map_row(entry):
+    """Map one remote NDJSON event to the in-memory honeypot_events schema
+    ({time, service, ip, summary, origin}). Returns None on a junk row."""
+    if not isinstance(entry, dict):
+        return None
+    try:
+        service = str(entry.get("service", "?"))
+        ip = str(entry.get("source_ip") or entry.get("ip") or "?")
+        data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+        ts = entry.get("timestamp", "")
+        tstr = ""
+        if isinstance(ts, str) and len(ts) >= 19:
+            try:
+                tstr = datetime.fromisoformat(
+                    ts.replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S")
+            except ValueError:
+                tstr = ts[11:19]
+        return {"time": tstr or "--:--:--", "service": service, "ip": ip,
+                "summary": _short_summary(service, ip, data), "origin": "droplet"}
+    except Exception:
+        return None
+
+
+def _console_load(path, limit):
+    """Read the last `limit` events from a remote node's flat NDJSON log,
+    reading only the tail bytes so a multi-MB file stays cheap to poll."""
+    rows = []
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            back = min(size, max(65536, limit * 2048))
+            f.seek(size - back)
+            chunk = f.read()
+    except OSError:
+        return rows
+    lines = chunk.decode("utf-8", "replace").splitlines()
+    if size > back and lines:
+        lines = lines[1:]              # drop the partial first line
+    for line in lines[-limit:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = _console_map_row(json.loads(line))
+        except (ValueError, json.JSONDecodeError):
+            continue
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _console_refresh():
+    """Replace the droplet-origin slice of honeypot_events with a fresh tail,
+    preserving any locally-captured probes (both mode). Returns rows loaded."""
+    rows = _console_load(CONSOLE_SRC, MAX_EVENTS)
+    if not rows:
+        return 0
+    with lock:
+        local = [e for e in honeypot_events if e.get("origin") == "local"]
+        honeypot_events[:] = (rows + local)[-MAX_EVENTS:]
+    return len(rows)
+
+
+def _console_ingest_loop():
+    """Console mode: keep the dashboard fed from the remote node so honeypot /
+    attackers / osint / all show REAL attacks, not this box's loopback noise."""
+    interval = max(5.0, float(os.environ.get("NETWATCH_CONSOLE_INTERVAL", "30")))
+    while True:
+        try:
+            _console_refresh()
+        except Exception:
+            pass
+        time.sleep(interval)
+
+
 def log_event(service, ip, data):
     truncated = _truncate_data(data)
     entry = {
@@ -516,6 +687,8 @@ def log_event(service, ip, data):
         honeypot_events.append({
             "time": datetime.now().strftime("%H:%M:%S"),
             "service": service, "ip": ip, "summary": short,
+            "origin": "local",   # so console ingest (both mode) never clobbers
+                                  # locally-captured probes when it refreshes
         })
         if len(honeypot_events) > MAX_EVENTS:
             honeypot_events.pop(0)
@@ -1549,6 +1722,17 @@ def _ftp_basic_intel(ip):
     abuse_str = abuse.get("blocklist_de", "?")
     flags = [k for k in ("is_proxy", "is_hosting", "is_mobile") if abuse.get(k)]
 
+    # country/org/asn/ptr/abuse come from external OSINT — plaintext ip-api.com,
+    # RIR descr, reverse DNS — all attacker-influenceable. Strip ANSI/OSC/control
+    # + newlines and bound length before they flow into alerts → the dashboard
+    # frame → the operator's (root, under `sudo netwatch`) TTY, where raw escapes
+    # would forge rows or drive terminal query/response sequences.
+    country = _ansi_strip(str(country)).replace("\n", " ")[:32]
+    org = _ansi_strip(str(org)).replace("\n", " ")[:48]
+    asn_str = _ansi_strip(str(asn_str)).replace("\n", " ")[:32]
+    ptr = _ansi_strip(str(ptr)).replace("\n", " ")[:64]
+    abuse_str = _ansi_strip(str(abuse_str)).replace("\n", " ")[:32]
+
     report_file = os.path.join(LOG_DIR, f"attacker_{ip.replace('.','_')}.txt")
     try:
         with open(report_file, "a") as f:
@@ -1786,7 +1970,10 @@ def nmap_scan(target, scan_type="-sV -T4"):
         with lock:
             nmap_results.clear()
             for l in lines[:20]:
-                nmap_results.append({"time": ts, "line": l})
+                # nmap -sV echoes remote service banners verbatim; strip any
+                # ANSI/control an attacker planted in a banner before it renders
+                # on the dashboard frame (→ root TTY).
+                nmap_results.append({"time": ts, "line": _ansi_strip(str(l))[:200]})
             alerts.append({"time": ts, "msg": f"NMAP: scan of {target} complete ({len(lines)} findings)"})
 
         # Save full output
@@ -3090,7 +3277,11 @@ def dispatch_command(cmd):
     _redraw_event.set()
     return False
 current_tab = "all"
-TABS = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts", "osint", "proxy", "mesh", "fleet"]
+# Original ten (digit hotkeys 1-9,0) kept in place; mesh/fleet at 10/11 as before;
+# new tabs appended so no existing digit mapping shifts. All reachable by name /
+# [ ] / Tab cycling; the tab bar shows «N/»N when some don't fit.
+TABS = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts", "osint",
+        "proxy", "mesh", "fleet", "scan", "cam", "hive", "audit"]
 # Derived from TABS so the two tab-switch code paths (raw input loop and
 # handle_command) can never drift. Typing any of these names switches tabs.
 _TAB_NAMES = frozenset(TABS)
@@ -3106,13 +3297,23 @@ def _cycle_tab(current, delta):
     return TABS[(i + delta) % len(TABS)]
 
 
+# Tab names that are ALSO command verbs: bare word switches the tab, but with an
+# argument it runs the command (`scan <ip>`, `cam add …`, `audit verify`).
+_TAB_CMD_COLLISIONS = frozenset({"scan", "cam", "audit"})
+
+
 def _tab_for_command(cmd):
-    """The tab a typed console command selects, or None if it isn't a tab name.
-    Pure helper shared by the raw input loop and tests."""
+    """The tab a typed console command selects, or None if it isn't a bare tab
+    name. Pure helper shared by the raw input loop and tests."""
     if not cmd or not cmd.strip():
         return None
-    action = cmd.strip().lower().split()[0]
-    return action if action in _TAB_NAMES else None
+    parts = cmd.strip().lower().split()
+    action = parts[0]
+    if action not in _TAB_NAMES:
+        return None
+    if len(parts) > 1 and action in _TAB_CMD_COLLISIONS:
+        return None                 # `scan 1.2.3.4` runs a scan, not a tab switch
+    return action
 
 
 show_help_overlay = False
@@ -3312,7 +3513,10 @@ _HELP_SECTIONS = [
         ("join <hub> <id> <key>", "Ship this node's events to a fleet hub (Free)"),
         ("collector", "Run/inspect the fleet hub — Apiary (Pro)"),
         ("ask <question>", "NL query over intel — local brain, no key (Pro)"),
-        ("cam", "Camera Sentry status — CCTV motion/person alerts (Pro)"),
+        ("cam [add|remove|list]", "Camera Sentry — CCTV motion/person alerts, Blink/RTSP/USB (Pro)"),
+        ("mfa [enroll|confirm|…]", "Two-factor logins, lockouts, sign-out-everywhere (Enterprise)"),
+        ("apikey [new|revoke]", "Scoped API keys for programmatic access (Enterprise)"),
+        ("sso [test]", "Single sign-on via your IdP — OpenID Connect (Enterprise)"),
         ("license", "Show tier / license status"),
     ]),
     ("System", None, [
@@ -3587,8 +3791,12 @@ def handle_command(cmd):
         "remote": (1, _disp_remote), "droplet": (1, _disp_remote),
         "join": (1, _disp_join), "collector": (1, _disp_collector),
         "ask": (2, _disp_ask), "users": (1, _disp_users),
-        "audit": (1, _disp_audit), "compliance": (1, _disp_compliance),
-        "cam": (1, _disp_cam), "cameras": (1, _disp_cam),
+        # audit/cam are also TAB names — require an arg so the bare word falls
+        # through to tab switching (like `scan`); `audit verify`, `cam add …` still route here.
+        "audit": (2, _disp_audit), "compliance": (1, _disp_compliance),
+        "cam": (2, _disp_cam), "cameras": (2, _disp_cam),
+        "mfa": (1, _disp_mfa), "apikey": (1, _disp_apikey),
+        "apikeys": (1, _disp_apikey), "sso": (1, _disp_sso),
     }
 
     if action in _DIRECT_CMDS:
@@ -4981,6 +5189,31 @@ def _disp_join(parts):
     add_console(f"  {GREEN}Joined {hub} as '{node_id}'. Shipping events.{RESET}")
 
 
+def _maybe_autostart_shipper():
+    """Start the Apiary shipper at process boot if this node is already enrolled
+    (~/.config/netwatch/apiary_node.json). Without this the shipper only ever
+    started from an interactive `join`, so a headless `netwatch join <token>`
+    followed by a service restart never actually shipped."""
+    global _apiary_shipper
+    if _apiary_shipper is not None:
+        return
+    try:
+        import netwatch_shipper as _ship
+        cfg = _ship.load_config()
+    except Exception:
+        return
+    if not (cfg.get("hub_url") and cfg.get("node_id") and cfg.get("node_key")):
+        return                                   # not enrolled — nothing to ship
+    try:
+        _apiary_shipper = _ship.Shipper(cfg)
+        _apiary_shipper.start_background()
+        print(f"  {GREEN}Apiary shipper  : shipping to "
+              f"{_ansi_strip(str(cfg.get('hub_url','')))[:48]} as "
+              f"'{_ansi_strip(str(cfg.get('node_id','')))[:32]}'{RESET}")
+    except Exception as e:
+        print(f"  {YELLOW}Apiary shipper  : not started — {type(e).__name__}{RESET}")
+
+
 def _disp_ask(parts):
     """ask — natural-language query over harvested intel (Pro feature).
       ask <question>                    answer locally (no API key, no network)
@@ -5070,22 +5303,112 @@ def _compliance_snapshot():
         "retention_days": int(os.environ.get("NETWATCH_RETENTION_DAYS", "30")),
         "hub_tls": True,
         "seat_enforced": bool(seats),
-        "siem_configured": os.path.exists(os.path.expanduser("~/.config/netwatch/siem.json")),
-        "threat_intel": os.path.exists(os.path.expanduser("~/.config/netwatch/watchlist.json")),
-        "geo_block": os.path.exists(os.path.expanduser("~/.config/netwatch/geoblock.json")),
+        "siem_configured": os.path.exists(_config_path("siem.json")),
+        "threat_intel": os.path.exists(_config_path("watchlist.json")),
+        "geo_block": os.path.exists(_config_path("geoblock.json")),
     }
 
 
 def _alerts_configured():
     try:
-        return os.path.exists(os.path.expanduser("~/.config/netwatch/alerts.json"))
+        return os.path.exists(_config_path("alerts.json"))
     except Exception:
         return False
 
 
+def _cam_manage(mod, sub, parts):
+    """cam add/remove/list/blink-auth — write cameras.json and hot-restart the
+    sentry so a new camera shows up without restarting NetWatch."""
+    if sub in ("list", "ls"):
+        try:
+            rows = mod.list_sources()
+        except Exception as e:
+            add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+            return
+        if not rows:
+            add_console(f"  {DIM}No cameras configured.{RESET} "
+                        f"Add one: {GREEN}cam add blink <name>{RESET}")
+            return
+        for r in rows:
+            bad = "" if r.get("valid") else f"  {RED}invalid{RESET}"
+            add_console(f"  cam{r.get('id')}  {CYAN}{r.get('kind')}{RESET}  "
+                        f"{_ansi_strip(str(r.get('source')))}{bad}")
+        return
+    if sub in ("blink-auth", "blink_auth"):
+        add_console(f"  {BOLD}Link your Blink account (one time){RESET}")
+        add_console("  Blink is cloud-only, so NetWatch signs in to Amazon/Blink for you.")
+        add_console("  Run this in YOUR terminal (it prompts for the emailed 2FA PIN):")
+        # Point at wherever the add-on actually lives on THIS box, so the
+        # command pastes cleanly from a pip install or a source checkout.
+        prefix = ""
+        try:
+            pkg_root = os.path.dirname(os.path.dirname(
+                os.path.abspath(getattr(mod, "__file__", "") or "")))
+            if pkg_root and pkg_root not in sys.path:
+                prefix = f"PYTHONPATH={pkg_root} "
+        except Exception:
+            prefix = ""
+        add_console(f"    {GREEN}{prefix}python3 -m netwatch_pro.camera_blink auth{RESET}")
+        add_console(f"  {DIM}The password is never stored; only a 0600 token cache at "
+                    f"~/.config/netwatch/blink_token.json.{RESET}")
+        add_console(f"  Then: {GREEN}cam add blink <camera name>{RESET}")
+        return
+    if sub == "add":
+        if len(parts) < 4:
+            add_console(f"  {YELLOW}usage: cam add blink <name> | rtsp <url> | "
+                        f"usb <index>{RESET}")
+            return
+        kind, value = parts[2], " ".join(parts[3:])
+        try:
+            entry = mod.add_source(kind, value)
+        except Exception as e:
+            add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+            return
+        add_console(f"  {GREEN}added cam{entry.get('id')}{RESET} "
+                    f"{CYAN}{entry.get('kind')}{RESET} "
+                    f"{_ansi_strip(str(entry.get('source')))}")
+    else:  # remove
+        if len(parts) < 3:
+            add_console(f"  {YELLOW}usage: cam remove <id>   (see: cam list){RESET}")
+            return
+        try:
+            gone = mod.remove_source(int(parts[2]))
+        except (ValueError, TypeError) as e:
+            add_console(f"  {RED}{e}{RESET}")
+            return
+        except Exception as e:
+            add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+            return
+        add_console(f"  {GREEN}removed cam{gone.get('id')}{RESET} "
+                    f"{_ansi_strip(str(gone.get('source')))}")
+    if not _APP_RUNNING:
+        # One-shot CLI: there is no sentry in THIS process to restart (the
+        # running app has its own), and starting camera threads here just to
+        # exit would abort in OpenCV's native code.
+        add_console(f"  {DIM}saved — the running NetWatch picks it up on its next "
+                    f"start (or run this from the console to apply now).{RESET}")
+        return
+    try:
+        started = mod.restart_background()
+        if started:
+            atexit.register(_stop_camera_sentry_at_exit)
+        add_console(f"  {DIM}sentry {'restarted' if started else 'idle (no cameras)'}"
+                    f"{RESET}")
+    except Exception as e:
+        add_console(f"  {YELLOW}sentry not restarted — {type(e).__name__}: {e}{RESET}")
+
+
 def _disp_cam(parts):
-    """cam — Camera Sentry status (Pro): cameras, alert counts, recent events.
-    Configure sources in ~/.config/netwatch/cameras.json; live view at /cam."""
+    """cam — Camera Sentry (Pro): status, and add/remove camera sources.
+      cam                        cameras, alert counts, recent events
+      cam list                   configured sources with their ids
+      cam add blink <name>       Blink cloud camera (name as in the Blink app)
+      cam add rtsp <url>         IP camera stream (rtsp:// or http(s)://)
+      cam add usb <index>        local USB / Pi camera (0, 1, …)
+      cam remove <id>            drop a source
+      cam blink-auth             how to link your Blink account (one time)
+    Sources live in ~/.config/netwatch/cameras.json (0600); add/remove restart
+    the sentry in place. Live view at /cam on the web dashboard."""
     if not tier_at_least("pro"):
         add_console(f"  {YELLOW}Camera Sentry is a Pro feature.{RESET}")
         add_console(f"  {PRO_UPGRADE_HINT}")
@@ -5094,14 +5417,19 @@ def _disp_cam(parts):
     if mod is None:
         add_console(f"  {RED}Pro add-on not installed.{RESET}")
         return
+    sub = (parts[1].lower() if len(parts) > 1 else "")
+    if sub in ("add", "remove", "rm", "del", "list", "ls", "blink-auth", "blink_auth"):
+        return _cam_manage(mod, sub, parts)
     try:
         st = mod.status()
     except Exception as e:
         add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
         return
     if not st.get("running"):
-        add_console(f"  {DIM}Camera Sentry not running — add sources to "
-                    f"~/.config/netwatch/cameras.json and restart.{RESET}")
+        reason = st.get("reason") or "not started"
+        add_console(f"  {DIM}Camera Sentry not running — {_ansi_strip(str(reason))}.{RESET}")
+        add_console(f"  Add a camera: {GREEN}cam add blink <name>{RESET} / "
+                    f"{GREEN}cam add rtsp <url>{RESET} / {GREEN}cam add usb <index>{RESET}")
         return
     add_console(f"{BOLD}{CYAN}CAMERA SENTRY{RESET}  {DIM}viewers: {st.get('viewers', 0)}  "
                 f"person detect: {'on' if st.get('person_detect') else 'off'}{RESET}")
@@ -5193,6 +5521,198 @@ def _disp_audit(parts):
         v = mod.verify()
         add_console(f"  {GREEN}✓ chain intact{RESET}" if v.get("ok")
                     else f"  {RED}✗ {_ansi_strip(str(v.get('error')))}{RESET}")
+    except Exception as e:
+        add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+
+
+def _ent_mod_or_msg():
+    """The enterprise_auth module, or None after printing why it isn't there."""
+    if not tier_at_least("enterprise"):
+        add_console(f"  {YELLOW}MFA, API keys and SSO are Enterprise features.{RESET}")
+        add_console(f"  {ENTERPRISE_UPGRADE_HINT}")
+        return None
+    mod = _pro_sub("enterprise_auth")
+    if mod is None:
+        add_console(f"  {RED}Pro add-on not installed.{RESET}")
+    return mod
+
+
+def _disp_mfa(parts):
+    """mfa — two-factor authentication for dashboard logins (Enterprise).
+      mfa                          enrollment + lockout status for every user
+      mfa enroll <user>            start enrollment (secret + recovery codes)
+      mfa confirm <user> <code>    activate MFA once the app shows a code
+      mfa codes <user>             fresh recovery codes (old ones stop working)
+      mfa disable <user>           remove MFA and sign the user out everywhere
+      mfa unlock <user>            clear a lockout after failed logins
+      mfa signout <user>           invalidate every session cookie they hold
+    Recovery codes and the secret are shown ONCE — capture them there and then."""
+    mod = _ent_mod_or_msg()
+    if mod is None:
+        return
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    user = parts[2] if len(parts) > 2 else ""
+    try:
+        if sub in ("status", "list"):
+            rows = mod.mfa_status()
+            if not rows:
+                add_console(f"  {DIM}No users have MFA enrolled.{RESET}")
+                add_console(f"  {DIM}Enroll one:{RESET} {GREEN}mfa enroll alice{RESET}")
+                return
+            for r in rows:
+                state = (f"{GREEN}on{RESET}" if r["confirmed"]
+                         else f"{YELLOW}pending{RESET}" if r["enrolled"]
+                         else f"{DIM}off{RESET}")
+                line = (f"  {r['user']:<20}{state}  {DIM}recovery left: "
+                        f"{r['recovery_left']}{RESET}")
+                if r["locked_until"] > time.time():
+                    line += f"  {RED}LOCKED{RESET}"
+                elif r["failures"]:
+                    line += f"  {YELLOW}{r['failures']} failed{RESET}"
+                add_console(line)
+            return
+        if not user:
+            add_console(f"  {YELLOW}usage: mfa {sub} <user>{RESET}")
+            return
+        if sub == "enroll":
+            info = mod.enroll_totp(user)
+            add_console(f"  {BOLD}MFA enrollment for {info['user']}{RESET}")
+            add_console(f"  secret: {BOLD}{info['secret']}{RESET}")
+            add_console(f"  {DIM}{info['uri']}{RESET}")
+            add_console(f"  recovery codes {DIM}(shown once){RESET}:")
+            for code in info["recovery_codes"]:
+                add_console(f"    {code}")
+            add_console(f"  Finish with: {GREEN}mfa confirm {info['user']} <code>{RESET}")
+            audit_emit("mfa.enroll", {"user": info["user"]})
+            return
+        if sub == "confirm":
+            code = parts[3] if len(parts) > 3 else ""
+            ok = mod.confirm_totp(user, code)
+            add_console(f"  {GREEN}MFA active for {user}.{RESET}" if ok else
+                        f"  {RED}Code rejected — check the clock and try again.{RESET}")
+            audit_emit("mfa.confirm", {"user": user, "ok": bool(ok)})
+            return
+        if sub == "codes":
+            codes = mod.regenerate_recovery_codes(user)
+            add_console(f"  {BOLD}New recovery codes for {user}{RESET} "
+                        f"{DIM}(old ones no longer work){RESET}")
+            for code in codes:
+                add_console(f"    {code}")
+            audit_emit("mfa.recovery_regen", {"user": user})
+            return
+        if sub == "disable":
+            ok = mod.disable_totp(user)
+            add_console(f"  {GREEN}MFA removed for {user}.{RESET}" if ok else
+                        f"  {YELLOW}{user} has no MFA enrolled.{RESET}")
+            audit_emit("mfa.disable", {"user": user, "ok": bool(ok)})
+            return
+        if sub == "unlock":
+            ok = mod.unlock(user)
+            add_console(f"  {GREEN}{user} unlocked.{RESET}" if ok else
+                        f"  {YELLOW}Nothing to unlock for {user}.{RESET}")
+            audit_emit("mfa.unlock", {"user": user, "ok": bool(ok)})
+            return
+        if sub == "signout":
+            epoch = mod.bump_epoch(user)
+            add_console(f"  {GREEN}All sessions for {user} signed out{RESET} "
+                        f"{DIM}(epoch {epoch}){RESET}")
+            audit_emit("session.signout_all", {"user": user, "epoch": epoch})
+            return
+        add_console("  usage: mfa [enroll|confirm|codes|disable|unlock|signout] <user>")
+    except ValueError as e:
+        add_console(f"  {RED}{e}{RESET}")
+    except Exception as e:
+        add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+
+
+def _disp_apikey(parts):
+    """apikey — scoped API keys for programmatic access (Enterprise).
+      apikey                            list live keys
+      apikey new <name> [read|operator] [days]   mint a key (shown once)
+      apikey revoke <id>                revoke a key
+    Send it as the X-NetWatch-Key header. Keys can never exceed the operator
+    role, are stored only as a salted hash, and die with the license."""
+    mod = _ent_mod_or_msg()
+    if mod is None:
+        return
+    sub = parts[1].lower() if len(parts) > 1 else "list"
+    try:
+        if sub in ("list", "ls"):
+            rows = mod.list_api_keys()
+            if not rows:
+                add_console(f"  {DIM}No API keys.{RESET} Mint one: "
+                            f"{GREEN}apikey new ci-bot read{RESET}")
+                return
+            for r in rows:
+                add_console(f"  {r['id']}  {CYAN}{r['scope']:<9}{RESET}"
+                            f"{_ansi_strip(str(r['name']))[:24]:<26}"
+                            f"{DIM}used: {r['last_used'] or 'never'}{RESET}")
+            return
+        if sub in ("new", "add", "mint"):
+            if len(parts) < 3:
+                add_console(f"  {YELLOW}usage: apikey new <name> [read|operator] [days]{RESET}")
+                return
+            scope = parts[3].lower() if len(parts) > 3 else "read"
+            days = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else None
+            res = mod.mint_api_key(parts[2], scope, days)
+            add_console(f"  {GREEN}Key '{res['name']}' minted ({res['scope']}).{RESET}")
+            add_console(f"  {BOLD}{res['key']}{RESET}")
+            add_console(f"  {DIM}Shown once. Use: curl -H 'X-NetWatch-Key: …' "
+                        f"http://127.0.0.1:{WEB_PORT}/api/state{RESET}")
+            audit_emit("apikey.mint", {"id": res["id"], "name": res["name"],
+                                       "scope": res["scope"]})
+            return
+        if sub in ("revoke", "rm", "del"):
+            if len(parts) < 3:
+                add_console(f"  {YELLOW}usage: apikey revoke <id>   (see: apikey){RESET}")
+                return
+            ok = mod.revoke_api_key(parts[2])
+            add_console(f"  {GREEN}Revoked {parts[2]}.{RESET}" if ok else
+                        f"  {YELLOW}No live key with id {parts[2]}.{RESET}")
+            audit_emit("apikey.revoke", {"id": parts[2], "ok": bool(ok)})
+            return
+        add_console("  usage: apikey [new <name> [scope] [days] | revoke <id>]")
+    except ValueError as e:
+        add_console(f"  {RED}{e}{RESET}")
+    except Exception as e:
+        add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
+
+
+def _disp_sso(parts):
+    """sso — single sign-on through your identity provider (Enterprise).
+      sso            show the configured IdP (secret never printed)
+      sso test       fetch the discovery document and check the endpoints
+    Configure in ~/.config/netwatch/oidc.json (0600): issuer, client_id,
+    client_secret, redirect_uri and a role_map of IdP group → NetWatch role.
+    Unmapped accounts are denied, never defaulted to viewer."""
+    if not tier_at_least("enterprise"):
+        add_console(f"  {YELLOW}SSO is an Enterprise feature.{RESET}")
+        add_console(f"  {ENTERPRISE_UPGRADE_HINT}")
+        return
+    mod = _pro_sub("sso_oidc")
+    if mod is None:
+        add_console(f"  {RED}Pro add-on not installed.{RESET}")
+        return
+    try:
+        if not mod.configured():
+            add_console(f"  {DIM}SSO not configured.{RESET} Create "
+                        f"~/.config/netwatch/oidc.json (chmod 600) with issuer, "
+                        f"client_id, client_secret, redirect_uri, role_map.")
+            return
+        summary = mod.config_summary()
+        add_console(f"{BOLD}{CYAN}SSO (OpenID Connect){RESET}")
+        for k in ("issuer", "client_id", "redirect_uri", "role_claim"):
+            add_console(f"  {k:<14}{_ansi_strip(str(summary.get(k, '')))}")
+        add_console(f"  {'roles mapped':<14}"
+                    f"{', '.join(summary.get('roles_mapped') or []) or '(none)'}")
+        if summary.get("allowed_domains"):
+            add_console(f"  {'domains':<14}{', '.join(summary['allowed_domains'])}")
+        if len(parts) > 1 and parts[1].lower() == "test":
+            meta = mod.discover(mod.load_config())
+            add_console(f"  {GREEN}discovery OK{RESET} "
+                        f"{DIM}{_ansi_strip(str(meta.get('authorization_endpoint')))}{RESET}")
+        else:
+            add_console(f"  {DIM}Check connectivity with:{RESET} {GREEN}sso test{RESET}")
     except Exception as e:
         add_console(f"  {RED}{type(e).__name__}: {e}{RESET}")
 
@@ -6252,35 +6772,53 @@ def _cmd_proxy(sub):
 
 def _tab_bar(cols, active=None):
     active = active or current_tab
+    # Match the painter's per-line `cols-1` re-clip so the last tab never loses
+    # its final character at exactly the boundary width.
+    budget = max(1, cols - 1)
 
     def _hotkey(i):
-        # 1-9 for the first nine, 0 for the tenth; 11th+ have no numeric hotkey.
+        # 1-9 for the first nine, 0 for the tenth; 11th+ reachable by name / cycle.
         return f"{i + 1}:" if i < 9 else ("0:" if i == 9 else "")
 
-    def _build(sep, show_num):
-        parts = []
-        for i, t in enumerate(TABS):
-            num = _hotkey(i) if show_num else ""
-            label = t.upper()
-            if t == active:
-                parts.append(f"{BOLD}{BG_RED}{WHITE} {num}{label} {RESET}")
-            else:
-                parts.append(f"{DIM}{num}{label}{RESET}")
-        return "  " + sep.join(parts)
+    def _cell(i, t, show_num):
+        num = _hotkey(i) if show_num else ""
+        label = t.upper()
+        if t == active:
+            return f"{BOLD}{BG_RED}{WHITE} {num}{label} {RESET}", len(num) + len(label) + 2
+        return f"{DIM}{num}{label}{RESET}", len(num) + len(label)
 
-    def _vis(s):
-        return len(re.sub(r'\x1b\[[0-9;]*m', '', s))
-
-    # Degrade gracefully so the bar never overflows and wraps (which shoves the
-    # whole dashboard down a row): full → single-space → drop the number prefix.
+    # Whole bar fits? Degrade full → tight → no-numbers before giving up.
     for sep, show_num in (("  ", True), (" ", True), (" ", False)):
-        bar = _build(sep, show_num)
-        if _vis(bar) <= cols:
-            return bar
-    # Still too wide (very narrow terminal): hard-clip the compact form.
-    bar = _build(" ", False)
-    plain = re.sub(r'\x1b\[[0-9;]*m', '', bar)
-    return plain[:max(0, cols - 1)]
+        cells = [_cell(i, t, show_num) for i, t in enumerate(TABS)]
+        total = 2 + sum(p for _, p in cells) + len(sep) * (len(cells) - 1)
+        if total <= budget:
+            return "  " + sep.join(r for r, _ in cells)
+
+    # Overflow: window the tabs around the ACTIVE one so it's always visible, and
+    # show «N / »N markers for how many are hidden left/right — never a silent clip.
+    sep = " "
+    cells = [_cell(i, t, False) for i, t in enumerate(TABS)]   # compact form
+    ai = TABS.index(active) if active in _TAB_NAMES else 0
+    lo = hi = ai
+    used = 2 + cells[ai][1]                     # leading "  " + active cell
+    reserve = 5                                 # room for a «N or »N marker
+    while True:
+        grew = False
+        if lo - 1 >= 0 and used + len(sep) + cells[lo - 1][1] + reserve <= budget:
+            used += len(sep) + cells[lo - 1][1]; lo -= 1; grew = True
+        if hi + 1 < len(cells) and used + len(sep) + cells[hi + 1][1] + reserve <= budget:
+            used += len(sep) + cells[hi + 1][1]; hi += 1; grew = True
+        if not grew:
+            break
+    left = f"{YELLOW}«{lo} {RESET}" if lo > 0 else ""
+    right = f"{YELLOW} »{len(cells) - 1 - hi}{RESET}" if hi < len(cells) - 1 else ""
+    result = "  " + left + sep.join(r for r, _ in cells[lo:hi + 1]) + right
+    # Absolute floor for a very narrow terminal (cols ≤ one tab): never exceed
+    # the width — strip color and hard-clip so the frame can't wrap.
+    if len(re.sub(r'\x1b\[[0-9;]*m', '', result)) > cols:
+        plain = re.sub(r'\x1b\[[0-9;]*m', '', "  " + " ".join(t.upper() for t in TABS))
+        return plain[:max(0, cols)]
+    return result
 
 
 def _host_line(ip, data):
@@ -6537,7 +7075,7 @@ def _build_help_overlay(cols, rows):
     lines.append(f"{pad}{BOLD}{RED}  NETWATCH v{VERSION} — COMMAND REFERENCE{RESET}  {DIM}(ESC to close){RESET}")
     lines.append(f"{pad}{BOLD}{RED}{'═'*w}{RESET}")
     lines.append("")
-    lines.append(f"{pad}{BOLD}Tabs:{RESET}  {DIM}type name, 1-9/0, or [ ] / Tab to cycle (reaches mesh & fleet){RESET}")
+    lines.append(f"{pad}{BOLD}Tabs:{RESET}  {DIM}type name, 1-9/0 for the first ten, or [ ] / Tab to cycle (reaches every tab; «N/»N marks hidden tabs on a narrow terminal){RESET}")
     lines.append(f"{pad}  " + "  ".join(f"{GREEN}{t}{RESET}" for t in TABS))
     lines.append("")
     for cat, subtitle, cmds in _HELP_SECTIONS:
@@ -6662,10 +7200,18 @@ def _build_frame(cols=80, max_content=35, active_tab=None):
         lines.extend(_section_osint(max_content))
     elif tab == "proxy":
         lines.extend(_section_proxy(max_content))
+    elif tab == "scan":
+        lines.extend(_section_scan(max_content))
+    elif tab == "cam":
+        lines.extend(_section_cam(max_content))
     elif tab == "mesh":
         lines.extend(_section_mesh(max_content))
     elif tab == "fleet":
         lines.extend(_section_fleet(max_content))
+    elif tab == "hive":
+        lines.extend(_section_hive(max_content))
+    elif tab == "audit":
+        lines.extend(_section_audit(max_content))
     else:
         current_tab = "all"
         lines.append(f"  {DIM}(reset to all view){RESET}")
@@ -6771,6 +7317,115 @@ def _section_fleet(max_lines=30):
     return out[:max_lines] if max_lines and len(out) > max_lines else out
 
 
+def _section_scan(limit=25):
+    """HTTP / scan-probe hits — the noisy recon traffic, split out of the
+    honeypot tab (mirrors the web `scan` tab)."""
+    lines = [f"{BOLD}{MAGENTA}  SCAN / HTTP PROBES{RESET}"]
+    with lock:
+        evs = [e for e in honeypot_events
+               if e.get("service") in ("http", "scan_probe", "api_probe")][-limit:]
+    if not evs:
+        lines.append(f"  {DIM}No HTTP/scan probes yet.{RESET}")
+        return lines
+    for e in reversed(evs):
+        lines.append(f"  {DIM}{e.get('time','')}{RESET} "
+                     f"{_honeypot_color(e.get('service',''))}{e.get('service',''):<12}{RESET} "
+                     f"{e.get('ip',''):<16} {_ansi_strip(str(e.get('summary','')))[:44]}")
+    return lines
+
+
+def _section_cam(limit=18):
+    """Camera Sentry status (Pro) — configured cameras + recent motion/person
+    events. Shown-with-lock on Free like every other Pro tab."""
+    lines = [f"{BOLD}{MAGENTA}  CAMERA SENTRY{RESET}"]
+    if not tier_at_least("pro"):
+        lines.append(f"  {DIM}Pro feature.{RESET} {PRO_UPGRADE_HINT}")
+        return lines
+    mod = _pro_sub("camera")
+    if mod is None:
+        lines.append(f"  {YELLOW}camera module not available (install netwatch-pro[camera]).{RESET}")
+        return lines
+    try:
+        st = mod.status() or {}
+    except Exception as e:
+        lines.append(f"  {RED}camera error: {type(e).__name__}{RESET}")
+        return lines
+    cams = st.get("cameras") or []
+    if not cams:
+        # Say WHY there is nothing to show — a missing OpenCV or an unparsable
+        # cameras.json used to masquerade as "no cameras configured".
+        reason = _ansi_strip(str(st.get("reason") or "no cameras configured"))
+        lines.append(f"  {DIM}{reason[:70]}.{RESET} Add one: "
+                     f"{GREEN}cam add blink <name>{RESET} / {GREEN}cam add rtsp <url>{RESET} / {GREEN}cam add usb <index>{RESET}")
+        if str(st.get("reason") or "").lower().startswith("no cameras"):
+            lines.append(f"  {DIM}Blink cameras need a one-time login: "
+                         f"{RESET}{GREEN}cam blink-auth{RESET}")
+        return lines
+    lines.append(f"  {DIM}running={st.get('running')} · person_detect="
+                 f"{st.get('person_detect')} · viewers={st.get('viewers', 0)}{RESET}")
+    for c in cams[:limit]:
+        name = _ansi_strip(str(c.get('name') or c.get('source') or c.get('id', '?')))[:26]
+        state = f"{GREEN}live{RESET}" if c.get("online") else f"{RED}offline{RESET}"
+        lines.append(f"  ◉ cam{c.get('id')} {name:<26}{state}  "
+                     f"{DIM}{c.get('kind', '')} · frames {c.get('frames', 0)} · "
+                     f"alerts {c.get('alerts', 0)}{RESET}")
+    # camera.py's event log is a deque of preformatted "[ts] camN: msg" lines.
+    for ev in (st.get("events") or [])[-6:]:
+        lines.append(f"  {DIM}{_ansi_strip(str(ev))[:78]}{RESET}")
+    return lines
+
+
+def _section_hive(limit=20):
+    """Apiary / hive shipper status — whether this node is enrolled and shipping."""
+    lines = [f"{BOLD}{MAGENTA}  HIVE / APIARY SHIPPER{RESET}"]
+    try:
+        import netwatch_shipper as _ship
+        cfg = _ship.load_config()
+    except Exception:
+        cfg = {}
+    if not cfg.get("hub_url"):
+        lines.append(f"  {DIM}Not joined a hub.{RESET}")
+        lines.append(f"  Join with a token:  {GREEN}join <nwj_token>{RESET}")
+        lines.append(f"  Community hive:     {GREEN}join community <https://hub>{RESET}")
+        return lines
+    shipping = _apiary_shipper is not None
+    lines.append(f"  hub:  {_ansi_strip(str(cfg.get('hub_url', '')))[:54]}")
+    lines.append(f"  node: {_ansi_strip(str(cfg.get('node_id', '')))[:36]}   "
+                 f"{(GREEN + 'shipping') if shipping else (YELLOW + 'idle')}{RESET}")
+    if cfg.get("community"):
+        lines.append(f"  {DIM}community node — attack vectors only, no payloads{RESET}")
+    if cfg.get("model_fetch"):
+        lines.append(f"  {DIM}cortex edge-model pull: on{RESET}")
+    lines.append(f"  {DIM}stop shipping: {RESET}{GREEN}join off{RESET}")
+    return lines
+
+
+def _section_audit(limit=18):
+    """Keyed audit trail (Enterprise) — recent records + chain verification."""
+    lines = [f"{BOLD}{MAGENTA}  AUDIT TRAIL{RESET}"]
+    if not tier_at_least("enterprise"):
+        lines.append(f"  {DIM}Enterprise feature.{RESET} {PRO_UPGRADE_HINT}")
+        return lines
+    mod = _pro_sub("audit")
+    if mod is None:
+        lines.append(f"  {YELLOW}audit module not available.{RESET}")
+        return lines
+    try:
+        recs = mod.list_records(limit) or []
+        ver = mod.verify() or {}
+    except Exception as e:
+        lines.append(f"  {RED}audit error: {type(e).__name__}{RESET}")
+        return lines
+    ok = ver.get("ok")
+    lines.append(f"  {(GREEN if ok else RED)}chain: {'verified' if ok else 'TAMPERED'}"
+                 f"{RESET} {DIM}({ver.get('records', 0)} records){RESET}")
+    for r in recs[-limit:]:
+        ts = str(r.get('ts') or r.get('time') or '')[:19]
+        lines.append(f"  {DIM}{ts}{RESET} {_ansi_strip(str(r.get('actor', '?')))[:14]:<14} "
+                     f"{CYAN}{_ansi_strip(str(r.get('action', '')))[:28]}{RESET}")
+    return lines
+
+
 def _section_mesh(limit=20):
     lines = []
     if not _HAS_MESH:
@@ -6858,7 +7513,13 @@ def _paint_dashboard():
     buf = "\033[?25l\033[H"
 
     for line in top_lines:
-        buf += line + "\033[K\n"
+        # Clip frame lines to the terminal width too (not just the output
+        # panel): a single over-wide line — long hostname/org, a tunnel URL, a
+        # wide host row on a narrow terminal — would otherwise wrap and shove
+        # the whole fixed layout down, garbling the screen. _clip_visible is
+        # ANSI-aware so colors aren't counted and never bleed.
+        text = str(line).replace('\n', ' ').replace('\r', '')
+        buf += _clip_visible(text, max(1, cols - 1)) + "\033[K\n"
     for _ in range(top_end - len(top_lines)):
         buf += "\033[K\n"
 
@@ -7280,7 +7941,7 @@ from cryptography.fernet import Fernet as _Fernet, InvalidToken as _InvalidToken
 # Persistent Fernet key at ~/.config/netwatch/web.key (dir 0700, file 0600).
 # Key never logged. rotate_key() generates fresh material; load_or_create_key()
 # reads existing or seeds new. Survives restarts so sessions don't die on reboot.
-_KEY_DIR = os.path.join(os.path.expanduser("~"), ".config", "netwatch")
+_KEY_DIR = _config_dir()
 _KEY_PATH = os.path.join(_KEY_DIR, "web.key")
 _TOKEN_PATH = os.path.join(_KEY_DIR, "token")
 
@@ -7395,30 +8056,149 @@ font-family:inherit;font-size:13px;font-weight:700;cursor:pointer;letter-spacing
 button:hover{background:#ff5555}
 .err{color:#ff3333;font-size:11px;margin-top:8px;min-height:16px}
 .div{color:#333;font-size:10px;margin:14px 0 10px;letter-spacing:1px}
+a.sso{display:block;margin-top:6px;padding:10px;border:1px solid #1a1f2b;border-radius:4px;
+color:#33ff99;text-decoration:none;font-size:12px;letter-spacing:1px}
+a.sso:hover{border-color:#33ff99}
+#mfabox{display:none}
 </style></head><body><div class="box"><h1>NETWATCH</h1><div class="sub">Enter access token to continue</div>
+<div id="credbox">
 <input id="tok" type="password" placeholder="Token" autocomplete="off" autofocus>
 <div class="div">— or sign in (Business) —</div>
 <input id="usr" type="text" placeholder="Username" autocomplete="username">
 <input id="pwd" type="password" placeholder="Password" autocomplete="current-password">
-<button onclick="go()">AUTHENTICATE</button><div class="err" id="err"></div></div>
+</div>
+<div id="mfabox">
+<div class="div">— two-factor code —</div>
+<input id="mfa" type="text" inputmode="numeric" placeholder="6-digit code or recovery code" autocomplete="one-time-code">
+</div>
+<button id="go" onclick="go()">AUTHENTICATE</button><div class="err" id="err"></div>
+{% if sso_enabled %}<div class="div">— or —</div>
+<a class="sso" href="/auth/oidc/login">SIGN IN WITH SSO</a>{% endif %}
+</div>
 <script>
-for(const id of ["tok","usr","pwd"])document.getElementById(id).addEventListener("keydown",e=>{if(e.key==="Enter")go()});
+let challenge=null;
+for(const id of ["tok","usr","pwd","mfa"])document.getElementById(id).addEventListener("keydown",e=>{if(e.key==="Enter")go()});
+async function post(body){
+return fetch("/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});}
 async function go(){
+const err=document.getElementById("err");
+let body=null;
+if(challenge){
+const c=document.getElementById("mfa").value.trim();
+if(!c)return;
+body={challenge:challenge,code:c};
+}else{
 const t=document.getElementById("tok").value.trim();
 const u=document.getElementById("usr").value.trim();
 const p=document.getElementById("pwd").value;
-let body=null;
 if(t)body={token:t};else if(u&&p)body={user:u,pass:p};else return;
-try{const r=await fetch("/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-if(r.ok){location.reload()}else{document.getElementById("err").textContent="Invalid credentials"}}
-catch(e){document.getElementById("err").textContent="Connection error"}}
+}
+try{const r=await post(body);
+let data={};try{data=await r.json()}catch(e){}
+if(r.status===429){err.textContent=data.retry_after?("Locked — retry in "+data.retry_after+"s"):"Too many attempts";return}
+if(r.ok&&data.mfa_required){
+challenge=data.challenge;
+document.getElementById("credbox").style.display="none";
+document.getElementById("mfabox").style.display="block";
+document.getElementById("mfa").focus();
+err.textContent="";return}
+if(r.ok){location.reload();return}
+if(challenge){err.textContent="Invalid code"}else{err.textContent="Invalid credentials"}}
+catch(e){err.textContent="Connection error"}}
 </script></body></html>"""
+
+
+def _render_login():
+    """The login page, with the SSO button only when SSO is actually set up."""
+    sso_enabled = False
+    mod = _sso_mod()
+    if mod is not None:
+        try:
+            sso_enabled = bool(mod.configured())
+        except Exception:
+            sso_enabled = False
+    return render_template_string(_LOGIN_HTML, sso_enabled=sso_enabled)
+
+# ─── Enterprise auth seams (MFA, lockout, API keys, session epochs) ──────
+# All Enterprise-gated: below that tier every helper here is a no-op and the
+# auth path behaves exactly as it did before. Substance lives in
+# netwatch_pro.enterprise_auth / netwatch_pro.sso_oidc.
+_TOKEN_COOKIE_TTL = int(os.environ.get("NETWATCH_TOKEN_TTL", 12 * 3600))
+_SESSION_IDLE = int(os.environ.get("NETWATCH_SESSION_IDLE", 30 * 60))
+_MFA_CHALLENGE_TTL = 300
+_API_KEY_HEADER = "X-NetWatch-Key"
+_TOKEN_ACCOUNT = "token"          # pseudo-account the fixed token locks out under
+
+
+def _ent_auth():
+    """netwatch_pro.enterprise_auth, or None below the Enterprise tier."""
+    if not tier_at_least("enterprise"):
+        return None
+    return _pro_sub("enterprise_auth")
+
+
+def _sso_mod():
+    if not tier_at_least("enterprise"):
+        return None
+    return _pro_sub("sso_oidc")
+
+
+def _client_ip():
+    """The client's real address for rate-limiting and audit rows.
+
+    `remote_addr` stays the ONLY input to the network allowlist: requests
+    through the cloudflared tunnel arrive on loopback, and trusting a header
+    there would let anyone forge an allowlisted source. XFF is consulted only
+    when the immediate peer is loopback AND the operator opted in with
+    NETWATCH_TRUST_PROXY=1 — then the rightmost entry (the hop our own proxy
+    saw) is used, never the client-controlled leftmost one."""
+    addr = request.remote_addr or ""
+    if os.environ.get("NETWATCH_TRUST_PROXY", "") not in ("1", "true", "yes"):
+        return addr
+    try:
+        if not ipaddress.ip_address(addr).is_loopback:
+            return addr
+    except ValueError:
+        return addr
+    fwd = request.headers.get("X-Forwarded-For", "")
+    hops = [h.strip() for h in fwd.split(",") if h.strip()]
+    if not hops:
+        return addr
+    try:
+        ipaddress.ip_address(hops[-1])
+    except ValueError:
+        return addr
+    return hops[-1]
+
+
+def _api_key_role():
+    """Role granted by an X-NetWatch-Key header, or None. Cached per request:
+    verification stamps last_used, and the before_request hook and the RBAC
+    check would otherwise both write."""
+    if "_nw_api_role" in g.__dict__:
+        return g._nw_api_role
+    role = None
+    raw = request.headers.get(_API_KEY_HEADER, "")
+    ea = _ent_auth()
+    if raw and ea is not None:
+        try:
+            info = ea.verify_api_key(raw)
+        except Exception:
+            info = None
+        role = (info or {}).get("role")
+        g._nw_api_key_name = (info or {}).get("name", "")
+    g._nw_api_role = role
+    return role
+
 
 def _verify_web_cookie(cookie_val):
     if not cookie_val:
         return False
     try:
-        decrypted = _fernet.decrypt(cookie_val.encode()).decode()
+        # TTL-bounded: the admin token cookie used to be valid forever, so a
+        # cookie lifted off a machine once stayed good until the token changed.
+        decrypted = _fernet.decrypt(cookie_val.encode(),
+                                    ttl=_TOKEN_COOKIE_TTL).decode()
         return _hmac.compare_digest(decrypted, WEB_TOKEN)
     except Exception:
         return False
@@ -7432,10 +8212,28 @@ def _verify_web_cookie(cookie_val):
 _SESSION_TTL = 12 * 3600
 
 
-def _mint_session(user, role):
+def _mint_session(user, role, epoch=None, src="local"):
+    """Session cookie. Carries the user's session *epoch* so "sign out other
+    devices" can invalidate every cookie already issued to them, a last-seen
+    stamp for the idle timeout (refreshed on each request), and the auth
+    *source*: "local" users are revalidated against the RBAC store every
+    request, "sso" users are not (they live in the IdP, not web_users.json —
+    revalidating them there would reject every SSO session)."""
+    if epoch is None:
+        ea = _ent_auth()
+        try:
+            epoch = ea.session_epoch(user) if ea is not None else 0
+        except Exception:
+            epoch = 0
     blob = json.dumps({"u": str(user)[:32], "r": str(role),
-                       "exp": time.time() + _SESSION_TTL})
+                       "e": int(epoch or 0), "s": time.time(),
+                       "src": str(src), "exp": time.time() + _SESSION_TTL})
     return _fernet.encrypt(blob.encode()).decode()
+
+
+def _set_session_cookie(resp, value):
+    resp.set_cookie("nw_sess", value, httponly=True, samesite="Lax",
+                    secure=request.is_secure, path="/")
 
 
 def _role_from_cookies(tok_val, sess_val):
@@ -7455,9 +8253,29 @@ def _role_from_cookies(tok_val, sess_val):
         return None
     if d.get("r") not in ("admin", "operator", "viewer"):
         return None
-    # Re-validate against the live user store every request: the cookie only
-    # proves authentication — the store is the authority on the current role, so
-    # a removed or demoted user loses access immediately, not at cookie expiry.
+    ea = _ent_auth()
+    if ea is not None:
+        # Idle timeout: an unattended browser stops being a live credential.
+        seen = float(d.get("s", 0) or 0)
+        if seen and time.time() - seen > _SESSION_IDLE:
+            return None
+        # Session epoch: "sign out other devices" (and disabling a user's MFA)
+        # bumps it, which retires every cookie already handed out.
+        try:
+            if int(d.get("e", 0) or 0) != ea.session_epoch(d.get("u", "")):
+                return None
+        except Exception:
+            return None                  # can't check → fail closed
+    # SSO users authenticate at the IdP and are NOT in the local RBAC store, so
+    # revalidating them there would reject every SSO session on its next
+    # request. Their live controls are the session TTL + idle timeout (above)
+    # and the epoch bump (`mfa signout <user>`), all already enforced. New
+    # access is still governed by the IdP at each fresh login.
+    if d.get("src") == "sso":
+        return d.get("r")
+    # Local RBAC users: re-validate against the live store every request — the
+    # cookie only proves authentication, the store is the authority on the
+    # current role, so a removed or demoted user loses access immediately.
     wa = _pro_sub("webauth")
     if wa is None:
         return None                      # can't validate → fail closed
@@ -7469,9 +8287,45 @@ def _role_from_cookies(tok_val, sess_val):
 
 def _session_role(req):
     """Effective role for a request: 'admin' via the token cookie (unchanged
-    behaviour), else the nw_sess role when valid + Business tier, else None."""
-    return _role_from_cookies(req.cookies.get("nw_token", ""),
+    behaviour), else the nw_sess role when valid + Business tier, else the
+    scope of a presented API key (Enterprise), else None."""
+    role = _role_from_cookies(req.cookies.get("nw_token", ""),
                               req.cookies.get("nw_sess", ""))
+    if role is not None:
+        return role
+    try:
+        return _api_key_role()
+    except RuntimeError:
+        return None            # outside a request context (SSE generator)
+
+
+def _session_user(req):
+    """Username behind the current session cookie, if any — for audit rows and
+    the rolling-session refresh. The fixed token has no user."""
+    sess_val = req.cookies.get("nw_sess", "")
+    if not sess_val:
+        return None
+    try:
+        d = json.loads(_fernet.decrypt(sess_val.encode(), ttl=_SESSION_TTL).decode())
+        return str(d.get("u", "")) or None
+    except Exception:
+        return None
+
+
+def _session_src(req):
+    """Auth source ("local"/"sso") behind the session cookie, "local" default."""
+    sess_val = req.cookies.get("nw_sess", "")
+    if not sess_val:
+        return "local"
+    try:
+        d = json.loads(_fernet.decrypt(sess_val.encode(), ttl=_SESSION_TTL).decode())
+        return "sso" if d.get("src") == "sso" else "local"
+    except Exception:
+        return "local"
+
+
+# Routes that ARE the login flow — they can't require an existing session.
+_AUTH_FLOW_PATHS = ("/auth/oidc/login", "/auth/oidc/callback")
 
 
 @web_app.before_request
@@ -7481,9 +8335,27 @@ def _web_auth():
         return "Forbidden", 403
     if request.path == "/auth" and request.method == "POST":
         return None
+    if request.path in _AUTH_FLOW_PATHS:
+        return None
+    role = None
     if WEB_TOKEN:
-        if _session_role(request) is None:
-            return _LOGIN_HTML, 401
+        role = _session_role(request)
+        if role is None:
+            return _render_login(), 401
+        if request.cookies.get("nw_sess") and _ent_auth() is not None:
+            user = _session_user(request)
+            if user:
+                # Preserve the auth source, or the re-minted cookie would drop
+                # the "sso" marker and bounce the user on the following request.
+                g._nw_refresh_sess = (user, role, _session_src(request))
+    else:
+        role = _session_role(request)
+    # A request authenticated ONLY by an API key carries no cookie, so it is
+    # not CSRF-able by definition — a browser can't be tricked into adding the
+    # header cross-origin (it would be preflighted, and there's no ambient
+    # credential to abuse). Cookie-bearing requests keep the Origin rule.
+    if request.method == "POST" and not request.cookies and _api_key_role():
+        return None
     if request.method == "POST":
         origin = request.headers.get("Origin", "")
         if not origin:
@@ -7499,9 +8371,9 @@ def _web_auth():
                               or _origin_lc.startswith("http://127.0.0.1:"))
         if _cf_origin and origin == f"https://{_cf_origin}":
             pass
-        elif origin.startswith("https://") and origin.endswith(".trycloudflare.com") and _session_role(request) is not None:
+        elif origin.startswith("https://") and origin.endswith(".trycloudflare.com") and role is not None:
             pass
-        elif _loopback_any_port and _session_role(request) is not None:
+        elif _loopback_any_port and role is not None:
             pass
         elif origin not in _allowed_origins:
             return "CSRF rejected", 403
@@ -7515,15 +8387,32 @@ def _security_headers(resp):
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    # The dashboard is a self-contained page: inline <style>/<script> are ours,
+    # images include data: URIs and the MJPEG camera feed, and nothing is ever
+    # fetched from a third-party origin — so everything else can be denied.
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+        "connect-src 'self'; font-src 'self' data:; object-src 'none'; "
+        "base-uri 'none'; form-action 'self'; frame-ancestors 'self'")
     if request.is_secure:
         resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    # Rolling session: refresh the last-seen stamp so an ACTIVE operator isn't
+    # logged out mid-shift by the idle timeout, while an idle one still is.
+    refresh = g.__dict__.get("_nw_refresh_sess")
+    if refresh:
+        try:
+            user, role, src = refresh
+            _set_session_cookie(resp, _mint_session(user, role, src=src))
+        except Exception:
+            pass
     return resp
 
 _auth_attempts = {}
 
 @web_app.route("/auth", methods=["POST"])
 def web_auth():
-    ip = request.remote_addr
+    ip = _client_ip()
     now = time.time()
     if len(_auth_attempts) > 1000:
         stale = [k for k, (_, ts) in _auth_attempts.items() if now - ts > 300]
@@ -7540,14 +8429,39 @@ def web_auth():
     else:
         _auth_attempts[ip] = (1, now)
     body = request.json if isinstance(request.json, dict) else {}
+    ea = _ent_auth()
+    cip = _client_ip()
+
+    # Step 2 of an MFA login: the challenge proves step 1 (password) passed.
+    challenge = str(body.get("challenge", ""))
+    if challenge:
+        return _auth_finish_mfa(challenge, str(body.get("code", "")), ea, cip)
+
     token = body.get("token", "")
-    if token and _hmac.compare_digest(token, WEB_TOKEN):
-        resp = jsonify({"ok": True})
-        encrypted = _fernet.encrypt(WEB_TOKEN.encode()).decode()
-        resp.set_cookie("nw_token", encrypted, httponly=True, samesite="Lax", secure=request.is_secure, path="/")
-        return resp
+    if token:
+        locked = _locked_response(ea, _TOKEN_ACCOUNT, cip)
+        if locked is not None:
+            return locked
+        if _hmac.compare_digest(token, WEB_TOKEN):
+            _record_login_success(ea, _TOKEN_ACCOUNT)
+            audit_emit("web.login.ok", {"user": "token", "role": "admin",
+                                        "ip": cip, "method": "token"})
+            resp = jsonify({"ok": True})
+            encrypted = _fernet.encrypt(WEB_TOKEN.encode()).decode()
+            resp.set_cookie("nw_token", encrypted, httponly=True, samesite="Lax", secure=request.is_secure, path="/")
+            return resp
+        # Per-ACCOUNT counting on top of the per-IP throttle: a distributed
+        # guessing attack changes IPs freely, but not the account it targets.
+        _record_login_failure(ea, _TOKEN_ACCOUNT)
+        audit_emit("web.login.fail", {"user": "token", "ip": cip,
+                                      "method": "token"})
+        return "Unauthorized", 401
+
     user, pw = str(body.get("user", "")), str(body.get("pass", ""))
     if user and pw and tier_at_least("team"):
+        locked = _locked_response(ea, user, cip)
+        if locked is not None:
+            return locked
         wa = _pro_sub("webauth")
         if wa is not None:
             try:
@@ -7555,14 +8469,198 @@ def web_auth():
             except Exception:
                 role = None
             if role:
+                if ea is not None and _mfa_required(ea, user):
+                    # Password alone is NOT a session — hand back a short-lived
+                    # challenge and wait for the second factor.
+                    audit_emit("web.mfa.challenge", {"user": user, "ip": cip})
+                    return jsonify({"ok": False, "mfa_required": True,
+                                    "challenge": _mint_mfa_challenge(user, role)})
+                _record_login_success(ea, user)
+                audit_emit("web.login.ok", {"user": user, "role": role,
+                                            "ip": cip, "method": "password"})
                 resp = jsonify({"ok": True, "role": role})
-                resp.set_cookie("nw_sess", _mint_session(user, role),
-                                httponly=True, samesite="Lax",
-                                secure=request.is_secure, path="/")
-                audit_emit("web.login", {"user": user, "role": role,
-                                         "ip": request.remote_addr})
+                _set_session_cookie(resp, _mint_session(user, role))
                 return resp
+            _record_login_failure(ea, user)
+        audit_emit("web.login.fail", {"user": user, "ip": cip,
+                                      "method": "password"})
     return "Unauthorized", 401
+
+
+# ─── login helpers (Enterprise: lockout + MFA) ───────────────────────────────
+
+def _locked_response(ea, account, cip):
+    """429 with Retry-After when the account is locked out, else None."""
+    if ea is None:
+        return None
+    try:
+        state = ea.lockout_state(account)
+    except Exception:
+        return None
+    if not state.get("locked"):
+        return None
+    audit_emit("web.login.locked", {"user": account, "ip": cip})
+    retry = int(state.get("retry_after", 60) or 60)
+    resp = jsonify({"error": "account temporarily locked",
+                    "retry_after": retry})
+    resp.status_code = 429
+    resp.headers["Retry-After"] = str(retry)
+    return resp
+
+
+def _record_login_failure(ea, account):
+    if ea is None:
+        return
+    try:
+        ea.record_failure(account)
+    except Exception:
+        pass          # the lockout ledger must never break the login path
+
+
+def _record_login_success(ea, account):
+    if ea is None:
+        return
+    try:
+        ea.record_success(account)
+    except Exception:
+        pass
+
+
+def _mfa_required(ea, user):
+    """Fail CLOSED — if the store can't be read, demand the second factor."""
+    try:
+        return bool(ea.mfa_required(user))
+    except Exception:
+        return True
+
+
+def _mint_mfa_challenge(user, role):
+    return _fernet.encrypt(json.dumps(
+        {"p": "mfa", "u": str(user)[:32], "r": str(role),
+         "iat": time.time()}).encode()).decode()
+
+
+def _auth_finish_mfa(challenge, code, ea, cip):
+    """Second leg of an MFA login: verify the TOTP (or a recovery code) and
+    only then mint the session."""
+    if ea is None:
+        return "Unauthorized", 401           # tier lapsed mid-login
+    try:
+        d = json.loads(_fernet.decrypt(challenge.encode(),
+                                       ttl=_MFA_CHALLENGE_TTL).decode())
+    except Exception:
+        return "Unauthorized", 401
+    if not isinstance(d, dict) or d.get("p") != "mfa":
+        return "Unauthorized", 401
+    user = str(d.get("u", ""))
+    locked = _locked_response(ea, user, cip)
+    if locked is not None:
+        return locked
+    # Re-read the role from the live store: a demotion between the two legs
+    # must not be papered over by the role captured in the challenge.
+    wa = _pro_sub("webauth")
+    role = None
+    if wa is not None:
+        try:
+            role = wa.current_role(user)
+        except Exception:
+            role = None
+    if role is None:
+        audit_emit("web.mfa.fail", {"user": user, "ip": cip, "reason": "no user"})
+        return "Unauthorized", 401
+    try:
+        ok = ea.verify_totp(user, code)
+    except Exception:
+        ok = False
+    if not ok:
+        _record_login_failure(ea, user)
+        audit_emit("web.mfa.fail", {"user": user, "ip": cip})
+        return "Unauthorized", 401
+    _record_login_success(ea, user)
+    audit_emit("web.mfa.ok", {"user": user, "ip": cip})
+    audit_emit("web.login.ok", {"user": user, "role": role, "ip": cip,
+                                "method": "password+mfa"})
+    resp = jsonify({"ok": True, "role": role})
+    _set_session_cookie(resp, _mint_session(user, role))
+    return resp
+
+
+@web_app.route("/logout", methods=["GET", "POST"])
+def web_logout():
+    """End the session on this device. GET is allowed on purpose: the worst a
+    forced logout can do is inconvenience, and an operator typing /logout in
+    the URL bar must not be left holding a live cookie."""
+    user = _session_user(request) or "token"
+    audit_emit("web.logout", {"user": user, "ip": _client_ip()})
+    resp = redirect("/") if request.method == "GET" else jsonify({"ok": True})
+    resp.delete_cookie("nw_token", path="/")
+    resp.delete_cookie("nw_sess", path="/")
+    g.__dict__.pop("_nw_refresh_sess", None)
+    return resp
+
+
+# ─── SSO / OIDC (Enterprise) ────────────────────────────────────────────────
+_OIDC_COOKIE = "nw_oidc"
+
+
+@web_app.route("/auth/oidc/login")
+def web_oidc_login():
+    mod = _sso_mod()
+    if mod is None:
+        return "SSO is an Enterprise feature", 402
+    try:
+        out = mod.begin_login()
+    except Exception as e:
+        audit_emit("web.sso.error", {"stage": "begin", "error": type(e).__name__})
+        return Response(f"SSO unavailable: {type(e).__name__}", status=503,
+                        mimetype="text/plain")
+    pending = json.dumps({k: out[k] for k in
+                          ("state", "nonce", "verifier", "issued_at")})
+    resp = redirect(out["url"])
+    # Scoped to the callback path and short-lived: this cookie is the only
+    # thing binding the IdP's answer to the browser that started the login.
+    resp.set_cookie(_OIDC_COOKIE, _fernet.encrypt(pending.encode()).decode(),
+                    httponly=True, samesite="Lax", secure=request.is_secure,
+                    path="/auth/oidc", max_age=600)
+    return resp
+
+
+@web_app.route("/auth/oidc/callback")
+def web_oidc_callback():
+    mod = _sso_mod()
+    if mod is None:
+        return "SSO is an Enterprise feature", 402
+    cip = _client_ip()
+    if request.args.get("error"):
+        audit_emit("web.sso.fail", {"ip": cip,
+                                    "error": str(request.args.get("error"))[:64]})
+        return "SSO login refused by the identity provider", 401
+    try:
+        pending = json.loads(_fernet.decrypt(
+            request.cookies.get(_OIDC_COOKIE, "").encode(), ttl=600).decode())
+    except Exception:
+        audit_emit("web.sso.fail", {"ip": cip, "reason": "no pending login"})
+        return "No login in progress — start again", 401
+    try:
+        result = mod.complete_login(request.args.get("code", ""), pending,
+                                    request.args.get("state", ""))
+    except Exception as e:
+        # Message text comes from our own module (never the IdP body) and names
+        # which check failed — state mismatch, bad signature, unmapped role.
+        audit_emit("web.sso.fail", {"ip": cip, "reason": str(e)[:120]})
+        # The reason names which check failed, but parts of it (an email
+        # domain, a group name) originate at the IdP — render it as plain
+        # text so nothing in there can be interpreted as markup.
+        return Response(f"SSO login refused: {str(e)[:200]}", status=401,
+                        mimetype="text/plain")
+    audit_emit("web.login.ok", {"user": result["user"], "role": result["role"],
+                                "ip": cip, "method": "sso",
+                                "email": result.get("email", "")})
+    resp = redirect("/")
+    _set_session_cookie(resp, _mint_session(result["user"], result["role"],
+                                            src="sso"))
+    resp.delete_cookie(_OIDC_COOKIE, path="/auth/oidc")
+    return resp
 
 def _state_snapshot():
     with lock:
@@ -7584,7 +8682,7 @@ def _state_snapshot():
         dns_list = [{"time": e["time"], "ip": e["ip"], "domain": e["domain"]}
                     for e in dns_queries[-50:]]
         hp_list = [{"time": e["time"], "service": e["service"], "ip": e["ip"],
-                     "summary": e["summary"]} for e in honeypot_events[-50:]]
+                     "summary": e["summary"]} for e in honeypot_events[-200:]]
         nm_list = [{"time": r["time"], "line": r["line"]} for r in nmap_results[-30:]]
         arp_list = [{"ip": ip, "mac": info["mac"], "state": info["state"]}
                     for ip, info in sorted(arp_table.items())]
@@ -8213,7 +9311,7 @@ function renderHP(limit){
   // HTTP events live in the Scan tab (they're high-volume scanner noise that drowns out
   // credential/telnet/ftp/rtsp signal). Mirrors the TUI's _section_honeypot(show_http=False) default.
   const h=(D.honeypot||[]).filter(e=>e.service!=="http").slice(-(limit||50)).reverse();
-  if(!h.length)return _empty("No honeypot hits yet","Honeypots are listening on :21 / :23 / :80 / :554 — waiting for attackers.");
+  if(!h.length)return _empty("No honeypot hits yet","Console mode shows a remote node's attacks; sensor mode listens locally on :2323 / :2121 / :8080 / :8554 (map 23/21/80/554 via NAT).");
   let s=`<table><tr><th style="width:70px">Time</th><th style="width:100px">Service</th><th style="width:130px">IP</th><th>Summary</th></tr>`;
   h.forEach(e=>{s+=`<tr><td style="color:var(--dim)">${esc(e.time)}</td><td class="${hpClass(e.service)}">${esc(e.service)}</td><td class="ip"><span class="ip-click" data-ip="${esc(e.ip)}">${esc(e.ip)}</span></td><td>${esc(e.summary)}</td></tr>`});
   return s+"</table>";
@@ -9251,7 +10349,7 @@ async function load(){
   if(!mounted){
     mounted=true;
     const g=document.getElementById('grid');
-    if(!st.cameras.length){g.innerHTML='<div class="empty">No cameras configured — add sources to ~/.config/netwatch/cameras.json and restart</div>';}
+    if(!st.cameras.length){g.innerHTML=`<div class="empty">${esc(st.reason||'No cameras configured')} &mdash; add one from the console: <code>cam add blink &lt;name&gt;</code>, <code>cam add rtsp &lt;url&gt;</code> or <code>cam add usb &lt;index&gt;</code></div>`;mounted=false;}
     else g.innerHTML=st.cameras.map(c=>
       `<div class="cam"><img src="/api/cam/stream/${esc(c.id)}" alt="camera ${esc(c.id)}">`+
       `<div class="bar"><span>CAM ${esc(c.id)} &middot; ${esc(c.source)}</span>`+
@@ -9293,14 +10391,21 @@ def web_cam_page():
 def web_cam_status():
     mod = _pro_sub("camera")
     if mod is None:
-        return jsonify({"error": "camera sentry unavailable"}), 404
+        return jsonify({"running": False, "cameras": [], "events": [],
+                        "configured": 0,
+                        "reason": "camera add-on not installed — "
+                                  'pip install "netwatch-pro[camera]"'}), 200
     try:
         return jsonify(mod.status())
     except Exception as e:
         # Surface only the pro-upsell message; never leak internal error text.
         if type(e).__name__ == "ProFeatureRequired":
             return jsonify({"error": str(e)}), 403
-        return jsonify({"error": "camera sentry unavailable"}), 404
+        # The panel used to get a bare 404 here and told everyone "no cameras
+        # configured" — say which failure it actually was, type only.
+        return jsonify({"running": False, "cameras": [], "events": [],
+                        "configured": 0,
+                        "reason": f"camera sentry error: {type(e).__name__}"}), 200
 
 
 @web_app.route("/api/cam/stream/<int:cam_id>")
@@ -9941,6 +11046,23 @@ def save_logs():
         json.dump(stats, f, indent=2, default=str)
     print(f"\n{GREEN}[*] Saved to {traffic_file}{RESET}")
 
+def _cli_via_console(handler, argv):
+    """Run a TUI verb from the shell by pointing add_console at stdout, so the
+    console and the CLI can never drift apart in what they support."""
+    import builtins
+    module = sys.modules[__name__]
+    original = module.add_console
+    module.add_console = lambda line="", *a, **k: builtins.print(line)
+    try:
+        handler(list(argv))
+    except Exception as e:
+        builtins.print(f"{type(e).__name__}: {e}")
+        return 1
+    finally:
+        module.add_console = original
+    return 0
+
+
 def _cli_subcommand(argv):
     """Handle `netwatch <cmd>` license/version subcommands before argv[0] is
     treated as an interface name. License ops delegate to the paid add-on when
@@ -10022,6 +11144,14 @@ def _cli_subcommand(argv):
             elif llm.get("summary"):
                 print(f"\nLLM summary: {llm['summary']}")
         return 0
+    if cmd in ("mfa", "apikey", "apikeys", "sso"):
+        # Enterprise auth admin from the shell — same verbs as the TUI.
+        return _cli_via_console({"mfa": _disp_mfa, "apikey": _disp_apikey,
+                                 "apikeys": _disp_apikey, "sso": _disp_sso}[cmd],
+                                argv)
+    if cmd == "cam" and len(argv) > 1:
+        # cam add/remove/list from the shell — same verb the TUI runs.
+        return _cli_via_console(_disp_cam, argv)
     if cmd == "cam":
         # Camera Sentry status from the shell (Pro). Read-only; live view is /cam.
         if not tier_at_least("pro"):
@@ -10269,11 +11399,12 @@ def _cli_subcommand(argv):
 
 _CLI_SUBCOMMANDS = ("activate", "register", "license", "status", "collector",
                     "ask", "cam", "join", "users", "report", "audit", "compliance",
+                    "mfa", "apikey", "apikeys", "sso",
                     "--version", "-V", "version")
 
 
 def main():
-    global IFACE
+    global IFACE, _APP_RUNNING
     _argv = sys.argv[1:]
     if _argv and _argv[0] in _CLI_SUBCOMMANDS:
         return _cli_subcommand(_argv)
@@ -10370,30 +11501,42 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    # Start all modules
-    threading.Thread(target=telnet_honeypot, args=(TELNET_PORT,), daemon=True).start()
-    threading.Thread(target=rtsp_honeypot, args=(RTSP_PORT,), daemon=True).start()
-    threading.Thread(target=ftp_honeypot, args=(FTP_PORT,), daemon=True).start()
-    if HAS_RAW_NET:
-        threading.Thread(target=traffic_monitor, daemon=True).start()
-        threading.Thread(target=tshark_monitor, daemon=True).start()
-        threading.Thread(target=arp_monitor, daemon=True).start()
+    # Local honeypot + passive monitors — only in sensor/both mode. In pure
+    # console mode this box is a viewer for a remote node, so nothing binds and
+    # the loopback noise (CrowdSec polling :8080) disappears entirely.
+    if RUN_LOCAL_HONEYPOT:
+        threading.Thread(target=telnet_honeypot, args=(TELNET_PORT,), daemon=True).start()
+        threading.Thread(target=rtsp_honeypot, args=(RTSP_PORT,), daemon=True).start()
+        threading.Thread(target=ftp_honeypot, args=(FTP_PORT,), daemon=True).start()
+        if HAS_RAW_NET:
+            threading.Thread(target=traffic_monitor, daemon=True).start()
+            threading.Thread(target=tshark_monitor, daemon=True).start()
+            threading.Thread(target=arp_monitor, daemon=True).start()
     threading.Thread(target=draw_dashboard, daemon=True).start()
 
-    # Start packet capture (skipped without raw-net privileges)
-    if HAS_RAW_NET:
+    # Console ingest — feed the dashboard from the remote node's event log so
+    # honeypot / attackers / osint / all show real attacks (fixes "2 attacks").
+    if RUN_CONSOLE_INGEST:
+        _console_refresh()   # rehydrate immediately so a restart isn't empty
+        threading.Thread(target=_console_ingest_loop, daemon=True).start()
+        print(f"  {GREEN}Console ingest  : {RUN_MODE} mode — feeding from {CONSOLE_SRC}{RESET}")
+
+    # Start packet capture (skipped without raw-net privileges or in console mode)
+    if RUN_LOCAL_HONEYPOT and HAS_RAW_NET:
         start_tcpdump()
 
-    # Auto-scan local subnet on startup
-    time.sleep(5)
-    nmap_scan_thread("10.0.1.0/24", "-sn -T4")
+    # Auto-scan local subnet on startup (local awareness — sensor/both only)
+    if RUN_LOCAL_HONEYPOT:
+        time.sleep(5)
+        nmap_scan_thread("10.0.1.0/24", "-sn -T4")
 
     # Flask honeypot in background thread (so main thread can do console)
-    flask_thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, use_reloader=False),
-        daemon=True
-    )
-    flask_thread.start()
+    if RUN_LOCAL_HONEYPOT:
+        flask_thread = threading.Thread(
+            target=lambda: app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, use_reloader=False),
+            daemon=True
+        )
+        flask_thread.start()
 
     # Web dashboard on :9090
     web_thread = threading.Thread(target=start_web_dashboard, daemon=True)
@@ -10406,7 +11549,9 @@ def main():
     # Time-series sampling for charts
     threading.Thread(target=_sample_timeseries, daemon=True).start()
     _maybe_start_pro_scheduler()
+    _APP_RUNNING = True
     _maybe_start_camera_sentry()
+    _maybe_autostart_shipper()
 
     # Meshtastic mesh radio
     if _HAS_MESH:

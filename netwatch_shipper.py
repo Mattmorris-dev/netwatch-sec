@@ -35,7 +35,10 @@ from urllib.parse import urlparse
 
 log = logging.getLogger("netwatch.shipper")
 
-CONFIG_DIR = Path(os.path.expanduser("~/.config/netwatch"))
+# Same directory the rest of NetWatch uses — NETWATCH_CONFIG_DIR keeps sudo and
+# non-sudo runs on ONE store (see netwatch._config_dir / netwatch_pro._paths).
+CONFIG_DIR = Path(os.path.expanduser(
+    os.environ.get("NETWATCH_CONFIG_DIR", "").strip() or "~/.config/netwatch"))
 CONFIG_PATH = CONFIG_DIR / "apiary_node.json"
 STATE_PATH = CONFIG_DIR / "apiary_shipper_state.json"
 SPOOL_DIR = CONFIG_DIR / "apiary_spool"

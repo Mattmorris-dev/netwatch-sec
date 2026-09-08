@@ -276,11 +276,11 @@ class TestConsoleWorkflow:
         reset_state()
 
     def test_typing_scan_enters_console(self):
-        """User types 'scan 1.2.3.4' — this is NOT a tab name.
-        The main loop would auto-enter console mode."""
+        """User types 'scan 1.2.3.4' — with an argument this is a command,
+        not a bare tab switch, so it runs in console mode."""
         cmd = "scan 1.2.3.4"
         action = cmd.strip().lower().split()[0]
-        assert action not in netwatch.TABS
+        assert netwatch._tab_for_command(cmd) is None
         assert action not in ("c", "console", "help")
 
     def test_typing_geo_enters_console(self):

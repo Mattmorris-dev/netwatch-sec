@@ -2,6 +2,107 @@
 
 All notable changes to NetWatch are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.6.1 - 2026-09-08
+
+### Added
+- **Console mode — the droplet is the honeypot, this box is the screen.**
+  `NETWATCH_MODE=console` (or `--console`) stops the local honeypot and sniffer
+  binding and ingests a remote sensor's event log
+  (`NETWATCH_CONSOLE_SRC`, default `~/.cache/cortex/droplet_events.json`) into
+  the honeypot/attackers/osint/all tabs, so a box behind home NAT shows the
+  *real* attacks its internet-facing sensor is taking instead of its own
+  loopback noise. `--sensor` keeps the old behaviour (the default for a sensor
+  node) and `--local-honeypot` runs both, tagging local hits `origin: "local"`
+  so ingest never clobbers them. The in-memory honeypot ring grew 100 → 1000
+  and rehydrates from disk on restart.
+- **Every feature has a TUI tab.** `scan`, `cam`, `hive` and `audit` joined the
+  tab registry (16 total, matching the web dashboard's set), reachable by name,
+  `[`/`]` or Tab. The tab bar no longer silently clips on a narrow terminal: it
+  windows around the active tab and shows `«N` / `»N` for what's hidden.
+- **Blink cameras (Pro).** Blink is cloud-only — no RTSP, no ONVIF — so
+  `netwatch_pro/camera_blink.py` bridges it: a `blink:<camera name>` source
+  polls Blink's cloud for the latest still and its motion state, then runs the
+  *same* motion + HOG person pipeline the RTSP/USB path uses. Amazon/Blink
+  login is a one-time interactive step in the operator's own terminal
+  (`python3 -m netwatch_pro.camera_blink auth`); the password is never stored
+  and only a 0600 token cache is kept. Opt-in extra:
+  `pip install "netwatch-pro[blink]"`.
+- **`cam add` / `cam remove` / `cam list`.** Cameras no longer require
+  hand-editing JSON and a restart: the `cam` verb writes
+  `~/.config/netwatch/cameras.json` (0600, atomic, symlink-refusing) and
+  restarts the sentry in place. `cam blink-auth` prints the one-time linking
+  command.
+
+- **Enterprise authentication.** The dashboard grows the controls an auditor
+  asks for, all Enterprise-gated and all no-ops below that tier:
+  **TOTP MFA** with single-use recovery codes (`mfa enroll|confirm|codes|
+  disable|unlock|signout`), a two-leg login where a password alone is never a
+  session; **per-account lockout** with progressive backoff on top of the
+  existing per-IP throttle; **session epochs** so "sign out my other devices"
+  retires every cookie a user holds, plus an idle timeout and a TTL on the
+  admin token cookie (it never expired before); **scoped API keys**
+  (`apikey new|revoke`, `X-NetWatch-Key` header) that are minted once, stored
+  only as a salted hash, capped at the operator role and revocable; and a
+  `/logout` route. Every login, failure, lockout, MFA step and logout lands in
+  the tamper-evident audit trail.
+- **SSO via OpenID Connect (Enterprise).** `sso` / `/auth/oidc/*` put NetWatch
+  behind Google Workspace, Okta, Azure AD or Keycloak: Authorization Code +
+  PKCE, RS256 `id_token` verified against the IdP's JWKS with an `alg`
+  allowlist (`none`/HS* refused), `iss`/`aud`/`exp`/`iat`/`nonce` all checked,
+  and roles mapped from an IdP claim through an operator-controlled map —
+  an unmapped account is denied, never defaulted to viewer. No new dependency:
+  it verifies with `cryptography`, which NetWatch already ships.
+- **Content-Security-Policy** on every dashboard response, and opt-in
+  `X-Forwarded-For` normalization (`NETWATCH_TRUST_PROXY=1`) for rate limits
+  and audit rows behind the cloudflared tunnel — the network allowlist still
+  trusts only the real peer address, which a header can't forge.
+
+### Fixed
+- **SSO login now actually holds a session.** Every request revalidated the
+  session against the local RBAC store (`webauth.current_role`), but SSO users
+  live in the identity provider, not `web_users.json` — so an OIDC login
+  succeeded, set its cookie, then got bounced to the login page on its very
+  next request. Sessions now carry their auth source; SSO sessions are governed
+  by the session TTL, the idle timeout and the sign-out-everywhere epoch (all
+  already enforced) instead of a store lookup that could never match, while
+  local RBAC users are still revalidated against the store every request. Found
+  by a deep self-audit — the original test only checked the cookie was set, not
+  that a follow-up request with it succeeds.
+- **One config directory, with or without `sudo`.** Every store NetWatch keeps
+  (`cameras.json`, the Blink token, team users, the keyed audit trail, the
+  Apiary node state, the web key) was `~`-relative — which is `/root` under
+  `sudo netwatch` and your own home for `netwatch cam list`, so the two never
+  saw each other's data. `NETWATCH_CONFIG_DIR` now names the single directory
+  both use (default unchanged: `~/.config/netwatch`), resolved through
+  `netwatch_pro._paths` / `netwatch._config_dir`, and the launcher points it at
+  the invoking user's home. A regression test fails the build if a new call
+  site hard-codes the old path.
+- **The Apiary shipper now auto-starts at boot** when the node is enrolled — it
+  previously only ever started from an interactive `join`, so a headless
+  enrolment shipped nothing after a restart.
+- **"No cameras configured" no longer covers for every camera failure.** The
+  sentry's status carries a `reason` (missing OpenCV, unparsable
+  `cameras.json`, failed start) and `/api/cam/status` returns it instead of a
+  bare 404, so the `/cam` panel and `cam` tab say what's actually wrong.
+- **The `cam` tab rendered against the wrong schema** and could raise on the
+  real status payload (its event log is preformatted lines, not dicts).
+
+## 1.6.1 — 2026-08-18
+
+### Security
+- **TUI escape-injection hardening.** External OSINT fields (country, org/ISP,
+  ASN, reverse-DNS from plaintext ip-api.com) and `nmap -sV` service banners are
+  attacker-influenceable and flowed into the alert feed and dashboard frame — the
+  operator's terminal, which is often root under `sudo netwatch`. They are now
+  stripped of ANSI/OSC/control sequences and length-bounded at ingest, so a
+  crafted RIR `descr` or service banner can't forge dashboard rows or drive
+  terminal query/response sequences.
+
+### Fixed
+- **Display-width-aware frame clipping.** Dashboard frame lines are now clipped by
+  terminal columns (CJK/emoji counted as 2, combining marks as 0) and to the full
+  width, so a wide-glyph hostname/org no longer wraps and shifts the fixed layout.
+
 ## 1.6.0 — 2026-08-17
 
 ### Added

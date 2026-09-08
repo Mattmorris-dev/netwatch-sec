@@ -15,8 +15,8 @@
 [![Parrot OS](https://img.shields.io/badge/Parrot%20OS-15CDCA?logo=parrotsecurity&logoColor=white)](https://www.parrotsec.org/)
 [![Kali](https://img.shields.io/badge/Kali-557C94?logo=kalilinux&logoColor=white)](https://www.kali.org/)
 [![Platform: Debian](https://img.shields.io/badge/platform-debian-A81D33?logo=debian&logoColor=white)](https://www.debian.org/)
-[![Tests](https://img.shields.io/badge/tests-2304-brightgreen.svg)](tests/)
-[![Version](https://img.shields.io/badge/version-1.6.0-blue.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-2516-brightgreen.svg)](tests/)
+[![Version](https://img.shields.io/badge/version-1.6.1-blue.svg)](CHANGELOG.md)
 [![Status: Active](https://img.shields.io/badge/status-active-brightgreen.svg)]()
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pr0xy_22)
 
@@ -465,7 +465,7 @@ mutation { runCommand(cmd: "geo 8.8.8.8") { output } }
 
 ```bash
 python3 -m pytest tests/ -q
-# 1900 tests, ~30s on a Pi 5
+# 2516 tests, ~90s on a Pi 5
 ```
 
 Lint (CI threshold `--fail-under=9.0`):
@@ -546,7 +546,8 @@ unlocks these; without one it simply keeps running as Free.
 | Camera Sentry — CCTV motion + person detection, `/cam` live feeds | | ✓ | ✓ | ✓ |
 | Signed PDF incident reports · alerts (Slack/SMS/PagerDuty) | | ✓ | ✓ | ✓ |
 | SIEM forwarding · webhooks | | | ✓ | ✓ |
-| Compliance control-coverage reports · SSO | | | | ✓ |
+| Compliance control-coverage reports | | | | ✓ |
+| SSO (OpenID Connect) · MFA/TOTP · account lockout · scoped API keys | | | | ✓ |
 | Nodes | 1 | 1 | 25 | negotiated |
 | Price | $0 | $20/mo · $200/yr | $99/mo · $990/yr | custom |
 

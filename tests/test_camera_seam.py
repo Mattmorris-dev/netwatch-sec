@@ -95,10 +95,15 @@ def test_cam_page_renders_with_pro(monkeypatch):
     assert b"CAMERA SENTRY" in r.data and b"/api/cam/status" in r.data
 
 
-def test_cam_status_404_without_module(monkeypatch):
+def test_cam_status_explains_a_missing_module(monkeypatch):
+    """A bare 404 made the panel say "no cameras configured" for what was
+    really a missing add-on — the payload now names the real reason."""
     monkeypatch.setattr(netwatch, "_pro_sub", lambda n: None)
     r = _admin_client().get("/api/cam/status")
-    assert r.status_code == 404
+    assert r.status_code == 200
+    data = r.get_json()
+    assert data["running"] is False and data["cameras"] == []
+    assert "netwatch-pro[camera]" in data["reason"]
 
 
 def test_cam_status_returns_module_payload(monkeypatch):
@@ -110,13 +115,15 @@ def test_cam_status_returns_module_payload(monkeypatch):
     assert data["running"] is True and data["cameras"][0]["frames"] == 42
 
 
-def test_cam_status_gated_module_error_is_404(monkeypatch):
+def test_cam_status_module_error_is_typed_not_leaked(monkeypatch):
     mod = _cam_mod()
-    mod.status.side_effect = RuntimeError("license expired")
+    mod.status.side_effect = RuntimeError("license expired: /home/u/secret.dat")
     monkeypatch.setattr(netwatch, "_pro_sub",
                         lambda n: mod if n == "camera" else None)
     r = _admin_client().get("/api/cam/status")
-    assert r.status_code == 404
+    assert r.status_code == 200
+    reason = r.get_json()["reason"]
+    assert "RuntimeError" in reason and "secret.dat" not in reason
 
 
 def test_cam_stream_streams_chunks(monkeypatch):
@@ -235,3 +242,186 @@ def test_cam_cli_subcommand_upsell_below_pro(monkeypatch):
     monkeypatch.setattr(netwatch, "tier_at_least", lambda t: False)
     rc = netwatch._cli_subcommand(["cam"])
     assert rc == 1
+
+
+# ── cam add / remove / list (config seams) ──────────────────────────────────
+
+def _capture_console(monkeypatch):
+    """Capture what the TUI verb printed."""
+    out = []
+    monkeypatch.setattr(netwatch, "add_console", lambda line="", *a, **k: out.append(line))
+    return out
+
+
+def _pro_cam(monkeypatch, mod, app_running=True):
+    monkeypatch.setattr(netwatch, "tier_at_least", lambda t: True)
+    monkeypatch.setattr(netwatch, "_pro_sub",
+                        lambda n: mod if n == "camera" else None)
+    # Inside the running app the sentry is hot-restarted; a one-shot CLI run
+    # only writes the config (see _APP_RUNNING).
+    monkeypatch.setattr(netwatch, "_APP_RUNNING", app_running)
+
+
+def test_cam_add_blink_writes_and_restarts(monkeypatch):
+    mod = _cam_mod()
+    mod.add_source.return_value = {"id": 0, "kind": "blink", "source": "Front Door"}
+    mod.restart_background.return_value = True
+    _pro_cam(monkeypatch, mod)
+    out = _capture_console(monkeypatch)
+    netwatch._disp_cam(["cam", "add", "blink", "Front", "Door"])
+    mod.add_source.assert_called_once_with("blink", "Front Door")  # name keeps its space
+    mod.restart_background.assert_called_once()
+    assert any("added cam0" in netwatch._ansi_strip(l) for l in out)
+
+
+def test_cam_add_reports_a_rejected_source(monkeypatch):
+    mod = _cam_mod()
+    mod.add_source.side_effect = ValueError("camera already configured: Front Door")
+    _pro_cam(monkeypatch, mod)
+    out = _capture_console(monkeypatch)
+    netwatch._disp_cam(["cam", "add", "blink", "Front Door"])
+    assert any("already configured" in netwatch._ansi_strip(l) for l in out)
+    mod.restart_background.assert_not_called()      # nothing changed, nothing restarted
+
+
+def test_cam_add_without_args_shows_usage(monkeypatch):
+    mod = _cam_mod()
+    _pro_cam(monkeypatch, mod)
+    out = _capture_console(monkeypatch)
+    netwatch._disp_cam(["cam", "add", "blink"])
+    assert any("usage: cam add" in netwatch._ansi_strip(l) for l in out)
+    mod.add_source.assert_not_called()
+
+
+def test_cam_remove_by_id(monkeypatch):
+    mod = _cam_mod()
+    mod.remove_source.return_value = {"id": 1, "source": "0"}
+    mod.restart_background.return_value = False
+    _pro_cam(monkeypatch, mod)
+    out = _capture_console(monkeypatch)
+    netwatch._disp_cam(["cam", "remove", "1"])
+    mod.remove_source.assert_called_once_with(1)
+    assert any("removed cam1" in netwatch._ansi_strip(l) for l in out)
+
+
+def test_cam_remove_rejects_a_non_numeric_id(monkeypatch):
+    mod = _cam_mod()
+    _pro_cam(monkeypatch, mod)
+    out = _capture_console(monkeypatch)
+    netwatch._disp_cam(["cam", "remove", "front-door"])
+    mod.remove_source.assert_not_called()
+    assert out                                      # complained instead of raising
+
+
+def test_cam_list_shows_ids_and_kinds(monkeypatch):
+    mod = _cam_mod()
+    mod.list_sources.return_value = [
+        {"id": 0, "kind": "blink", "source": "Front Door", "valid": True},
+        {"id": 1, "kind": "rtsp", "source": "rtsp://***@cam/stream", "valid": True},
+    ]
+    _pro_cam(monkeypatch, mod)
+    out = _capture_console(monkeypatch)
+    netwatch._disp_cam(["cam", "list"])
+    text = " ".join(netwatch._ansi_strip(l) for l in out)
+    assert "cam0" in text and "blink" in text and "Front Door" in text
+    assert "cam1" in text and "rtsp" in text
+
+
+def test_cam_blink_auth_points_at_the_terminal_command(monkeypatch):
+    mod = _cam_mod()
+    _pro_cam(monkeypatch, mod)
+    out = _capture_console(monkeypatch)
+    netwatch._disp_cam(["cam", "blink-auth"])
+    text = " ".join(netwatch._ansi_strip(l) for l in out)
+    assert "netwatch_pro.camera_blink auth" in text
+    assert "password is never stored" in text.lower()
+
+
+def test_cam_management_is_pro_gated(monkeypatch):
+    mod = _cam_mod()
+    monkeypatch.setattr(netwatch, "tier_at_least", lambda t: False)
+    monkeypatch.setattr(netwatch, "_pro_sub",
+                        lambda n: mod if n == "camera" else None)
+    out = _capture_console(monkeypatch)
+    netwatch._disp_cam(["cam", "add", "blink", "Front Door"])
+    mod.add_source.assert_not_called()
+    assert any("Pro feature" in netwatch._ansi_strip(l) for l in out)
+
+
+def test_cam_restart_failure_is_reported_not_raised(monkeypatch):
+    mod = _cam_mod()
+    mod.add_source.return_value = {"id": 0, "kind": "usb", "source": "0"}
+    mod.restart_background.side_effect = RuntimeError("OpenCV not installed")
+    _pro_cam(monkeypatch, mod)
+    out = _capture_console(monkeypatch)
+    netwatch._disp_cam(["cam", "add", "usb", "0"])
+    assert any("OpenCV not installed" in netwatch._ansi_strip(l) for l in out)
+
+
+# ── cam tab panel ──────────────────────────────────────────────────────────
+
+def test_section_cam_renders_the_real_status_schema(monkeypatch):
+    """The panel was written against an imagined schema (dict events, a
+    'status' key) and blew up on camera.py's actual payload."""
+    mod = _cam_mod()
+    _pro_cam(monkeypatch, mod)
+    lines = netwatch._section_cam()
+    text = " ".join(netwatch._ansi_strip(l) for l in lines)
+    assert "cam0" in text and "live" in text and "frames 42" in text
+    assert "ALERT camera_person" in text
+
+
+def test_section_cam_shows_why_it_is_empty(monkeypatch):
+    mod = _cam_mod()
+    mod.status.return_value = {"running": False, "cameras": [], "events": [],
+                               "configured": 1,
+                               "reason": "RuntimeError: OpenCV not installed"}
+    _pro_cam(monkeypatch, mod)
+    text = " ".join(netwatch._ansi_strip(l) for l in netwatch._section_cam())
+    assert "OpenCV not installed" in text
+    assert "cam add blink" in text
+
+
+def test_section_cam_offers_blink_auth_when_nothing_configured(monkeypatch):
+    mod = _cam_mod()
+    mod.status.return_value = {"running": False, "cameras": [], "events": [],
+                               "configured": 0, "reason": "no cameras configured"}
+    _pro_cam(monkeypatch, mod)
+    text = " ".join(netwatch._ansi_strip(l) for l in netwatch._section_cam())
+    assert "cam blink-auth" in text
+
+
+def test_cam_status_verb_explains_a_stopped_sentry(monkeypatch):
+    mod = _cam_mod()
+    mod.status.return_value = {"running": False, "cameras": [], "events": [],
+                               "configured": 0, "reason": "no cameras configured"}
+    _pro_cam(monkeypatch, mod)
+    out = _capture_console(monkeypatch)
+    netwatch._disp_cam(["cam"])
+    text = " ".join(netwatch._ansi_strip(l) for l in out)
+    assert "no cameras configured" in text and "cam add blink" in text
+
+
+def test_one_shot_cli_add_does_not_start_camera_threads(monkeypatch):
+    """`netwatch cam add …` exits immediately — starting OpenCV watchers there
+    aborts in native code at teardown and helps nobody."""
+    mod = _cam_mod()
+    mod.add_source.return_value = {"id": 0, "kind": "usb", "source": "0"}
+    _pro_cam(monkeypatch, mod, app_running=False)
+    out = _capture_console(monkeypatch)
+    netwatch._disp_cam(["cam", "add", "usb", "0"])
+    mod.add_source.assert_called_once()
+    mod.restart_background.assert_not_called()
+    assert "saved" in netwatch._ansi_strip(" ".join(out))
+
+
+def test_exit_hook_stops_the_sentry(monkeypatch):
+    mod = _cam_mod()
+    monkeypatch.setattr(netwatch, "_pro_sub", lambda n: mod if n == "camera" else None)
+    netwatch._stop_camera_sentry_at_exit()
+    mod.stop_background.assert_called_once()
+
+
+def test_exit_hook_is_silent_without_the_addon(monkeypatch):
+    monkeypatch.setattr(netwatch, "_pro_sub", lambda n: None)
+    netwatch._stop_camera_sentry_at_exit()        # must not raise

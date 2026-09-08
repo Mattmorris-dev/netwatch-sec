@@ -20,8 +20,14 @@ def test_every_tab_name_resolves():
 
 
 def test_non_tab_command_is_not_a_tab():
-    for cmd in ("scan 1.2.3.4", "help", "", "   ", "whois example.com", "notatab"):
+    # `scan`/`cam`/`audit` are tab names, but WITH an argument they are commands,
+    # so _tab_for_command must not treat them as a tab switch.
+    for cmd in ("scan 1.2.3.4", "cam add rtsp x", "audit verify", "help", "",
+                "   ", "whois example.com", "notatab"):
         assert netwatch._tab_for_command(cmd) is None
+    # bare collision words DO switch to their tab
+    for cmd in ("scan", "cam", "audit"):
+        assert netwatch._tab_for_command(cmd) == cmd
 
 
 def test_cycle_tab_forward_and_back_wraps():

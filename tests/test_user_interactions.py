@@ -425,7 +425,7 @@ class TestConsoleModeTransitions:
         """Typing any non-tab, non-help command should set console_mode=True."""
         # In main loop: if action not in TABS and action != "help":
         #   console_mode = True
-        action = "scan"
+        action = "whois"
         assert action not in netwatch.TABS
         assert action != "help"
         # This would trigger console_mode = True in the main loop
@@ -1172,5 +1172,6 @@ class TestEdgeCases:
 
     def test_all_tabs_valid_values(self):
         """TABS list contains all expected values."""
-        expected = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts", "osint", "proxy", "mesh", "fleet"]
+        expected = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts",
+                    "osint", "proxy", "mesh", "fleet", "scan", "cam", "hive", "audit"]
         assert netwatch.TABS == expected

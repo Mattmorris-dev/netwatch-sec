@@ -55,10 +55,13 @@ def _frame_text(cols=80, max_content=35):
 class TestTabNavigation:
 
     def test_tabs_list_length(self):
-        assert len(netwatch.TABS) == 12
+        assert len(netwatch.TABS) == 16
 
     def test_tabs_list_content(self):
-        expected = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts", "osint", "proxy", "mesh", "fleet"]
+        # Original ten (digit hotkeys) + mesh/fleet, kept in order; scan/cam/hive/
+        # audit appended so no existing digit mapping shifts.
+        expected = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts",
+                    "osint", "proxy", "mesh", "fleet", "scan", "cam", "hive", "audit"]
         assert netwatch.TABS == expected
 
     def test_default_tab_is_all(self):
@@ -283,7 +286,9 @@ class TestTabBar:
         assert isinstance(result, str)
 
     def test_all_tabs_present(self):
-        result = _strip(netwatch._tab_bar(80))
+        # On a wide terminal every tab fits; on narrow ones the bar windows
+        # around the active tab and shows «N/»N (see test_tui_stability).
+        result = _strip(netwatch._tab_bar(200))
         for tab in netwatch.TABS:
             assert tab.upper() in result.upper()
 

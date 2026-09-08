@@ -61,3 +61,7 @@ docs/private/
 docs/ROADMAP.md
 docs/PRICING.md
 docs/DROP4_TUI_REPLAY_PLAN.md
+
+# local-only, not part of the distributed package
+findings.py
+tests/test_findings.py

@@ -341,6 +341,44 @@ def test_clip_visible_bounds_visible_width():
     assert netwatch._clip_visible(colored, 0) == ""
 
 
+def _display_cols(s):
+    import unicodedata
+    s = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", s)   # all CSI (SGR, cursor, EL, private)
+    return sum(0 if unicodedata.combining(c)
+               else (2 if unicodedata.east_asian_width(c) in ("W", "F") else 1)
+               for c in s)
+
+
+def test_clip_visible_counts_wide_glyphs_as_two_columns():
+    # CJK/emoji occupy 2 terminal columns; a codepoint count would let a wide
+    # line slip past the width and wrap, garbling the fixed layout.
+    assert _display_cols(netwatch._clip_visible("漢" * 60, 80)) <= 80
+    assert _display_cols(netwatch._clip_visible("x" * 200, 40)) <= 40
+
+
+def test_paint_dashboard_clips_frame_lines_to_width(monkeypatch):
+    # Regression: frame lines (host rows, alerts) must be width-clipped like the
+    # output panel — an over-wide line wraps and shoves the whole layout down.
+    import datetime
+    frames = {}
+    monkeypatch.setattr(netwatch, "_write_frame", lambda b: frames.__setitem__(
+        "b", b.decode("utf-8", "replace") if isinstance(b, (bytes, bytearray)) else b))
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    with netwatch.lock:
+        h = netwatch.hosts["185.220.101.55"]
+        h.update({"packets": 9, "bytes_in": 9_000_000, "bytes_out": 8_000_000,
+                  "last_seen": now, "hostname": "漢" * 90, "org": "z" * 90,
+                  "ports": set(range(1, 40)), "tags": {"tor-exit", "scanner"}})
+        netwatch.alerts.append({"time": now, "msg": "漢" * 200})
+    for cols in (80, 60, 40):
+        monkeypatch.setattr(netwatch, "_get_terminal_dims", lambda c=cols: (c, 24))
+        for tab in netwatch.TABS:
+            netwatch.current_tab = tab
+            netwatch._paint_dashboard()
+            for line in frames["b"].split("\n"):
+                assert _display_cols(line) <= cols, (tab, cols, _display_cols(line))
+
+
 # --------------------------------------------------------------------------- #
 # 7. Console output is bounded
 # --------------------------------------------------------------------------- #

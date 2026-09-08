@@ -90,9 +90,11 @@ class TestScanningCommands:
         assert not any("Invalid" in c for c in netwatch.console_output)
 
     def test_scan_no_target_not_crash(self):
+        # `scan` is now also a TAB name: bare `scan` (no target) switches to the
+        # scan tab instead of erroring; `scan <ip>` still runs a scan.
         netwatch.handle_command("scan")
-        # No target means action=="scan" but len(parts)<2 → falls to unknown
-        assert any("Unknown" in c for c in netwatch.console_output)
+        assert netwatch.current_tab == "scan"
+        assert not any("Traceback" in c for c in netwatch.console_output)
 
     # --- deep scan ---
     @patch("threading.Thread")
