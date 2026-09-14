@@ -5489,6 +5489,7 @@ def _disp_audit(parts):
     """audit — tamper-evident action log (Enterprise feature).
       audit                list recent audit records
       audit verify         re-check the hash chain for tampering
+      audit rebaseline     archive the trail and start a new chain (see below)
     Every block, login, join, user-change and license action is chained."""
     if not tier_at_least("enterprise"):
         add_console(f"  {YELLOW}The tamper-evident audit trail is an Enterprise feature.{RESET}")
@@ -5505,7 +5506,30 @@ def _disp_audit(parts):
             if res.get("ok"):
                 add_console(f"  {GREEN}✓ Audit chain intact — {res.get('records', 0)} records.{RESET}")
             else:
-                add_console(f"  {RED}✗ TAMPER DETECTED: {_ansi_strip(str(res.get('error')))}{RESET}")
+                add_console(f"  {RED}✗ CHAIN UNVERIFIED: {_ansi_strip(str(res.get('error')))}{RESET}")
+                add_console(f"  {DIM}A rotated HMAC key breaks it at line 1 without any tampering — "
+                            f"in that case: {RESET}{GREEN}audit rebaseline confirm <why>{RESET}")
+            return
+        if sub == "rebaseline":
+            # Renames the trail, so make it deliberate: bare form only explains.
+            if len(parts) < 3 or parts[2].lower() != "confirm":
+                add_console(f"  {YELLOW}Archives the current trail and starts a fresh chain on the current key.{RESET}")
+                add_console(f"  {DIM}The old log is renamed (never deleted) and the new chain's first"
+                            f" record names it, its length and its tip hash.{RESET}")
+                add_console(f"  {DIM}Only do this when the break is explained — a rotated key, not a"
+                            f" mutation you can't account for.{RESET}")
+                add_console(f"  Run: {GREEN}audit rebaseline confirm <why>{RESET}")
+                return
+            res = mod.rebaseline(reason=" ".join(parts[3:]))
+            if res.get("archived") is None:
+                add_console(f"  {DIM}{_ansi_strip(str(res.get('note', 'nothing to do')))}{RESET}")
+                return
+            add_console(f"  {GREEN}✓ New chain started.{RESET} "
+                        f"{res.get('records_archived', 0)} record(s) archived as "
+                        f"{DIM}{_ansi_strip(str(res.get('archived')))}{RESET}")
+            v = mod.verify()
+            add_console(f"  {GREEN}✓ chain verified{RESET}" if v.get("ok")
+                        else f"  {RED}✗ {_ansi_strip(str(v.get('error')))}{RESET}")
             return
         rows = mod.list_records(20)
         if not rows:
@@ -7416,9 +7440,16 @@ def _section_audit(limit=18):
     except Exception as e:
         lines.append(f"  {RED}audit error: {type(e).__name__}{RESET}")
         return lines
-    ok = ver.get("ok")
-    lines.append(f"  {(GREEN if ok else RED)}chain: {'verified' if ok else 'TAMPERED'}"
-                 f"{RESET} {DIM}({ver.get('records', 0)} records){RESET}")
+    if ver.get("ok"):
+        lines.append(f"  {GREEN}chain: verified{RESET} {DIM}({ver.get('records', 0)} records){RESET}")
+    else:
+        # verify() returns the count it got through BEFORE the failing line, so a
+        # break at line 1 read as "0 records" above a screenful of them. Show why
+        # it failed and how many are actually on screen.
+        lines.append(f"  {RED}chain: UNVERIFIED{RESET} {DIM}({len(recs)} shown) — "
+                     f"{_ansi_strip(str(ver.get('error') or 'unknown'))[:58]}{RESET}")
+        lines.append(f"  {DIM}Key rotated? Archive + restart the chain: {RESET}"
+                     f"{GREEN}audit rebaseline confirm <why>{RESET}")
     for r in recs[-limit:]:
         ts = str(r.get('ts') or r.get('time') or '')[:19]
         lines.append(f"  {DIM}{ts}{RESET} {_ansi_strip(str(r.get('actor', '?')))[:14]:<14} "
@@ -8904,6 +8935,21 @@ _CMD_MIN_ROLE = {c: "operator" for c in (
     "sweep", "mesh", "expose", "compliance", "audit",
 )}
 
+# Subcommands that stay on the LOCAL console even for an operator. Archiving the
+# audit trail is exactly the move someone covering their tracks would make, and
+# the trail records that operator's own actions — so it must not be reachable
+# through the web console or the GraphQL API, only from the box itself.
+_WEB_BLOCKED_SUBCMDS = {("audit", "rebaseline")}
+
+
+def _web_blocked_sub(parts):
+    """The '<cmd> <sub>' string if this invocation is console-only, else None."""
+    if len(parts) < 2:
+        return None
+    pair = (parts[0].lower(), parts[1].lower())
+    return f"{pair[0]} {pair[1]}" if pair in _WEB_BLOCKED_SUBCMDS else None
+
+
 _OUTBOUND_CMDS = {"geo", "whois", "dnsinfo", "crt", "headers", "asn", "abuse",
                    "ssl", "secheaders", "techstack", "health", "etrace", "ping",
                    "fullrecon", "scan", "deep", "recon", "trace", "banner",
@@ -8960,6 +9006,9 @@ def web_cmd():
     _cmd_rate[rip] = (cnt + 1, ecnt + (1 if action in _EXPENSIVE_CMDS else 0), wstart)
     if action not in _WEB_SAFE_CMDS:
         return jsonify({"error": f"command '{action}' not recognized — type 'help' for available commands"})
+    blocked_sub = _web_blocked_sub(parts)
+    if blocked_sub:
+        return jsonify({"error": f"'{blocked_sub}' can only be run from the local console"}), 403
     role = _session_role(request) or "viewer"
     # Anything that emits outbound traffic (active nmap/recon, external lookups)
     # is at least operator — a shared viewer credential must not be usable to
@@ -10951,6 +11000,10 @@ if _HAS_GQL:
             action = parts[0].lower()
             if action not in _WEB_SAFE_CMDS:
                 return _GQL_RunCommand(output=[], error=f"'{action}' not allowed via API")
+            blocked_sub = _web_blocked_sub(parts)
+            if blocked_sub:
+                return _GQL_RunCommand(
+                    output=[], error=f"'{blocked_sub}' is local-console only")
             if action in _EXPENSIVE_CMDS and ecnt >= _EXPENSIVE_RATE_LIMIT:
                 return _GQL_RunCommand(output=[], error=f"'{action}' rate limited")
             _cmd_rate[rip] = (cnt + 1, ecnt + (1 if action in _EXPENSIVE_CMDS else 0), wstart)

@@ -80,6 +80,20 @@ def _isolate_log_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_config_dir(tmp_path_factory, monkeypatch):
+    """Same reasoning as _isolate_log_dir, for the config/credential tree:
+    cameras.json, the audit trail, users and the Apiary state all resolve
+    through NETWATCH_CONFIG_DIR at call time, so an unredirected test would
+    write into the operator's real ~/.config/netwatch (and has — past runs left
+    hundreds of records in the live audit log)."""
+    # Its OWN temp dir, not a subdir of tmp_path, so a test that treats tmp_path
+    # as a data root doesn't pick the config dir up as content.
+    monkeypatch.setenv(netwatch.NETWATCH_CONFIG_DIR_ENV,
+                       str(tmp_path_factory.mktemp("nwconfig")))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def mock_getaddrinfo(request):
     """Return a public IP for any DNS lookup so SSRF validators pass in tests."""
     if "integration" in (request.node.get_closest_marker("skipif") and "network" or ""):
