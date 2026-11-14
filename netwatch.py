@@ -87,7 +87,7 @@ for _i, _a in enumerate(sys.argv[1:]):
     _positional.append(_a)
 IFACE = _positional[0] if _positional else "wlan0"
 _MODE_FLAGS = {a for a in sys.argv[1:] if a.startswith("--")}
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 # Honeypot listener ports — overridable via env so deployments can move to
 # standard ports (80/23/21/554) without local sed against the repo.
@@ -2472,7 +2472,7 @@ def osint_geolocate(target):
             return {"error": "private IP — no geolocation"}
     except ValueError:
         pass
-    r = _proxied_get(f"http://ip-api.com/json/{urllib.parse.quote(target, safe='')}", timeout=10)
+    r = _ipapi_get(urllib.parse.quote(target, safe=''), timeout=10)
     if not r:
         return {"error": "request failed (install requests or check proxy)"}
     try:
@@ -3042,7 +3042,7 @@ def osint_trace_enriched(target):
                 try:
                     addr = ipaddress.ip_address(ip)
                     if not addr.is_private and geo_count < max_geo:
-                        geo = _proxied_get(f"http://ip-api.com/json/{ip}?fields=city,country,isp,as", timeout=3)
+                        geo = _ipapi_get(f"{ip}?fields=city,country,isp,as", timeout=3)
                         geo_count += 1
                         if geo:
                             gdata = geo.json()
@@ -3084,7 +3084,7 @@ def osint_asn(ip):
         ipaddress.ip_address(ip)
     except ValueError:
         return {"error": "invalid IP address"}
-    r = _proxied_get(f"http://ip-api.com/json/{ip}?fields=as,org,isp,query,country,city", timeout=10)
+    r = _ipapi_get(f"{ip}?fields=as,org,isp,query,country,city", timeout=10)
     if not r:
         return {"error": "request failed"}
     try:
@@ -3102,7 +3102,7 @@ def osint_abuse(ip):
     if r:
         attacks = r.text.strip()
         result["blocklist_de"] = attacks if attacks else "clean"
-    r2 = _proxied_get(f"http://ip-api.com/json/{ip}?fields=proxy,hosting,mobile,query", timeout=8)
+    r2 = _ipapi_get(f"{ip}?fields=proxy,hosting,mobile,query", timeout=8)
     if r2:
         try:
             d = r2.json()
@@ -3563,6 +3563,7 @@ _HELP_SECTIONS = [
     ]),
     ("Scanning", None, [
         ("scan <ip>", "Quick nmap"), ("deep <ip>", "Full + vulns"),
+        ("cve <ip|CVE-id>", "Known CVEs, exploited first"),
         ("stealth <ip>", "Tor scan"), ("recon <ip>", "Full OSINT profile"),
         ("banner <ip> <p>", "Grab banner"), ("trace <ip>", "Traceroute"),
         ("fullrecon <ip>", "7-phase chain"), ("sweep [cidr]", "ARP+ping+scan"),
@@ -3865,6 +3866,7 @@ def handle_command(cmd):
         "diffarp":    (1, None,                    _cmd_diffarp,      f"{BOLD}{YELLOW}ARP TABLE DIFF — checking for changes...{RESET}"),
         "sweep":      (1, None,                    _cmd_sweep,        f"{BOLD}{RED}NETWORK SWEEP — ARP + ping + scan...{RESET}"),
         "speed":      (1, None,                    _cmd_speed,        ""),
+        "cve":        (2, r'^[A-Za-z0-9][A-Za-z0-9.\-:/_~*%+!]*$', _cmd_cve, f"{CYAN}CVE lookup: {{}}...{RESET}"),
     }
     if action in _SIMPLE_THREAD_CMDS and len(parts) >= _SIMPLE_THREAD_CMDS[action][0]:
         min_args, pattern, func, msg = _SIMPLE_THREAD_CMDS[action]
@@ -4202,7 +4204,8 @@ def _disp_expose(parts):
     reachability probe. Pro: external nmap -sV fingerprint + hardening report."""
     add_console(f"{BOLD}NetWatch expose — what the internet can see{RESET}")
     pub = None
-    r = _proxied_get("http://ip-api.com/json/?fields=query,country,city,isp,hosting,proxy", timeout=8)
+    # our own exit address: it changes with the proxy, so never cache it
+    r = _ipapi_get("?fields=query,country,city,isp,hosting,proxy", timeout=8, cache=False)
     if r is not None:
         try:
             d = r.json()
@@ -6716,6 +6719,140 @@ def _cmd_dnsinfo(target):
     _osint_record("DNS", target, f"{total} records ({', '.join(data.keys())})")
 
 
+# -- CVE LOOKUP (netwatch_cve.py: NVD API, known-exploited first)
+_cve_client = None
+_CVE_HOST_RE = re.compile(
+    r'^[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)*$')
+CVE_SHOW_PER_SERVICE = 8
+
+def _cve_target_is_host(target):
+    """True when `cve <target>` will scan a host (not a CVE id or a CPE name)."""
+    import netwatch_cve
+    return not (netwatch_cve.is_cve_id(target) or netwatch_cve.is_cpe(target))
+
+def _nvd_http_get(url, params, headers, timeout):
+    """Transport for netwatch_cve: same proxy session as every other lookup."""
+    sess = _proxy_session(_get_proxy())
+    if not sess:
+        return 0, None
+    try:
+        r = sess.get(url, params=params, headers=headers, timeout=timeout)
+    except Exception:
+        return 0, None
+    body = None
+    if r.status_code == 200:
+        try:
+            body = r.json()
+        except ValueError:
+            body = None
+    return r.status_code, body
+
+def _get_cve_client():
+    global _cve_client
+    if _cve_client is None:
+        import netwatch_cve
+        _cve_client = netwatch_cve.NvdClient(
+            _nvd_http_get,
+            api_key=os.environ.get("NETWATCH_NVD_API_KEY", "").strip() or None,
+            cache_path=_config_path("cve_cache.json"))
+    return _cve_client
+
+def _cve_line(f):
+    sev = f.get("severity") or "?"
+    color = RED if sev in ("CRITICAL", "HIGH") else YELLOW if sev == "MEDIUM" else WHITE
+    score = f"{f['score']:.1f}" if f.get("score") is not None else "n/a"
+    kev = f" {BG_RED}{WHITE} EXPLOITED {RESET}" if f.get("kev") else ""
+    summary = _ansi_strip(f.get("summary", ""))[:90]
+    return f"  {color}{f['id']:<17}{score:>5} {sev:<9}{RESET}{kev} {DIM}{summary}{RESET}"
+
+def _cve_print_findings(label, findings):
+    import netwatch_cve
+    if not findings:
+        add_console(f"  {GREEN}{label}: no CVE on record for this version{RESET}")
+        return
+    c = netwatch_cve.summarize(findings)
+    add_console(f"  {BOLD}{label}{RESET} — {c['total']} CVE, {c['kev']} known exploited, "
+                f"{c['CRITICAL']} critical, {c['HIGH']} high")
+    for f in findings[:CVE_SHOW_PER_SERVICE]:
+        add_console(_cve_line(f))
+    if len(findings) > CVE_SHOW_PER_SERVICE:
+        add_console(f"  {DIM}... {len(findings) - CVE_SHOW_PER_SERVICE} more, lower rank{RESET}")
+
+def _cve_scan_services(target):
+    """nmap version scan of the top 100 ports -> (services, error text)."""
+    import netwatch_cve
+    argv = ["nmap", "-sV", "--version-light", "-F", "-T4", "-Pn", "-oX", "-"]
+    if ":" in target:
+        argv.append("-6")
+    try:
+        res = subprocess.run(argv + [target], capture_output=True, text=True, timeout=300)
+    except FileNotFoundError:
+        return [], "nmap is not installed"
+    except subprocess.TimeoutExpired:
+        return [], "version scan timed out"
+    return netwatch_cve.parse_nmap_xml(res.stdout), ""
+
+def _cmd_cve(target):
+    """cve <CVE-id> | cve <cpe> | cve <ip|host> (version scan, then NVD)."""
+    import netwatch_cve
+    client = _get_cve_client()
+    try:
+        if netwatch_cve.is_cve_id(target):
+            f = client.lookup_cve(target)
+            if not f:
+                add_console(f"  {YELLOW}{target.upper()} is not in NVD.{RESET}")
+                return
+            add_console(_cve_line(f))
+            if f.get("kev"):
+                add_console(f"  {RED}In the CISA known-exploited catalog since {f['kev_added']}"
+                            f"{', fix due ' + f['kev_due'] if f.get('kev_due') else ''}.{RESET}")
+            add_console(f"  {DIM}Published {f.get('published') or 'unknown'}{RESET}")
+            _osint_record("CVE", f["id"], f"{f.get('severity') or '?'} {f.get('score')}"
+                                          f"{' exploited' if f.get('kev') else ''}")
+            return
+        if netwatch_cve.is_cpe(target):
+            findings, _cached = client.lookup_cpe(target)
+            _cve_print_findings(target, findings)
+            _osint_record("CVE", target, f"{len(findings)} CVE")
+            return
+        try:
+            ipaddress.ip_address(target)
+        except ValueError:
+            if len(target) > 253 or not _CVE_HOST_RE.match(target):
+                add_console(f"  {RED}Usage: cve <ip|host> | cve CVE-2024-1234 | cve cpe:2.3:a:vendor:product:version{RESET}")
+                return
+        services, err = _cve_scan_services(target)
+        if err:
+            add_console(f"  {RED}{err}{RESET}")
+            return
+        if not services:
+            add_console(f"  {YELLOW}No open port in the top 100.{RESET}")
+            return
+        versioned = [svc for svc in services if svc["cpes"]]
+        add_console(f"  {GREEN}{len(services)} open ports, {len(versioned)} with a product version.{RESET}")
+        if not versioned:
+            add_console(f"  {DIM}nmap found no product version, so there is nothing to match.{RESET}")
+            return
+        if not os.environ.get("NETWATCH_NVD_API_KEY") and len(versioned) > 2:
+            add_console(f"  {DIM}No NVD key: one lookup each 6.5 s. Set NETWATCH_NVD_API_KEY for 10x speed.{RESET}")
+        results, skipped = client.lookup_services(versioned)
+        total = kev = 0
+        for svc, _cpe, findings in results:
+            name = _ansi_strip(f"{svc['product']} {svc['version']}".strip()) or svc["service"]
+            _cve_print_findings(f"{svc['port']}/{svc['proto']} {name}", findings)
+            total += len(findings)
+            kev += sum(1 for f in findings if f.get("kev"))
+        if skipped:
+            add_console(f"  {DIM}{skipped} more services not checked (limit {netwatch_cve.MAX_SERVICES_PER_SCAN}).{RESET}")
+        add_console(f"  {DIM}Match is by version only. A distribution can fix a CVE and keep the "
+                    f"version number, so confirm before you act.{RESET}")
+        with lock:
+            if target in hosts and total:
+                hosts[target]["tags"].add("KEV" if kev else "VULN")
+        _osint_record("CVE", target, f"{total} CVE ({kev} exploited) on {len(versioned)} services")
+    except netwatch_cve.NvdError as e:
+        add_console(f"  {RED}{e}{RESET}")
+
 def _cmd_portscan(target):
     results = osint_port_scan(target)
     if not results:
@@ -6819,6 +6956,38 @@ def _proxied_get(url, timeout=10):
         return sess.get(url, timeout=timeout, headers=headers)
     except Exception:
         return None
+
+_IPAPI_TTL = 3600      # an address does not change country within the hour
+_IPAPI_MAX = 2000
+_ipapi_cache = {}      # query -> (epoch, response)
+_ipapi_lock = threading.Lock()
+
+def _ipapi_get(query, timeout=10, cache=True):
+    """GET ip-api.com/json/<query>, with a one-hour cache.
+
+    The free endpoint is plain HTTP, allows 45 requests a minute (then a
+    one-hour ban) and its terms do not allow commercial use. Set
+    NETWATCH_IPAPI_KEY to use the paid HTTPS endpoint instead. The cache keeps
+    batch commands (geoall, fullrecon) inside the free limit."""
+    key = os.environ.get("NETWATCH_IPAPI_KEY", "").strip()
+    if key:
+        sep = "&" if "?" in query else "?"
+        url = f"https://pro.ip-api.com/json/{query}{sep}key={urllib.parse.quote(key, safe='')}"
+    else:
+        url = f"http://ip-api.com/json/{query}"
+    if cache:
+        with _ipapi_lock:
+            hit = _ipapi_cache.get(query)
+            if hit and time.time() - hit[0] < _IPAPI_TTL:
+                return hit[1]
+    r = _proxied_get(url, timeout=timeout)
+    if cache and r is not None and getattr(r, "status_code", None) == 200:
+        with _ipapi_lock:
+            if len(_ipapi_cache) >= _IPAPI_MAX:
+                for old in sorted(_ipapi_cache, key=lambda k: _ipapi_cache[k][0])[:_IPAPI_MAX // 10]:
+                    del _ipapi_cache[old]
+            _ipapi_cache[query] = (time.time(), r)
+    return r
 
 def _test_proxy(entry):
     if not req_lib:
@@ -9027,7 +9196,7 @@ _WEB_SAFE_CMDS = {
     "attacks", "abusers", "threats", "expose", "checkme",
     "tag", "note", "watch", "report", "exportips", "diffarp", "mesh",
     "scanall", "geoall", "whoisall", "reconall", "blockall", "sweep",
-    "speed", "ifinfo", "help",
+    "speed", "ifinfo", "help", "cve",
     "block", "unblock", "pcap", "track", "untrack", "conns", "sniff",
     "trackdns", "tracking", "stealth", "clear", "export",
     "join", "compliance", "audit", "cam", "cameras",
@@ -9041,7 +9210,7 @@ _CMD_MIN_ROLE = {c: "operator" for c in (
     "block", "unblock", "blockall", "pcap", "track", "untrack", "sniff",
     "trackdns", "stealth", "tag", "note", "watch", "clear", "export",
     "proxy", "report", "join", "scanall", "geoall", "whoisall", "reconall",
-    "sweep", "mesh", "expose", "compliance", "audit",
+    "sweep", "mesh", "expose", "compliance", "audit", "cve",
 )}
 
 # Subcommands that stay on the LOCAL console even for an operator. Archiving the
@@ -9086,7 +9255,7 @@ _web_cmd_lock = threading.Lock()
 _CMD_RATE_LIMIT = 20
 _CMD_RATE_WINDOW = 60
 _EXPENSIVE_CMDS = {"fullrecon", "scanall", "reconall", "blockall", "sweep", "geoall", "whoisall", "deep",
-                    "block", "unblock", "stealth", "pcap", "expose", "checkme"}
+                    "block", "unblock", "stealth", "pcap", "expose", "checkme", "cve"}
 _EXPENSIVE_RATE_LIMIT = 3
 
 @web_app.route("/api/cmd", methods=["POST"])
@@ -9128,7 +9297,8 @@ def web_cmd():
     if _ROLE_RANK.get(role, 0) < _ROLE_RANK[need]:
         return jsonify({"error": f"'{action}' requires the {need} role "
                                  f"(you are {role})"}), 403
-    if action in _OUTBOUND_CMDS and len(parts) >= 2:
+    if (action in _OUTBOUND_CMDS or (action == "cve" and len(parts) >= 2
+                                           and _cve_target_is_host(parts[1]))) and len(parts) >= 2:
         target = parts[1]
         if _is_internal_target(target):
             return jsonify({"error": f"target '{target}' resolves to internal/metadata IP — blocked"})
@@ -11116,7 +11286,8 @@ if _HAS_GQL:
             if action in _EXPENSIVE_CMDS and ecnt >= _EXPENSIVE_RATE_LIMIT:
                 return _GQL_RunCommand(output=[], error=f"'{action}' rate limited")
             _cmd_rate[rip] = (cnt + 1, ecnt + (1 if action in _EXPENSIVE_CMDS else 0), wstart)
-            if action in _OUTBOUND_CMDS and len(parts) >= 2:
+            if (action in _OUTBOUND_CMDS or (action == "cve" and len(parts) >= 2
+                                           and _cve_target_is_host(parts[1]))) and len(parts) >= 2:
                 if _is_internal_target(parts[1]):
                     return _GQL_RunCommand(output=[], error="internal target blocked")
             if action in ("scan", "deep", "recon", "portscan", "fullrecon", "sweep", "subnet") and len(parts) >= 2:

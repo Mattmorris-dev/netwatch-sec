@@ -32,6 +32,8 @@ def reset_global_state():
     netwatch.console_output.clear()
     netwatch.hosts.clear()
     netwatch.dns_cache.clear()
+    netwatch._ipapi_cache.clear()
+    netwatch._cve_client = None
     netwatch.proto_stats.clear()
     netwatch.tshark_conversations.clear()
     netwatch.arp_table.clear()
