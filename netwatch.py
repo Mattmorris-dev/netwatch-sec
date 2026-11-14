@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetWatch v2.0 - Unified Network Security Dashboard
+NetWatch - Unified Network Security Dashboard
 ════════════════════════════════════════════════════
 Modules:
   HONEYPOT  - Fake NVR panel, DVR telnet, RTSP camera, FTP bait
@@ -321,6 +321,11 @@ hosts = defaultdict(lambda: {
     "bytes_in": 0, "bytes_out": 0, "packets": 0,
     "ports": set(), "protocols": set(), "first_seen": None, "last_seen": None,
     "hostname": "", "resolved": False, "threat_score": 0, "tags": set(),
+    # scan_ports: LOCAL ports this host opened connections to (TCP SYN, or UDP
+    # from a client port). Scan detection uses this, not "ports": "ports" also
+    # holds our own client ports, so a busy server looked like a scanner.
+    "scan_ports": set(),
+    "last_seen_ts": 0.0,   # epoch seconds; "last_seen" is display text only
 })
 dns_queries = []
 alerts = []
@@ -415,20 +420,37 @@ SCAN_THRESHOLD = 50
 TOR_PORTS = {9001, 9002, 9003, 9030, 9050, 9051, 9150}
 
 # Whitelist
-WHITELIST_SCAN = {
-    "127.0.0.1", "10.0.1.1", "100.66.15.102", "100.85.81.110",
-    "160.79.104.10", "142.251.211.91", "172.253.62.188",
-    "149.154.166.110", "209.177.145.120",
-    "207.251.86.235",  # webcams.nyctmc.org - LocalTipoff
-}
+# Shipped defaults hold only loopback and large CDN/Google ranges. Addresses
+# that belong to one site (your router, VPN peers, services you use) go in
+#   NETWATCH_WHITELIST=198.51.100.7,203.0.113.     (a trailing "." = prefix)
+WHITELIST_SCAN = {"127.0.0.1"}
 WHITELIST_PREFIXES = (
     "216.239.", "104.16.", "104.17.", "104.18.", "199.232.",
     "151.101.", "142.250.", "142.251.", "172.253.", "172.217.",
-    "207.251.",  # NYC DOT camera range
     "18.238.",   # CloudFront
     "18.155.",   # CloudFront
     "108.138.",  # CloudFront
 )
+
+def _load_user_whitelist(raw=None):
+    """Add NETWATCH_WHITELIST entries. Returns the entries that were rejected."""
+    global WHITELIST_PREFIXES
+    raw = os.environ.get("NETWATCH_WHITELIST", "") if raw is None else raw
+    bad = []
+    for item in (x.strip() for x in raw.split(",")):
+        if not item:
+            continue
+        if item.endswith(".") and re.fullmatch(r"(\d{1,3}\.){1,3}", item):
+            if item not in WHITELIST_PREFIXES:
+                WHITELIST_PREFIXES = WHITELIST_PREFIXES + (item,)
+            continue
+        try:
+            WHITELIST_SCAN.add(str(ipaddress.ip_address(item)))
+        except ValueError:
+            bad.append(item)
+    return bad
+
+_WHITELIST_REJECTED = _load_user_whitelist()
 
 # Known services for OSINT enrichment
 KNOWN_SERVICES = {
@@ -449,10 +471,45 @@ def get_local_ips():
             if "inet " in line:
                 ips.add(line.strip().split()[1].split("/")[0])
     except Exception:
-        ips.add("10.0.1.9")
+        ips.add("127.0.0.1")
     return ips
 
 LOCAL_IPS = get_local_ips()
+
+def _is_private_ip(ip):
+    """True for RFC 1918, loopback, link-local and CGNAT (100.64/10) IPv4.
+    String checks only: this runs for every packet."""
+    if ip.startswith(("10.", "192.168.", "127.", "169.254.")):
+        return True
+    if ip.startswith(("172.", "100.")):
+        try:
+            second = int(ip.split(".", 2)[1])
+        except (ValueError, IndexError):
+            return False
+        return 16 <= second <= 31 if ip[1] == "7" else 64 <= second <= 127
+    return False
+
+def _default_cidr(max_hosts_prefix=22):
+    """The private subnet on IFACE, or None. Only home/office-sized private
+    networks qualify (/22 or smaller): a default must never sweep a public
+    range or a cloud provider's shared /16."""
+    try:
+        out = subprocess.check_output(["ip", "-4", "-o", "addr", "show", "dev", IFACE],
+                                      text=True, timeout=5, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    for tok in str(out).split():
+        if "/" not in tok:
+            continue
+        try:
+            iface = ipaddress.ip_interface(tok)
+        except ValueError:
+            continue
+        if (iface.version == 4 and _is_private_ip(str(iface.ip))
+                and not iface.ip.is_loopback and not iface.ip.is_link_local
+                and iface.network.prefixlen >= max_hosts_prefix):
+            return str(iface.network)
+    return None
 
 # ─── OSINT Enrichment ───────────────────────────────────
 
@@ -475,45 +532,79 @@ KNOWN_INFRA = ("cloudfront", "google", "amazon", "aws", "telegram",
                "microsoft", "apple", "akamai", "fastly",
                "cloudflare", "github", "facebook", "meta", "netflix")
 
-def enrich_host(ip):
+def score_host(ip):
+    """Apply the port-behaviour rules to one host. Safe to call again and
+    again: a rule adds its points one time, when it first matches, so the
+    score follows a host that starts to scan after it was first seen.
+    Call with `lock` held when the sniffer is running."""
     h = hosts[ip]
-    if h.get("_enriched"):
+    if _is_private_ip(ip) or ip in LOCAL_IPS or is_whitelisted(ip):
         return
-    hostname = resolve_host(ip)
-    h["hostname"] = hostname
-    h["resolved"] = True
-    h["tags"] = set()
-
-    is_known = any(k in hostname.lower() for k in KNOWN_INFRA) if hostname else False
-    is_local = ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("172.16.") or ip in LOCAL_IPS
-
-    if "cloudfront" in hostname:
-        h["tags"].add("CDN")
-    elif "google" in hostname:
-        h["tags"].add("Google")
-    elif "amazon" in hostname or "aws" in hostname:
-        h["tags"].add("AWS")
-    elif "telegram" in hostname:
-        h["tags"].add("Telegram")
-
-    # NOTE: is_known is based on reverse DNS which is attacker-controllable.
-    # We still tag for DISPLAY, but NEVER skip threat scoring based on PTR alone.
-    # Only truly local IPs and hardcoded whitelisted IPs skip scoring.
-    if is_local or is_whitelisted(ip):
-        h["_enriched"] = True
-        return
-
-    port_count = len(h["ports"])
-    if port_count > SCAN_THRESHOLD:
+    applied = h.setdefault("_scored", set())
+    if "SCANNER" not in applied and len(h.get("scan_ports") or ()) > SCAN_THRESHOLD:
+        applied.add("SCANNER")
         h["tags"].add("SCANNER")
         h["threat_score"] += 30
-    if h["ports"] & SUS_PORTS:
+    if "SUS-PORT" not in applied and h["ports"] & SUS_PORTS:
+        applied.add("SUS-PORT")
         h["tags"].add("SUS-PORT")
         h["threat_score"] += 20
     if h["ports"] & {23, 3389}:
         h["tags"].add("REMOTE-ACCESS")
 
-    h["_enriched"] = True
+def enrich_host(ip):
+    """Resolve the hostname one time (blocking DNS — never call with `lock`
+    held), add display tags, then score."""
+    h = hosts[ip]
+    try:
+        if h.get("_enriched"):
+            return
+        hostname = resolve_host(ip)
+        with lock:
+            h["hostname"] = hostname
+            h["resolved"] = True
+            # Reverse DNS is attacker-controllable: these tags are for DISPLAY
+            # only and never skip scoring.
+            if "cloudfront" in hostname:
+                h["tags"].add("CDN")
+            elif "google" in hostname:
+                h["tags"].add("Google")
+            elif "amazon" in hostname or "aws" in hostname:
+                h["tags"].add("AWS")
+            elif "telegram" in hostname:
+                h["tags"].add("Telegram")
+            h["_enriched"] = True
+            score_host(ip)
+    finally:
+        h.pop("_enriching", None)
+
+_ENRICH_BATCH = 20        # hostname lookups started per maintenance pass
+_ENRICH_MAX_ACTIVE = 40   # lookups allowed in flight (slow DNS must not pile up threads)
+
+def _maintain_hosts():
+    """Housekeeping, about every 1.5 s: cap alerts and hosts, re-score every
+    host, and start hostname lookups for hosts that have none yet."""
+    with lock:
+        if len(alerts) > MAX_ALERTS:
+            del alerts[:len(alerts) - MAX_ALERTS]
+        if len(hosts) > MAX_HOSTS:
+            oldest = sorted(hosts, key=lambda k: hosts[k].get("last_seen_ts") or 0.0)
+            for k in oldest[:len(hosts) - MAX_HOSTS]:
+                del hosts[k]
+        active = 0
+        pending = []
+        for ip, h in list(hosts.items()):
+            score_host(ip)
+            if h.get("_enriching"):
+                active += 1
+            elif not h.get("_enriched"):
+                pending.append(ip)
+        pending = pending[:max(0, min(_ENRICH_BATCH, _ENRICH_MAX_ACTIVE - active))]
+        for ip in pending:
+            hosts[ip]["_enriching"] = True
+    for ip in pending:
+        threading.Thread(target=enrich_host, args=(ip,), daemon=True).start()
+    return len(pending)
 
 # ─── Logging ─────────────────────────────────────────────
 
@@ -1602,10 +1693,20 @@ def handle_ftp(client, addr):
                 p1 = pasv_port >> 8
                 p2 = pasv_port & 0xFF
                 # Get our IP for the response
+                our_ip = None
                 try:
-                    our_ip = [x for x in LOCAL_IPS if not x.startswith("127") and ":" not in x][0]
-                except IndexError:
-                    our_ip = "10.0.1.9"
+                    # The address the client reached us on is the one it can
+                    # reach again; LOCAL_IPS order is arbitrary on a host with
+                    # several interfaces (VPN, Docker).
+                    _ctl = client.getsockname()[0]
+                    if isinstance(_ctl, str) and ipaddress.ip_address(_ctl).version == 4 \
+                            and not _ctl.startswith(("0.", "127.")):
+                        our_ip = _ctl
+                except Exception:
+                    our_ip = None
+                if not our_ip:
+                    _cands = sorted(x for x in LOCAL_IPS if not x.startswith("127") and ":" not in x)
+                    our_ip = _cands[0] if _cands else "127.0.0.1"
                 ip_parts = our_ip.replace(".", ",")
                 send(f"227 Entering Passive Mode ({ip_parts},{p1},{p2}).")
                 ftp_log("PASV", f"port {pasv_port}")
@@ -2244,17 +2345,7 @@ def parse_dns(data):
         return None
 
 def _is_benign(ip):
-    if ip in LOCAL_IPS or is_whitelisted(ip):
-        return True
-    if ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("172.16."):
-        return True
-    if ip.startswith("100."):
-        try:
-            if ipaddress.ip_address(ip) in ipaddress.ip_network("100.64.0.0/10"):
-                return True
-        except ValueError:
-            pass
-    return False
+    return ip in LOCAL_IPS or _is_private_ip(ip) or is_whitelisted(ip)
 
 def check_suspicious(src_ip, dst_ip, src_port, dst_port):
     if _is_benign(src_ip) and _is_benign(dst_ip):
@@ -2267,8 +2358,11 @@ def check_suspicious(src_ip, dst_ip, src_port, dst_port):
                 if alert not in [a["msg"] for a in alerts[-20:]]:
                     alerts.append({"time": now_str, "msg": alert})
         for ip in (src_ip, dst_ip):
-            if not _is_benign(ip) and len(hosts[ip]["ports"]) > SCAN_THRESHOLD:
-                alert = f"PORT SCAN: {ip} ({len(hosts[ip]['ports'])} ports)"
+            if ip not in hosts or _is_benign(ip):
+                continue
+            probed = len(hosts[ip].get("scan_ports") or ())
+            if probed > SCAN_THRESHOLD:
+                alert = f"PORT SCAN: {ip} ({probed} ports)"
                 if alert not in [a["msg"] for a in alerts[-20:]]:
                     alerts.append({"time": now_str, "msg": alert})
 
@@ -2284,6 +2378,8 @@ def traffic_monitor():
                            "msg": f"Sniffer error: {e}"})
         return
 
+    last_sec = 0
+    now_str = ""
     while True:
         try:
             data, _ = sock.recvfrom(65535)
@@ -2297,12 +2393,22 @@ def traffic_monitor():
             continue
 
         protocol, src_ip, dst_ip, pkt_len, ip_payload = parse_ip(eth_payload)
-        now_str = datetime.now().strftime("%H:%M:%S")
+        now_ts = time.time()
+        if int(now_ts) != last_sec:          # format the clock once per second
+            last_sec = int(now_ts)
+            now_str = time.strftime("%H:%M:%S", time.localtime(now_ts))
 
         src_port = dst_port = 0
         dns_domain = None
+        opens_conn = False   # this packet starts a connection toward dst_port
         if protocol in (6, 17):
             src_port, dst_port = parse_ports(ip_payload)
+            if protocol == 6:
+                # SYN set, ACK clear = a new inbound attempt (replies carry ACK)
+                opens_conn = len(ip_payload) > 13 and (ip_payload[13] & 0x12) == 0x02
+            else:
+                # UDP has no handshake: a packet from a client port to us
+                opens_conn = src_port >= 1024 and dst_port != 0
             if protocol == 17 and dst_port == 53 and len(ip_payload) > 20:
                 dns_domain = parse_dns(ip_payload[8:])
                 if dns_domain and len(dns_domain) <= 3:
@@ -2323,15 +2429,21 @@ def traffic_monitor():
                 hosts[src_ip]["bytes_in"] += pkt_len
             for ip in (src_ip, dst_ip):
                 if ip not in LOCAL_IPS:
-                    hosts[ip]["packets"] += 1
-                    hosts[ip]["last_seen"] = now_str
-                    if not hosts[ip]["first_seen"]:
-                        hosts[ip]["first_seen"] = now_str
-                    if len(hosts[ip]["ports"]) < 500:
+                    h = hosts[ip]
+                    h["packets"] += 1
+                    h["last_seen"] = now_str
+                    h["last_seen_ts"] = now_ts
+                    if not h["first_seen"]:
+                        h["first_seen"] = now_str
+                    if len(h["ports"]) < 500:
                         if src_port:
-                            hosts[ip]["ports"].add(src_port)
+                            h["ports"].add(src_port)
                         if dst_port:
-                            hosts[ip]["ports"].add(dst_port)
+                            h["ports"].add(dst_port)
+            if opens_conn and dst_ip in LOCAL_IPS and src_ip not in LOCAL_IPS:
+                probed = hosts[src_ip]["scan_ports"]
+                if len(probed) < 500:
+                    probed.add(dst_port)
 
         check_suspicious(src_ip, dst_ip, src_port, dst_port)
 
@@ -4498,7 +4610,10 @@ def _cmd_fullrecon(target):
     _osint_record("FULLRECON", target, "7-phase recon complete")
 
 def _cmd_sweep(cidr=None):
-    cidr = cidr or "10.0.1.0/24"
+    cidr = cidr or _default_cidr()
+    if not cidr:
+        add_console(f"  {YELLOW}No private subnet found on {IFACE}. Usage: sweep <cidr>{RESET}")
+        return
     add_console(f"  {CYAN}[1/3] ARP scan...{RESET}")
     try:
         result = subprocess.run(["arp-scan", "-l", "-I", IFACE], capture_output=True, text=True, timeout=30)
@@ -6272,7 +6387,10 @@ def _disp_tracked(parts):
     track_summary(parts[1])
 
 def _disp_subnet(parts):
-    cidr = parts[1] if len(parts) >= 2 else "10.0.1.0/24"
+    cidr = parts[1] if len(parts) >= 2 else _default_cidr()
+    if not cidr:
+        add_console(f"{YELLOW}No private subnet found on {IFACE}. Usage: subnet <cidr>{RESET}")
+        return
     add_console(f"{CYAN}Ping sweeping {cidr}...{RESET}")
     threading.Thread(target=_cmd_subnet_sweep, args=(cidr,), daemon=True).start()
 
@@ -7908,16 +8026,7 @@ def draw_dashboard():
         enrich_counter += 1
         if enrich_counter % 5 == 0:
             try:
-                with lock:
-                    if len(alerts) > MAX_ALERTS:
-                        del alerts[:len(alerts) - MAX_ALERTS]
-                    if len(hosts) > MAX_HOSTS:
-                        oldest = sorted(hosts.keys(), key=lambda k: hosts[k].get("last_seen") or "")[:len(hosts) - MAX_HOSTS]
-                        for k in oldest:
-                            del hosts[k]
-                    for ip in list(hosts.keys())[:20]:
-                        if not hosts[ip].get("_enriched"):
-                            threading.Thread(target=enrich_host, args=(ip,), daemon=True).start()
+                _maintain_hosts()
             except Exception:
                 pass
 
@@ -11581,7 +11690,9 @@ def main():
     # Auto-scan local subnet on startup (local awareness — sensor/both only)
     if RUN_LOCAL_HONEYPOT:
         time.sleep(5)
-        nmap_scan_thread("10.0.1.0/24", "-sn -T4")
+        _lan = _default_cidr()
+        if _lan:   # never sweep a public or cloud-shared range by default
+            nmap_scan_thread(_lan, "-sn -T4")
 
     # Flask honeypot in background thread (so main thread can do console)
     if RUN_LOCAL_HONEYPOT:

@@ -583,8 +583,9 @@ class TestOsintSubnet:
     @patch("threading.Thread")
     def test_subnet_default_cidr(self, mock_thread):
         mock_thread.return_value.start = MagicMock()
-        netwatch.handle_command("subnet")
-        assert any("Ping sweep" in c or "10.0.1.0" in c for c in netwatch.console_output)
+        with patch("netwatch._default_cidr", return_value="192.168.1.0/24"):
+            netwatch.handle_command("subnet")
+        assert any("192.168.1.0/24" in c for c in netwatch.console_output)
 
     @patch("threading.Thread")
     def test_subnet_custom_cidr_in_output(self, mock_thread):

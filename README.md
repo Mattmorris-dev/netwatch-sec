@@ -567,4 +567,4 @@ NetWatch is built and maintained solo. If it saves you time or protects your net
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE)
+AGPL-3.0 — see [LICENSE](LICENSE)
