@@ -20,7 +20,7 @@
 [![Status: Active](https://img.shields.io/badge/status-active-brightgreen.svg)]()
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pr0xy_22)
 
-**All-in-one network security dashboard** — deploy honeypots, capture traffic, run OSINT, scan targets, block threats, and forward alerts over mesh radio. One command, one file, real-time.
+**All-in-one network security dashboard** — deploy honeypots, capture traffic, run OSINT, scan targets, block threats, and forward alerts over mesh radio. One command, real-time.
 
 ```
 sudo netwatch
@@ -186,13 +186,32 @@ NETWATCH_NVD_API_KEY=<key> sudo -E netwatch   # optional, free key: 10x faster l
 
 The match is by version string. A distribution can fix a CVE and keep the version number, so confirm a finding before you act on it.
 
-### Local settings
+### Saved settings
 
-| Variable | Purpose |
-|----------|---------|
-| `NETWATCH_WHITELIST` | Addresses that skip threat scoring: `198.51.100.7,203.0.113.` (a trailing `.` is a prefix). The shipped list holds loopback and large CDN ranges only. |
-| `NETWATCH_NVD_API_KEY` | NVD API key for `cve` (raises the rate limit). |
-| `NETWATCH_IPAPI_KEY` | ip-api.com paid key. With it, geo lookups use HTTPS. Without it they use the free endpoint: plain HTTP, 45 requests a minute, **non-commercial use only**. |
+Settings are saved with one command, so you do not need environment variables or `sudo -E`:
+
+```
+config                               show every setting and where its value comes from
+config set nvd-key <key>             save a setting (takes effect at once unless it says "restart")
+config unset nvd-key                 remove it
+```
+
+From the shell, use the same user that starts NetWatch: `sudo netwatch config set nvd-key <key>`.
+
+| Name | Purpose |
+|------|---------|
+| `whitelist` | Addresses that skip threat scoring: `198.51.100.7,203.0.113.` (a trailing `.` is a prefix). The shipped list holds loopback and large CDN ranges only. |
+| `nvd-key` | NVD API key for `cve` (free; raises the rate limit). |
+| `ipinfo-token` | [IPinfo Lite](https://ipinfo.io/lite) token (free). Geo lookups then use HTTPS and **commercial use is allowed with attribution**. It gives country and ASN only: no city, ISP detail or proxy flags. |
+| `ipapi-key` | ip-api.com paid key: HTTPS and full detail. Used before `ipinfo-token` when both are set. |
+| `mesh-port`, `mesh-timeout` | Serial device of the Meshtastic radio, and seconds to wait for its config. |
+| `http-port`, `telnet-port`, `ftp-port`, `rtsp-port`, `retention-days` | Honeypot ports and log retention (restart to apply). |
+
+With no `ipinfo-token` and no `ipapi-key`, geo lookups use the free ip-api.com endpoint: plain HTTP, 45 requests a minute, **non-commercial use only**.
+
+The file is `settings.env` in the config directory (mode 0600). A `NETWATCH_*` variable in the real environment wins over the file. Settings that change who can log in or which program is run (token, tier, `NETWATCH_WEB_ALLOW`, binary paths) cannot be saved there on purpose; give those on the command line.
+
+Geo data from IPinfo Lite is licensed CC BY-SA 4.0: [IP address data powered by IPinfo](https://ipinfo.io).
 
 ### Replay tunables
 
@@ -411,6 +430,9 @@ Requires root. Disabled automatically in passive mode.
 | `dashboard` / `d` | Return to dashboard screen |
 | `clear` | Wipe console buffer |
 | `help` | Show full reference overlay |
+| `help <word>` | Search the reference (`help cve`, `help traceroute`) |
+| `config` | Saved settings: API keys, whitelist, ports |
+| `doctor` | Check Python packages and system tools |
 | `rotate-key` | New Fernet key (invalidates web sessions) |
 | `rotate-token` | New web auth token (invalidates sessions) |
 
@@ -447,7 +469,8 @@ proxy start                        proxy stop
 ### Mesh Radio
 
 ```
-mesh send <text>     mesh status     mesh nodes     mesh alert on/off
+mesh connect [/dev/ttyACM0]     mesh disconnect     mesh status
+mesh send <text>     mesh nodes     mesh alert on/off
 ```
 
 ## Honeypots
@@ -485,7 +508,7 @@ mutation { runCommand(cmd: "geo 8.8.8.8") { output } }
 
 ```bash
 python3 -m pytest tests/ -q
-# 2641 tests, ~90s on a Pi 5
+# 2749 tests, ~90s on a Pi 5
 ```
 
 Lint (CI threshold `--fail-under=9.0`):

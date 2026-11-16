@@ -28,6 +28,8 @@ MIN_INTERVAL_NO_KEY = 6.5
 MIN_INTERVAL_WITH_KEY = 0.7
 
 CACHE_TTL = 24 * 3600        # a CVE list for a product version changes slowly
+PAGE_SIZE = 2000             # the largest page NVD serves
+MAX_PAGES = 3                # 6000 CVEs for one product version is the ceiling
 CACHE_MAX_ENTRIES = 2000
 MAX_SERVICES_PER_SCAN = 25   # bound the NVD calls one scan can cause
 MAX_XML_BYTES = 4 * 1024 * 1024
@@ -241,30 +243,51 @@ class NvdClient:
             pass   # the cache is an optimisation; a read-only disk must not break lookups
 
     # -- transport -----------------------------------------------------
-    def _query(self, cache_key, params):
+    def _call(self, params):
+        """One rate-limited request. Returns (status, body)."""
+        interval = MIN_INTERVAL_WITH_KEY if self._api_key else MIN_INTERVAL_NO_KEY
+        wait = self._last_call + interval - self._clock()
+        if wait > 0:
+            self._sleep(wait)
+        headers = {"apiKey": self._api_key} if self._api_key else {}
+        self._last_call = self._clock()
+        status, body = self._http_get(NVD_URL, params, headers, 30)
+        if status in (403, 429):
+            raise NvdError("NVD rate limit reached. Wait 30 seconds, or set "
+                           "NETWATCH_NVD_API_KEY (free key from nvd.nist.gov).")
+        if status not in (200, 404) or (status == 200 and not isinstance(body, dict)):
+            raise NvdError(f"NVD lookup failed (HTTP {status or 'no response'}). "
+                           "Check outbound HTTPS to services.nvd.nist.gov.")
+        return status, body
+
+    def _query(self, cache_key, params, paged=False):
+        """Cached lookup. With paged=True, follow NVD's paging (PAGE_SIZE per
+        request, at most MAX_PAGES) so a product with many CVEs is not cut off
+        at the first page — the known-exploited one could be on page two."""
         with self._lock:
             self._load_cache()
             hit = self._cache.get(cache_key)
             if hit and self._clock() - hit.get("ts", 0) < CACHE_TTL:
                 return hit["data"], True
-            interval = MIN_INTERVAL_WITH_KEY if self._api_key else MIN_INTERVAL_NO_KEY
-            wait = self._last_call + interval - self._clock()
-            if wait > 0:
-                self._sleep(wait)
-            headers = {"apiKey": self._api_key} if self._api_key else {}
-            self._last_call = self._clock()
-            status, body = self._http_get(NVD_URL, params, headers, 30)
-            if status in (403, 429):
-                raise NvdError("NVD rate limit reached. Wait 30 seconds, or set "
-                               "NETWATCH_NVD_API_KEY (free key from nvd.nist.gov).")
-            if status == 404:
-                data = []          # NVD answers 404 for a CPE name it does not know
-            elif status != 200 or body is None:
-                raise NvdError(f"NVD lookup failed (HTTP {status or 'no response'}). "
-                               "Check outbound HTTPS to services.nvd.nist.gov.")
-            else:
-                data = parse_nvd_response(body)
-            self._cache[cache_key] = {"ts": self._clock(), "data": data}
+            data, missing, start = [], 0, 0
+            for _page in range(MAX_PAGES if paged else 1):
+                query = dict(params)
+                if paged:
+                    query["resultsPerPage"] = PAGE_SIZE
+                    if start:
+                        query["startIndex"] = start
+                status, body = self._call(query)
+                if status == 404:      # NVD answers 404 for a CPE name it does not know
+                    break
+                seen = {f["id"] for f in data}
+                data.extend(f for f in parse_nvd_response(body) if f["id"] not in seen)
+                got = len(body.get("vulnerabilities") or [])
+                total = body.get("totalResults")
+                start += got
+                missing = total - start if isinstance(total, int) and total > start else 0
+                if not paged or not got or not missing:
+                    break
+            self._cache[cache_key] = {"ts": self._clock(), "data": data, "missing": missing}
             self._save_cache()
             return data, False
 
@@ -283,8 +306,18 @@ class NvdClient:
         if not norm:
             raise NvdError("CPE needs vendor, product and a version "
                            "(example: cpe:2.3:a:openbsd:openssh:8.9p1).")
-        data, cached = self._query(f"cpe:{norm}", {"cpeName": norm, "resultsPerPage": 500})
+        data, cached = self._query(f"cpe:{norm}", {"cpeName": norm}, paged=True)
         return rank(data), cached
+
+    def missing_for(self, cpe):
+        """How many CVEs NVD has for this CPE that the last lookup did not
+        fetch (0 when everything was fetched)."""
+        norm = normalize_cpe(cpe)
+        with self._lock:
+            self._load_cache()
+            entry = self._cache.get(f"cpe:{norm}") or {}
+        missing = entry.get("missing", 0)
+        return missing if isinstance(missing, int) and missing > 0 else 0
 
     def lookup_services(self, services, progress=None):
         """Look up every versioned CPE of a scan.

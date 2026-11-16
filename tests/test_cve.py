@@ -139,7 +139,7 @@ class TestNvdClient:
         c.lookup_cpe("cpe:/a:openbsd:openssh:8.9p1")
         url, params, headers = calls[0]
         assert url == "https://services.nvd.nist.gov/rest/json/cves/2.0"
-        assert params == {"cpeName": "cpe:2.3:a:openbsd:openssh:8.9p1:*:*:*:*:*:*:*", "resultsPerPage": 500}
+        assert params == {"cpeName": "cpe:2.3:a:openbsd:openssh:8.9p1:*:*:*:*:*:*:*", "resultsPerPage": 2000}
         assert headers == {"apiKey": "k123"}
 
     def test_no_key_sends_no_header(self):
@@ -360,3 +360,160 @@ class TestGeoCache:
             for i in range(100):
                 netwatch._ipapi_get(f"10.0.0.{i}")
         assert len(netwatch._ipapi_cache) <= 20
+
+
+class TestGeoProviders:
+    def _resp(self, body):
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = body
+        return r
+
+    LITE = {"ip": "8.8.8.8", "asn": "AS15169", "as_name": "Google LLC", "as_domain": "google.com",
+            "country_code": "US", "country": "United States", "continent_code": "NA", "continent": "North America"}
+
+    def test_ipinfo_lite_is_mapped_to_the_common_shape(self, monkeypatch):
+        monkeypatch.delenv("NETWATCH_IPAPI_KEY", raising=False)
+        monkeypatch.setenv("NETWATCH_IPINFO_TOKEN", "t0k&n")
+        with patch("netwatch._proxied_get", return_value=self._resp(self.LITE)) as g:
+            d = netwatch._ipapi_get("8.8.8.8?fields=as,org,isp,query,country,city").json()
+        assert g.call_args[0][0] == "https://api.ipinfo.io/lite/8.8.8.8?token=t0k%26n"
+        assert d == {"status": "success", "query": "8.8.8.8", "country": "United States",
+                     "countryCode": "US", "as": "AS15169 Google LLC", "org": "Google LLC",
+                     "isp": "Google LLC", "source": "IPinfo"}
+
+    def test_ipinfo_lite_feeds_the_real_commands(self, monkeypatch):
+        monkeypatch.delenv("NETWATCH_IPAPI_KEY", raising=False)
+        monkeypatch.setenv("NETWATCH_IPINFO_TOKEN", "tok")
+        with patch("netwatch._proxied_get", return_value=self._resp(self.LITE)):
+            assert netwatch.osint_geolocate("8.8.8.8")["country"] == "United States"
+            assert netwatch.osint_asn("8.8.8.8")["as"] == "AS15169 Google LLC"
+            netwatch._cmd_geo("8.8.8.8")
+        assert any("United States" in c for c in netwatch.console_output)
+
+    def test_ipinfo_lite_own_address_and_names(self, monkeypatch):
+        monkeypatch.delenv("NETWATCH_IPAPI_KEY", raising=False)
+        monkeypatch.setenv("NETWATCH_IPINFO_TOKEN", "tok")
+        with patch("netwatch._proxied_get", return_value=self._resp(self.LITE)) as g:
+            netwatch._ipapi_get("?fields=query", cache=False)
+            assert g.call_args[0][0].startswith("https://api.ipinfo.io/lite/me?token=")
+            g.reset_mock()
+            d = netwatch._ipapi_get("example.com").json()
+        assert d["status"] == "fail" and not g.called
+
+    @pytest.mark.parametrize("bad", [None, "status500", "notjson", "empty"])
+    def test_ipinfo_lite_failures_return_none(self, monkeypatch, bad):
+        monkeypatch.delenv("NETWATCH_IPAPI_KEY", raising=False)
+        monkeypatch.setenv("NETWATCH_IPINFO_TOKEN", "tok")
+        r = MagicMock()
+        r.status_code = 500 if bad == "status500" else 200
+        if bad == "notjson":
+            r.json.side_effect = ValueError
+        else:
+            r.json.return_value = {}
+        with patch("netwatch._proxied_get", return_value=None if bad is None else r):
+            assert netwatch._ipapi_get("8.8.8.8") is None
+
+    def test_paid_key_wins_and_cache_is_per_provider(self, monkeypatch):
+        monkeypatch.setenv("NETWATCH_IPINFO_TOKEN", "tok")
+        monkeypatch.delenv("NETWATCH_IPAPI_KEY", raising=False)
+        assert netwatch._geo_provider() == "ipinfo-lite"
+        with patch("netwatch._proxied_get", return_value=self._resp(self.LITE)) as g:
+            netwatch._ipapi_get("8.8.8.8")
+            monkeypatch.setenv("NETWATCH_IPAPI_KEY", "k")
+            assert netwatch._geo_provider() == "ip-api-pro"
+            netwatch._ipapi_get("8.8.8.8")
+        assert g.call_count == 2 and "pro.ip-api.com" in g.call_args[0][0]
+
+    def test_paid_tier_on_free_endpoint_warns_once(self, monkeypatch):
+        monkeypatch.delenv("NETWATCH_IPAPI_KEY", raising=False)
+        monkeypatch.delenv("NETWATCH_IPINFO_TOKEN", raising=False)
+        with patch("netwatch.tier_at_least", return_value=True), \
+                patch("netwatch._proxied_get", return_value=self._resp({"status": "success"})):
+            netwatch._ipapi_get("1.1.1.1")
+            netwatch._ipapi_get("1.0.0.1")
+        assert sum("non-commercial" in a["msg"] for a in netwatch.alerts) == 1
+
+    def test_free_tier_gets_no_warning(self, monkeypatch):
+        monkeypatch.delenv("NETWATCH_IPAPI_KEY", raising=False)
+        monkeypatch.delenv("NETWATCH_IPINFO_TOKEN", raising=False)
+        with patch("netwatch.tier_at_least", return_value=False), \
+                patch("netwatch._proxied_get", return_value=self._resp({"status": "success"})):
+            netwatch._ipapi_get("1.1.1.1")
+        assert not any("non-commercial" in a["msg"] for a in netwatch.alerts)
+
+
+class TestRealNvdRecords:
+    """Records copied from NVD (see tests/fixtures/nvd_sample.json)."""
+
+    def _body(self):
+        import os
+        with open(os.path.join(os.path.dirname(__file__), "fixtures", "nvd_sample.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_real_records_parse_and_rank(self):
+        out = nc.rank(nc.parse_nvd_response(self._body()))
+        assert [f["id"] for f in out] == ["CVE-2021-44228", "CVE-2023-38408", "CVE-2024-6387"]
+        log4shell = out[0]
+        assert log4shell["kev"] is True and log4shell["kev_added"] == "2021-12-10"
+        assert (log4shell["score"], log4shell["severity"]) == (10.0, "CRITICAL")
+        assert log4shell["published"] == "2021-12-10" and log4shell["summary"].startswith("Apache Log4j2")
+        assert (out[2]["score"], out[2]["severity"], out[2]["kev"]) == (8.1, "HIGH", False)
+        assert nc.summarize(out) == {"total": 3, "kev": 1, "CRITICAL": 2, "HIGH": 1, "MEDIUM": 0, "LOW": 0}
+
+    def test_real_record_through_the_command(self, cve_cmd):
+        run, _ = cve_cmd
+        body = self._body()
+        netwatch._cve_client = nc.NvdClient(lambda *a: (200, body), sleep=lambda s: None)
+        out, _ = run("CVE-2021-44228")
+        assert "10.0 CRITICAL" in out and "EXPLOITED" in out and "since 2021-12-10" in out
+
+
+class TestPaging:
+    def _page(self, ids, total):
+        return (200, {"totalResults": total, "vulnerabilities": [_vuln(i, 5.0, "MEDIUM") for i in ids]})
+
+    def test_follows_pages_until_complete(self):
+        pages = [self._page([f"CVE-2024-{i:04d}" for i in range(1, 2001)], 2003),
+                 (200, {"totalResults": 2003, "vulnerabilities": [
+                     _vuln("CVE-2024-9001", 5.0, "MEDIUM"), _vuln("CVE-2024-9002", 9.8, "CRITICAL", kev="2024-06-01"),
+                     _vuln("CVE-2024-9003", 5.0, "MEDIUM")]})]
+        c, calls, _ = _client(pages, api_key="k")
+        findings, _cached = c.lookup_cpe("cpe:/a:x:y:1.0")
+        assert len(findings) == 2003 and findings[0]["id"] == "CVE-2024-9002"     # the exploited one was on page 2
+        assert [p[1].get("startIndex") for p in calls] == [None, 2000]
+        assert c.missing_for("cpe:/a:x:y:1.0") == 0
+
+    def test_reports_what_was_not_fetched(self, tmp_path):
+        pages = [self._page([f"CVE-202{p}-{i:04d}" for i in range(1, 2001)], 9000) for p in range(nc.MAX_PAGES)]
+        c, calls, _ = _client(pages, tmp_path, api_key="k")
+        findings, _cached = c.lookup_cpe("cpe:/a:x:y:1.0")
+        assert len(calls) == nc.MAX_PAGES and len(findings) == 2000 * nc.MAX_PAGES
+        assert [p[1].get("startIndex") for p in calls] == [None, 2000, 4000]
+        assert c.missing_for("cpe:/a:x:y:1.0") == 9000 - 2000 * nc.MAX_PAGES
+        c2, calls2, _ = _client(pages, tmp_path, api_key="k")        # survives a restart
+        assert c2.missing_for("cpe:/a:x:y:1.0") == 3000 and calls2 == []
+
+    def test_a_repeated_record_is_listed_once(self):
+        same = self._page(["CVE-2024-0001", "CVE-2024-0002"], 6)
+        c, _calls, _ = _client([same], api_key="k")
+        assert [f["id"] for f in c.lookup_cpe("cpe:/a:x:y:1.0")[0]] == ["CVE-2024-0001", "CVE-2024-0002"]
+
+    def test_single_page_makes_one_request(self):
+        c, calls, _ = _client([self._page(["CVE-2024-0001"], 1)])
+        c.lookup_cpe("cpe:/a:x:y:1.0")
+        assert len(calls) == 1 and c.missing_for("cpe:/a:x:y:1.0") == 0
+        assert c.missing_for("cpe:/a:never:seen:1.0") == 0 and c.missing_for("garbage") == 0
+
+    def test_a_failed_page_is_an_error_and_caches_nothing(self):
+        c, calls, _ = _client([self._page(["CVE-2024-0001"] * 1, 5000), (500, None)], api_key="k")
+        with pytest.raises(nc.NvdError):
+            c.lookup_cpe("cpe:/a:x:y:1.0")
+        assert c._cache == {}
+
+    def test_command_says_when_the_list_is_incomplete(self, cve_cmd):
+        run, _ = cve_cmd
+        page = (200, {"totalResults": 9000, "vulnerabilities": [_vuln("CVE-2024-0001", 9.8, "CRITICAL")]})
+        netwatch._cve_client = nc.NvdClient(lambda *a: page, sleep=lambda s: None)
+        out, _ = run("203.0.113.5")
+        assert "more CVE for this version that were not fetched" in out

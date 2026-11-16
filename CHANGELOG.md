@@ -2,18 +2,16 @@
 
 All notable changes to NetWatch are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 1.6.2 - 2026-11-14
+## 1.6.2 - 2026-11-15
 
 ### Security
 - **Dependency floors allowed releases with known advisories.** New floors:
   flask 3.1.3, requests 2.33.0, dnspython 2.9.2, cryptography 50.0.0,
   markupsafe 3.0.0, python-whois 0.9.0. The fixed dnspython needs
   **Python 3.11**, so `requires-python` moves from 3.9 to 3.11.
-- CI now runs the test suite (3.11–3.13) and `pip-audit` on a fresh install
-  and on the exact floors, weekly as well as on push. `publish.yml` runs the
-  tests before it builds. Dependabot is on.
+- Dependabot is on.
 - Site-specific addresses are gone from the shipped whitelist. Add your own
-  with `NETWATCH_WHITELIST`. **If you relied on the old entries, set it.**
+  with `config set whitelist …`. **If you relied on the old entries, set it.**
 - The start-up subnet sweep and the default of `subnet` / `sweep` used a fixed
   `10.0.1.0/24`. They now use the private subnet on the interface and never a
   public or cloud-shared range.
@@ -21,11 +19,17 @@ All notable changes to NetWatch are documented here. Format follows [Keep a Chan
 ### Added
 - **`cve <ip|host|CVE-id|cpe>`** — known CVEs for each product version on a
   host, from the NVD API, with CISA known-exploited entries first. Cached,
-  rate-limited, operator role on the web.
+  rate-limited, follows NVD paging, operator role on the web.
+- **`config`** — saved settings (`settings.env`, mode 0600): API keys,
+  whitelist, radio port, honeypot ports. No environment variables or
+  `sudo -E` needed. Access and program-path settings cannot be saved there.
+- **IPinfo Lite as a geo provider** (`config set ipinfo-token …`): HTTPS, free,
+  commercial use allowed with attribution. The free ip-api.com endpoint stays
+  the default but its terms are non-commercial; a paid tier now gets one alert
+  that says so. Geo lookups are cached for one hour.
+- `mesh connect [port]` and `mesh disconnect`.
 - `help <word>` searches the command reference. An unknown command now
   suggests the nearest real one.
-- `NETWATCH_IPAPI_KEY` selects the ip-api HTTPS endpoint. Geo lookups are
-  cached for one hour.
 
 ### Fixed
 - **Threat scoring covered only the first 20 hosts and ran once per host.**
@@ -36,15 +40,26 @@ All notable changes to NetWatch are documented here. Format follows [Keep a Chan
   connections to (`scan_ports`).
 - Host eviction removed the newest hosts after midnight.
 - 172.17–172.31 (Docker default) were treated as public addresses.
-- **`alert set` and `remote add` saved to the home directory of the user who
-  ran them**, so a webhook saved from the shell was not seen by
-  `sudo netwatch`. Both files now live in the shared config directory, and
-  old files are copied there at start-up.
+- **Mesh radio:** start-up waited on the radio (30 s for each serial device
+  that was not a radio); it now connects in the background. A failed connect
+  says why (permission, port in use, no answer, not found). An unplugged radio
+  is shown as disconnected. Received messages show the node name, not its
+  number. A long alert with multi-byte characters could fail to send; text is
+  now cut at 200 bytes on a character boundary.
 - `alert test` now says why a send failed (HTTP status, DNS, network).
+- `alerts.json` and `remotes.json` ignored `NETWATCH_CONFIG_DIR`. They now
+  follow it like every other file; old files are copied over at start-up.
 - FTP passive mode advertised an arbitrary local address on hosts with more
   than one interface.
 - The Docker image did not include `netwatch_shipper.py`.
 - README stated two licences. The licence is AGPL-3.0.
+- A test (`test_console_roundtrip_with_render_thread`) failed about one run in
+  eight because it read its baseline before taking the render lock.
+
+### Changed
+- The five web pages (1,572 lines of HTML/CSS/JS) moved from `netwatch.py` to
+  `netwatch_web_assets.py`. New code lives in its own modules
+  (`netwatch_cve.py`, `netwatch_settings.py`). NetWatch is no longer one file.
 
 ## 1.6.1 - 2026-09-08
 

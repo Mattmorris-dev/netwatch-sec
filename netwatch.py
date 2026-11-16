@@ -91,6 +91,33 @@ IFACE = _positional[0] if _positional else "wlan0"
 _MODE_FLAGS = {a for a in sys.argv[1:] if a.startswith("--")}
 VERSION = "1.6.2"
 
+NETWATCH_CONFIG_DIR_ENV = "NETWATCH_CONFIG_DIR"
+
+
+def _config_dir():
+    """Where NetWatch keeps config and credentials.
+
+    `sudo netwatch` runs as root, where `~` is /root, while `netwatch cam list`
+    runs as you — so a home-relative path is really two directories and the two
+    never see each other's cameras, users or tokens. NETWATCH_CONFIG_DIR names
+    the one both should use (the launcher points it at the invoking user's
+    home); unset, it stays the historical ~/.config/netwatch. Read at call time
+    so it can be redirected after import. Mirrors netwatch_pro._paths."""
+    return os.path.expanduser(
+        os.environ.get(NETWATCH_CONFIG_DIR_ENV, "").strip() or "~/.config/netwatch")
+
+
+def _config_path(name):
+    return os.path.join(_config_dir(), name)
+
+
+# Saved settings (settings.env in the config dir) go into the environment
+# BEFORE anything below reads it. `sudo` drops NETWATCH_* variables unless you
+# use `sudo -E`; the file makes a setting stick. See: config set <name> <value>
+import netwatch_settings  # noqa: E402  pylint: disable=wrong-import-position
+_SETTINGS_REJECTED = netwatch_settings.load(_config_path("settings.env"))[1]
+
+
 # Honeypot listener ports — overridable via env so deployments can move to
 # standard ports (80/23/21/554) without local sed against the repo.
 # CAP_NET_BIND_SERVICE or root required for ports <1024.
@@ -191,26 +218,6 @@ PRO_ENABLED = current_tier() != "community"
 
 _pro_import_tried = False
 _pro_submods = {}
-
-
-NETWATCH_CONFIG_DIR_ENV = "NETWATCH_CONFIG_DIR"
-
-
-def _config_dir():
-    """Where NetWatch keeps config and credentials.
-
-    `sudo netwatch` runs as root, where `~` is /root, while `netwatch cam list`
-    runs as you — so a home-relative path is really two directories and the two
-    never see each other's cameras, users or tokens. NETWATCH_CONFIG_DIR names
-    the one both should use (the launcher points it at the invoking user's
-    home); unset, it stays the historical ~/.config/netwatch. Read at call time
-    so it can be redirected after import. Mirrors netwatch_pro._paths."""
-    return os.path.expanduser(
-        os.environ.get(NETWATCH_CONFIG_DIR_ENV, "").strip() or "~/.config/netwatch")
-
-
-def _config_path(name):
-    return os.path.join(_config_dir(), name)
 
 
 def _pro_sub(name):
@@ -868,6 +875,55 @@ def _save_alerts_cfg(cfg):
     fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(cfg, f)
+
+
+def _config_lines(parts):
+    """config | config set <name> <value> | config unset <name> -> output lines."""
+    global _cve_client
+    path = _config_path("settings.env")
+    sub = parts[1].lower() if len(parts) > 1 else "show"
+    if sub in ("set", "unset"):
+        if len(parts) < (4 if sub == "set" else 3):
+            return [f"  usage: config set <name> <value>   |   config unset <name>",
+                    f"  {DIM}names: {', '.join(netwatch_settings.SETTINGS)}{RESET}"]
+        env_key = netwatch_settings.resolve(parts[2])
+        if not env_key:
+            return [f"  {RED}Unknown setting '{_ansi_strip(parts[2])[:40]}'.{RESET}",
+                    f"  {DIM}names: {', '.join(netwatch_settings.SETTINGS)}{RESET}"]
+        name = netwatch_settings.short_name(env_key)
+        value = " ".join(parts[3:]) if sub == "set" else None
+        ok, msg = netwatch_settings.save(path, env_key, value)
+        if not ok:
+            return [f"  {RED}{name}: {msg}{RESET}"]
+        if value is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = msg
+            if env_key == "NETWATCH_WHITELIST":
+                _load_user_whitelist(msg)
+        if env_key == "NETWATCH_NVD_API_KEY":
+            _cve_client = None      # the client keeps the key it was built with
+        with _ipapi_lock:
+            _ipapi_cache.clear()    # a different geo provider gives different answers
+        shown = netwatch_settings.mask(env_key, msg) if value is not None else "removed"
+        out = [f"  {GREEN}{name} = {shown}{RESET}  {DIM}(saved in {path}){RESET}"]
+        if env_key in netwatch_settings.NEEDS_RESTART or (value is None and env_key == "NETWATCH_WHITELIST"):
+            out.append(f"  {YELLOW}Restart NetWatch to apply this one.{RESET}")
+        return out
+    if sub not in ("show", "list"):
+        return ["  usage: config   |   config set <name> <value>   |   config unset <name>"]
+    out = [f"  {BOLD}Saved settings{RESET}  {DIM}{path}{RESET}"]
+    for name, shown, source, desc in netwatch_settings.describe(path):
+        value = f"{GREEN}{shown}{RESET} {DIM}({source}){RESET}" if source else f"{DIM}not set{RESET}"
+        out.append(f"  {CYAN}{name:<15}{RESET} {value}")
+        out.append(f"  {'':<15} {DIM}{desc}{RESET}")
+    out.append(f"  {DIM}Change with: config set <name> <value>. The real environment wins over the file.{RESET}")
+    return out
+
+
+def _disp_config(parts):
+    for line in _config_lines(parts):
+        add_console(line)
 
 
 def _webhook_kind(url):
@@ -3668,6 +3724,7 @@ _HELP_SECTIONS = [
         ("proxy rotate", "Toggle rotation"), ("proxy start", "Boot Tor circuits"),
     ]),
     ("Mesh Radio", None, [
+        ("mesh connect [port]", "Connect or reconnect the radio"), ("mesh disconnect", "Release the radio"),
         ("mesh send <text>", "Send message"), ("mesh status", "Connection info"),
         ("mesh nodes", "List nodes"), ("mesh alert on/off", "Toggle forwarding"),
     ]),
@@ -3693,6 +3750,7 @@ _HELP_SECTIONS = [
     ("System", None, [
         ("status", "Service info"), ("dashboard / d", "Return to TUI"),
         ("clear", "Clear screen"), ("help [word]", "This reference, or search it"),
+        ("config [set|unset]", "Saved settings: API keys, whitelist, ports"),
         ("doctor", "Check Python packages + system tools"),
         ("cli / console", "Switch to the command-line / console screen"),
         ("rotate-key", "New Fernet key (invalidate sessions)"),
@@ -3987,7 +4045,7 @@ def handle_command(cmd):
         "sniff": (2, _disp_sniff), "tracked": (2, _disp_tracked),
         "subnet": (1, _disp_subnet), "pcap": (1, _disp_pcap),
         "blockall": (1, _disp_blockall), "tag": (1, _disp_tag), "note": (1, _disp_note),
-        "watch": (1, _disp_watch), "mesh": (1, _disp_mesh), "ifinfo": (1, _disp_ifinfo),
+        "watch": (1, _disp_watch), "mesh": (1, _disp_mesh), "config": (1, _disp_config), "ifinfo": (1, _disp_ifinfo),
         "proxy": (1, _disp_proxy), "replay": (1, _disp_replay),
         "doctor": (1, _disp_doctor), "deps": (1, _disp_doctor), "check": (1, _disp_doctor),
         "expose": (1, _disp_expose), "checkme": (1, _disp_expose),
@@ -6592,17 +6650,38 @@ def _disp_mesh(parts):
             add_console(f"{RED}Message too long (200 char max for LoRa){RESET}"); return
         if mesh_send(text):
             add_console(f"{GREEN}Sent: {text}{RESET}")
+        elif mesh_interface:
+            add_console(f"{RED}Mesh: {_mesh_last_error or 'send failed'}{RESET}")
         else:
-            add_console(f"{RED}Mesh not connected{RESET}")
+            add_console(f"{RED}Mesh not connected — try: mesh connect{RESET}")
+    elif sub == "connect":
+        if not _HAS_MESH:
+            add_console(f"  {YELLOW}Meshtastic is not installed: pip3 install meshtastic{RESET}")
+            return
+        dev = parts[2] if len(parts) >= 3 else None
+        if dev and not re.match(r'^/dev/(tty[A-Za-z]+[0-9]{0,3}|serial/by-(id|path)/[A-Za-z0-9._:\-]{1,120})$', dev):
+            add_console(f"  {RED}Usage: mesh connect [/dev/ttyACM0]{RESET}")
+            return
+        if mesh_interface:
+            _mesh_disconnect()
+        add_console(f"  {CYAN}Mesh: connecting{' on ' + dev if dev else ''}...{RESET}")
+        threading.Thread(target=_mesh_connect, args=(dev,), daemon=True).start()
+    elif sub == "disconnect":
+        add_console(f"  {GREEN}Mesh: disconnected{RESET}" if _mesh_disconnect()
+                    else f"  {DIM}Mesh: not connected{RESET}")
     elif sub == "status":
         if mesh_interface:
-            add_console(f"  {GREEN}Mesh: connected{RESET}")
+            add_console(f"  {GREEN}Mesh: connected{' on ' + _mesh_port if _mesh_port else ''}{RESET}")
             add_console(f"  Nodes: {len(mesh_nodes)}  Messages: {len(mesh_messages)}")
             add_console(f"  Alert forwarding: {'ON' if mesh_alert_fwd else 'OFF'}")
         else:
             add_console(f"  {YELLOW}Mesh: not connected{RESET}")
             if not _HAS_MESH:
                 add_console(f"  {DIM}Install: pip3 install meshtastic{RESET}")
+            else:
+                if _mesh_last_error:
+                    add_console(f"  {DIM}Last attempt: {_mesh_last_error}{RESET}")
+                add_console(f"  {DIM}Try: mesh connect [/dev/ttyACM0]{RESET}")
     elif sub == "nodes":
         if not mesh_nodes:
             add_console(f"  {DIM}No mesh nodes seen yet{RESET}")
@@ -6616,7 +6695,7 @@ def _disp_mesh(parts):
         else:
             add_console(f"  {DIM}Usage: mesh alert on/off{RESET}")
     else:
-        add_console(f"  {DIM}mesh send <text> | mesh status | mesh nodes | mesh alert on/off{RESET}")
+        add_console(f"  {DIM}mesh connect [port] | mesh disconnect | mesh send <text> | mesh status | mesh nodes | mesh alert on/off{RESET}")
 
 def _disp_ifinfo(parts):
     try:
@@ -6909,6 +6988,9 @@ def _cmd_cve(target):
         if netwatch_cve.is_cpe(target):
             findings, _cached = client.lookup_cpe(target)
             _cve_print_findings(target, findings)
+            if client.missing_for(target):
+                add_console(f"  {YELLOW}NVD has {client.missing_for(target)} more CVE for this version "
+                            f"that were not fetched.{RESET}")
             _osint_record("CVE", target, f"{len(findings)} CVE")
             return
         try:
@@ -6933,9 +7015,12 @@ def _cmd_cve(target):
             add_console(f"  {DIM}No NVD key: one lookup each 6.5 s. Set NETWATCH_NVD_API_KEY for 10x speed.{RESET}")
         results, skipped = client.lookup_services(versioned)
         total = kev = 0
-        for svc, _cpe, findings in results:
+        for svc, cpe, findings in results:
             name = _ansi_strip(f"{svc['product']} {svc['version']}".strip()) or svc["service"]
             _cve_print_findings(f"{svc['port']}/{svc['proto']} {name}", findings)
+            if client.missing_for(cpe):
+                add_console(f"  {YELLOW}NVD has {client.missing_for(cpe)} more CVE for this version "
+                            f"that were not fetched; the list above is not complete.{RESET}")
             total += len(findings)
             kev += sum(1 for f in findings if f.get("kev"))
         if skipped:
@@ -7057,32 +7142,98 @@ _IPAPI_TTL = 3600      # an address does not change country within the hour
 _IPAPI_MAX = 2000
 _ipapi_cache = {}      # query -> (epoch, response)
 _ipapi_lock = threading.Lock()
+_geo_terms_warned = False
+
+
+class _GeoResponse:
+    """A provider answer in ip-api's field names, so callers need one shape."""
+    status_code = 200
+
+    def __init__(self, data):
+        self._data = data
+
+    def json(self):
+        return dict(self._data)
+
+
+def _geo_provider():
+    """Which geo service is in use: 'ip-api-pro', 'ipinfo-lite' or 'ip-api-free'."""
+    if os.environ.get("NETWATCH_IPAPI_KEY", "").strip():
+        return "ip-api-pro"
+    if os.environ.get("NETWATCH_IPINFO_TOKEN", "").strip():
+        return "ipinfo-lite"
+    return "ip-api-free"
+
+
+def _ipinfo_lite_get(query, timeout):
+    """IPinfo Lite (free token, HTTPS, no request limit, commercial use allowed
+    with attribution, CC BY-SA 4.0). It gives country and ASN only: no city, no
+    ISP detail, no proxy/hosting flags. Mapped to ip-api field names."""
+    token = os.environ.get("NETWATCH_IPINFO_TOKEN", "").strip()
+    target = urllib.parse.unquote(query.split("?", 1)[0]) or "me"
+    if target != "me":
+        try:
+            target = str(ipaddress.ip_address(target))
+        except ValueError:
+            return _GeoResponse({"status": "fail", "query": target,
+                                 "message": "IPinfo Lite needs an IP address, not a name"})
+    r = _proxied_get(f"https://api.ipinfo.io/lite/{target}"
+                     f"?token={urllib.parse.quote(token, safe='')}", timeout=timeout)
+    if r is None or getattr(r, "status_code", None) != 200:
+        return None
+    try:
+        d = r.json()
+    except Exception:
+        return None
+    if not isinstance(d, dict) or not d.get("ip"):
+        return None
+    asn, name = str(d.get("asn") or ""), str(d.get("as_name") or "")
+    return _GeoResponse({
+        "status": "success", "query": str(d.get("ip")),
+        "country": str(d.get("country") or ""), "countryCode": str(d.get("country_code") or ""),
+        "as": f"{asn} {name}".strip(), "org": name, "isp": name,
+        "source": "IPinfo",
+    })
+
 
 def _ipapi_get(query, timeout=10, cache=True):
-    """GET ip-api.com/json/<query>, with a one-hour cache.
+    """Geo/ASN lookup for `query` ("<ip>[?fields=...]"), with a one-hour cache.
 
-    The free endpoint is plain HTTP, allows 45 requests a minute (then a
-    one-hour ban) and its terms do not allow commercial use. Set
-    NETWATCH_IPAPI_KEY to use the paid HTTPS endpoint instead. The cache keeps
-    batch commands (geoall, fullrecon) inside the free limit."""
-    key = os.environ.get("NETWATCH_IPAPI_KEY", "").strip()
-    if key:
-        sep = "&" if "?" in query else "?"
-        url = f"https://pro.ip-api.com/json/{query}{sep}key={urllib.parse.quote(key, safe='')}"
-    else:
-        url = f"http://ip-api.com/json/{query}"
+    Three providers, picked by environment:
+      NETWATCH_IPAPI_KEY     ip-api.com paid endpoint: HTTPS, full detail.
+      NETWATCH_IPINFO_TOKEN  IPinfo Lite: free, HTTPS, commercial use allowed
+                             with attribution; country + ASN only.
+      (neither)              ip-api.com free endpoint: plain HTTP, 45 requests
+                             a minute, and its terms do NOT allow commercial use.
+    The cache keeps batch commands (geoall, fullrecon) inside the free limit."""
+    global _geo_terms_warned
+    provider = _geo_provider()
     if cache:
         with _ipapi_lock:
-            hit = _ipapi_cache.get(query)
+            hit = _ipapi_cache.get((provider, query))
             if hit and time.time() - hit[0] < _IPAPI_TTL:
                 return hit[1]
-    r = _proxied_get(url, timeout=timeout)
+    if provider == "ipinfo-lite":
+        r = _ipinfo_lite_get(query, timeout)
+    elif provider == "ip-api-pro":
+        key = os.environ.get("NETWATCH_IPAPI_KEY", "").strip()
+        sep = "&" if "?" in query else "?"
+        r = _proxied_get(f"https://pro.ip-api.com/json/{query}{sep}key={urllib.parse.quote(key, safe='')}",
+                         timeout=timeout)
+    else:
+        if not _geo_terms_warned and tier_at_least("pro"):
+            _geo_terms_warned = True
+            with lock:
+                _capped_append(alerts, {"time": datetime.now().strftime("%H:%M:%S"),
+                                        "msg": "Geo lookups use the free ip-api endpoint (non-commercial terms, plain HTTP). "
+                                               "Set NETWATCH_IPINFO_TOKEN (free) or NETWATCH_IPAPI_KEY."}, MAX_ALERTS)
+        r = _proxied_get(f"http://ip-api.com/json/{query}", timeout=timeout)
     if cache and r is not None and getattr(r, "status_code", None) == 200:
         with _ipapi_lock:
             if len(_ipapi_cache) >= _IPAPI_MAX:
                 for old in sorted(_ipapi_cache, key=lambda k: _ipapi_cache[k][0])[:_IPAPI_MAX // 10]:
                     del _ipapi_cache[old]
-            _ipapi_cache[query] = (time.time(), r)
+            _ipapi_cache[(provider, query)] = (time.time(), r)
     return r
 
 def _test_proxy(entry):
@@ -7850,7 +8001,7 @@ def _section_mesh(limit=20):
         lines.append(f"  {DIM}Supported: T-Beam, Heltec, RAK, LilyGo{RESET}")
         if _mesh_last_error:
             lines.append(f"  {DIM}Last attempt: {_mesh_last_error}{RESET}")
-        lines.append(f"  {DIM}Tip: NETWATCH_MESH_PORT=/dev/ttyACM0 to force a device.{RESET}")
+        lines.append(f"  {DIM}Tip: type  mesh connect /dev/ttyACM0  (or set NETWATCH_MESH_PORT).{RESET}")
         return lines
     lines.append(f"  {BOLD}{GREEN}MESH RADIO CONNECTED{RESET}")
     lines.append(f"  {DIM}Nodes: {len(mesh_nodes)}  |  Messages: {len(mesh_messages)}  |  Alert fwd: {'ON' if mesh_alert_fwd else 'OFF'}{RESET}")
@@ -9599,38 +9750,129 @@ def web_timeseries():
 
 # -- MESHTASTIC MESH RADIO
 
-def _mesh_connect():
-    global mesh_interface, _mesh_last_error
+_mesh_connect_lock = threading.Lock()
+_mesh_port = ""          # device the radio is connected on
+MESH_TEXT_MAX_BYTES = 200   # LoRa payload limit is ~230 bytes; leave room for the header
+
+
+def _mesh_candidate_ports(explicit=""):
+    """Serial ports to try, best first. An explicit port wins. Otherwise the
+    Meshtastic library's own list (filtered by USB vendor, so a GPS or an
+    Arduino is not probed), then every USB serial device as a fallback."""
+    import glob
+    if explicit:
+        return [explicit]
+    found = []
+    try:
+        found = [p for p in _meshtastic_lib.util.findPorts(True) if isinstance(p, str)]
+    except Exception:
+        found = []
+    return found or sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+
+
+def _mesh_error_text(port, exc):
+    """A reason the user can act on, from a failed open of `port`."""
+    text = _ansi_strip(str(exc))[:120]
+    low = f"{type(exc).__name__} {text}".lower()
+    if isinstance(exc, PermissionError) or "permission denied" in low:
+        return (f"{port}: permission denied — run with sudo, or add your user to the "
+                f"dialout group (sudo usermod -aG dialout $USER, then log in again)")
+    if "exclusively lock" in low or "busy" in low or "resource temporarily unavailable" in low:
+        return f"{port}: another program has the port open (close the meshtastic CLI or app)"
+    if "timed out" in low or "timeout" in low:
+        return (f"{port}: no answer from a Meshtastic device — wrong port, or the device "
+                f"is still booting; try: mesh connect <port>")
+    if isinstance(exc, FileNotFoundError) or "no such file" in low:
+        return f"{port}: device not found — check the cable and the port name"
+    return f"{port}: {type(exc).__name__}{': ' + text if text else ''}"
+
+
+def _mesh_connect(port=None):
+    """Open the radio. Returns True when connected.
+
+    Slow by nature: the library waits up to 30 s per port for a device to
+    answer, so call this from a background thread (start-up and `mesh connect`
+    do). NETWATCH_MESH_TIMEOUT (default 20 s; library default 300 s) bounds the
+    wait for the radio's config after it has answered."""
+    global mesh_interface, _mesh_last_error, _mesh_port
     if not _HAS_MESH:
         _mesh_last_error = "meshtastic not installed (pip install meshtastic)"
         return False
-    import glob
-    # Explicit device wins (e.g. NETWATCH_MESH_PORT=/dev/ttyACM0 for the LilyGo);
-    # otherwise auto-detect USB serial.
-    explicit = os.environ.get("NETWATCH_MESH_PORT", "").strip()
-    ports = [explicit] if explicit else sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
-    if not ports:
-        _mesh_last_error = "no serial device found — set NETWATCH_MESH_PORT or plug in the device"
-        add_console(f"  {YELLOW}Mesh: {_mesh_last_error}{RESET}")
+    if not _mesh_connect_lock.acquire(blocking=False):
+        _mesh_last_error = "a connect attempt is already running"
         return False
-    last = ""
-    for port in ports:
+    try:
+        explicit = (port or os.environ.get("NETWATCH_MESH_PORT", "")).strip()
+        ports = _mesh_candidate_ports(explicit)
+        if not ports:
+            _mesh_last_error = ("no serial device found — plug in the radio, or name the port: "
+                                "mesh connect /dev/ttyACM0")
+            add_console(f"  {YELLOW}Mesh: {_mesh_last_error}{RESET}")
+            return False
         try:
-            mesh_interface = _mesh_serial.SerialInterface(port)
+            timeout = max(5, min(300, int(os.environ.get("NETWATCH_MESH_TIMEOUT", "20"))))
+        except ValueError:
+            timeout = 20
+        last = ""
+        for dev in ports:
+            try:
+                try:
+                    iface = _mesh_serial.SerialInterface(dev, timeout=timeout)
+                except TypeError:          # older library: no timeout argument
+                    iface = _mesh_serial.SerialInterface(dev)
+            except (Exception, SystemExit) as e:   # the library calls sys.exit() on some errors
+                last = _mesh_error_text(dev, e)
+                continue
+            mesh_interface = iface
+            _mesh_port = dev
             try:
                 from pubsub import pub
                 pub.subscribe(_on_mesh_recv, "meshtastic.receive")
+                pub.subscribe(_on_mesh_lost, "meshtastic.connection.lost")
             except ImportError:
                 pass
             _mesh_last_error = ""
-            add_console(f"  {GREEN}Mesh: connected on {port}{RESET}")
+            add_console(f"  {GREEN}Mesh: connected on {dev}{RESET}")
             return True
-        except Exception as e:
-            last = f"{port}: {type(e).__name__}"
-            continue
-    _mesh_last_error = f"could not open mesh device ({last})"
-    add_console(f"  {YELLOW}Mesh: {_mesh_last_error}{RESET}")
-    return False
+        _mesh_last_error = f"could not open mesh device ({last})"
+        add_console(f"  {YELLOW}Mesh: {_mesh_last_error}{RESET}")
+        return False
+    finally:
+        _mesh_connect_lock.release()
+
+
+def _mesh_disconnect(reason=""):
+    global mesh_interface, _mesh_last_error, _mesh_port
+    iface, mesh_interface = mesh_interface, None
+    _mesh_port = ""
+    if reason:
+        _mesh_last_error = reason
+    if iface is not None:
+        try:
+            iface.close()
+        except Exception:
+            pass
+    return iface is not None
+
+
+def _on_mesh_lost(interface=None, **_kw):
+    """The library reports the radio was unplugged or stopped answering."""
+    if interface is None or interface is mesh_interface:
+        _mesh_disconnect("the radio disconnected — plug it in, then: mesh connect")
+        add_console(f"  {YELLOW}Mesh: {_mesh_last_error}{RESET}")
+
+
+def _mesh_node_name(from_id, fallback):
+    """Long name of a node from the radio's own node list, else the fallback."""
+    try:
+        user = (mesh_interface.nodes or {}).get(from_id, {}).get("user", {})
+        name = user.get("longName") or user.get("shortName")
+        if isinstance(name, str) and name:
+            return name
+    except Exception:
+        pass
+    return fallback
+
 
 def _on_mesh_recv(packet, interface=None):
     decoded = packet.get("decoded", {})
@@ -9638,7 +9880,8 @@ def _on_mesh_recv(packet, interface=None):
     if not text:
         return
     from_id = _ansi_strip(str(packet.get("fromId", "unknown")))
-    from_name = _ansi_strip(str(packet.get("from", from_id)))
+    # "from" is the numeric node number; show the node's name when the radio knows it
+    from_name = _ansi_strip(str(_mesh_node_name(packet.get("fromId"), packet.get("from", from_id))))
     with lock:
         mesh_messages.append({
             "ts": datetime.now().strftime("%H:%M:%S"),
@@ -9661,8 +9904,15 @@ def _on_mesh_recv(packet, interface=None):
             }
 
 def mesh_send(text):
+    global _mesh_last_error
     if not mesh_interface:
+        _mesh_last_error = _mesh_last_error or "not connected — try: mesh connect"
         return False
+    # LoRa limits the payload in BYTES; cut on a character boundary so a
+    # multi-byte character (an emoji, a dash) cannot make the send fail.
+    raw = text.encode("utf-8")
+    if len(raw) > MESH_TEXT_MAX_BYTES:
+        text = raw[:MESH_TEXT_MAX_BYTES].decode("utf-8", errors="ignore")
     try:
         mesh_interface.sendText(text)
         with lock:
@@ -9672,8 +9922,11 @@ def mesh_send(text):
                 "text": text,
                 "type": "sent",
             })
+            if len(mesh_messages) > _MESH_MAX_MSGS:
+                del mesh_messages[:len(mesh_messages) - _MESH_MAX_MSGS]
         return True
-    except Exception:
+    except Exception as e:
+        _mesh_last_error = f"send failed: {type(e).__name__}: {_ansi_strip(str(e))[:100]}"
         return False
 
 def _mesh_forward_alert(msg):
@@ -9699,7 +9952,7 @@ def web_mesh_send():
     if len(text) > 200:
         return jsonify({"error": "message too long (200 char max for LoRa)"})
     ok = mesh_send(text)
-    return jsonify({"ok": ok})
+    return jsonify({"ok": ok} if ok else {"ok": False, "error": _mesh_last_error or "not connected"})
 
 # -- GRAPHQL API (optional)
 
@@ -9933,6 +10186,11 @@ def _cli_subcommand(argv):
     if cmd in ("--version", "-V", "version"):
         print(f"netwatch {VERSION}  (tier: {current_tier()})")
         return 0
+    if cmd == "config":
+        lines = _config_lines(argv)
+        for line in lines:
+            print(line)
+        return 1 if any(RED in line or "usage:" in line for line in lines[:1]) else 0
     try:
         from netwatch_activate import main as _lic_main  # paid add-on only
     except Exception:
@@ -10261,7 +10519,7 @@ def _cli_subcommand(argv):
 
 _CLI_SUBCOMMANDS = ("activate", "register", "license", "status", "collector",
                     "ask", "cam", "join", "users", "report", "audit", "compliance",
-                    "mfa", "apikey", "apikeys", "sso",
+                    "mfa", "apikey", "apikeys", "sso", "config",
                     "--version", "-V", "version")
 
 
@@ -10275,6 +10533,8 @@ def main():
         print(f"{DIM}[*] Moved {', '.join(_migrated)} into {_config_dir()}{RESET}")
     if _WHITELIST_REJECTED:
         print(f"{YELLOW}[!] NETWATCH_WHITELIST: ignored {', '.join(_WHITELIST_REJECTED)}{RESET}")
+    for _bad in _SETTINGS_REJECTED:
+        print(f"{YELLOW}[!] settings.env: {_ansi_strip(_bad)}{RESET}")
     if not HAS_RAW_NET:
         if IS_TERMUX:
             print(f"{YELLOW}[!] Termux detected — running passive mode (honeypots + OSINT + web only).{RESET}")
@@ -10424,11 +10684,10 @@ def main():
 
     # Meshtastic mesh radio
     if _HAS_MESH:
-        mesh_ok = _mesh_connect()
-        if mesh_ok:
-            print(f"  {GREEN}Meshtastic      : connected{RESET}")
-        else:
-            print(f"  {DIM}Meshtastic      : no device found{RESET}")
+        # In the background: a serial device that is not a radio must not
+        # delay start-up. The mesh tab and `mesh status` show the result.
+        threading.Thread(target=_mesh_connect, daemon=True).start()
+        print(f"  {DIM}Meshtastic      : looking for a radio (see: mesh status){RESET}")
     else:
         print(f"  {DIM}Meshtastic      : not installed{RESET}")
 

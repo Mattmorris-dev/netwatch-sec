@@ -18,7 +18,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Patch heavy imports before importing netwatch
 # We need to prevent netwatch from opening raw sockets or binding ports on import
 with patch("subprocess.check_output", return_value="inet 10.0.1.9/24 scope global\ninet 127.0.0.1/8 scope host"):
-    with patch.dict(os.environ, {"WERKZEUG_RUN_MAIN": "true"}):
+    # NETWATCH_CONFIG_DIR: netwatch loads saved settings (settings.env) at
+    # import. Point it at an empty directory so a developer's own saved ports
+    # or keys can never leak into the test run.
+    import tempfile
+    with patch.dict(os.environ, {"WERKZEUG_RUN_MAIN": "true",
+                                 "NETWATCH_CONFIG_DIR": tempfile.mkdtemp(prefix="nwtest-import-")}):
         import netwatch
 
 
@@ -33,6 +38,7 @@ def reset_global_state():
     netwatch.hosts.clear()
     netwatch.dns_cache.clear()
     netwatch._ipapi_cache.clear()
+    netwatch._geo_terms_warned = False
     netwatch._cve_client = None
     netwatch.proto_stats.clear()
     netwatch.tshark_conversations.clear()
