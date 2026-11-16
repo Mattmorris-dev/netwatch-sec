@@ -1,7 +1,7 @@
 # NetWatch — all-in-one network security dashboard (honeypots + capture + OSINT)
 # Headless by default: no TTY in a container, so NetWatch runs the web dashboard
 # and honeypots without the curses UI.
-FROM python:3.12-slim-bookworm
+FROM python:3.15-slim-bookworm
 
 LABEL org.opencontainers.image.title="NetWatch" \
       org.opencontainers.image.description="Honeypots, traffic capture, OSINT, scanning, mesh alerts." \
