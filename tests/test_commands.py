@@ -295,7 +295,8 @@ class TestSubnetCommand:
     @patch("threading.Thread")
     def test_subnet_default(self, mock_thread):
         mock_thread.return_value.start = MagicMock()
-        netwatch.handle_command("subnet")
+        with patch("netwatch._default_cidr", return_value="192.168.1.0/24"):
+            netwatch.handle_command("subnet")
         assert any("Ping sweeping" in c for c in netwatch.console_output)
 
     @patch("threading.Thread")

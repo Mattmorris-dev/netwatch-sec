@@ -4,6 +4,7 @@ import os
 import json
 import time
 import threading
+import pytest
 from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -234,6 +235,7 @@ class TestTUIRenderFix:
         assert len(lines) > 0
 
     def test_section_mesh_with_messages(self):
+        pytest.importorskip("meshtastic")   # optional extra: netwatch-sec[mesh]
         netwatch.mesh_interface = MagicMock()
         netwatch.mesh_messages.append({
             "ts": "12:00", "from": "Node1", "text": "test", "type": "recv"

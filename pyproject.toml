@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netwatch-sec"
-version = "1.6.1"
+version = "1.6.2"
 description = "All-in-one network security dashboard: honeypots, traffic capture, OSINT, scanning, mesh alerts."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [
     { name = "mrrobot", email = "matthewjmorris1993@gmail.com" }
@@ -24,20 +24,19 @@ classifiers = [
     "License :: OSI Approved :: GNU Affero General Public License v3",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Security",
     "Topic :: System :: Networking :: Monitoring",
 ]
 dependencies = [
-    "flask>=2.3.0",
-    "markupsafe>=2.1.0",
-    "requests>=2.28.0",
-    "python-whois>=0.8.0",
-    "dnspython>=2.3.0",
-    "cryptography>=42.0.0",
+    "flask>=3.1.3",
+    "markupsafe>=3.0.0",
+    "requests>=2.33.0",
+    "python-whois>=0.9.0",
+    "dnspython>=2.9.2",
+    "cryptography>=50.0.0",
 ]
 
 [project.optional-dependencies]
@@ -63,7 +62,7 @@ netwatch = "netwatch:main"
 # All four top-level modules must ship: netwatch.py imports replay at import
 # time, and the shipper/crowdsec modules are loaded on demand — a wheel with
 # only "netwatch" breaks on a clean install.
-py-modules = ["netwatch", "replay", "netwatch_shipper", "netwatch_crowdsec"]
+py-modules = ["netwatch", "netwatch_web_assets", "netwatch_settings", "netwatch_cve", "replay", "netwatch_shipper", "netwatch_crowdsec"]
 
 [tool.setuptools.packages.find]
 exclude = ["tests*", "docs*", "logs*", "ftp_root*", ".claude*", "pro_beta*",

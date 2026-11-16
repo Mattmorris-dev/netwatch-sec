@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetWatch v2.0 - Unified Network Security Dashboard
+NetWatch - Unified Network Security Dashboard
 ════════════════════════════════════════════════════
 Modules:
   HONEYPOT  - Fake NVR panel, DVR telnet, RTSP camera, FTP bait
@@ -52,6 +52,8 @@ except ImportError:
     dns = None
 
 import replay  # session-replay data layer (replay.py)
+from netwatch_web_assets import (  # the pages: static HTML/CSS/JS
+    WEB_DASHBOARD_HTML, _CAM_HTML, _LOGIN_HTML, _REPLAY_INDEX_HTML, _REPLAY_PLAYER_HTML)
 
 # ─── Config ──────────────────────────────────────────────
 
@@ -87,7 +89,34 @@ for _i, _a in enumerate(sys.argv[1:]):
     _positional.append(_a)
 IFACE = _positional[0] if _positional else "wlan0"
 _MODE_FLAGS = {a for a in sys.argv[1:] if a.startswith("--")}
-VERSION = "1.6.1"
+VERSION = "1.6.2"
+
+NETWATCH_CONFIG_DIR_ENV = "NETWATCH_CONFIG_DIR"
+
+
+def _config_dir():
+    """Where NetWatch keeps config and credentials.
+
+    `sudo netwatch` runs as root, where `~` is /root, while `netwatch cam list`
+    runs as you — so a home-relative path is really two directories and the two
+    never see each other's cameras, users or tokens. NETWATCH_CONFIG_DIR names
+    the one both should use (the launcher points it at the invoking user's
+    home); unset, it stays the historical ~/.config/netwatch. Read at call time
+    so it can be redirected after import. Mirrors netwatch_pro._paths."""
+    return os.path.expanduser(
+        os.environ.get(NETWATCH_CONFIG_DIR_ENV, "").strip() or "~/.config/netwatch")
+
+
+def _config_path(name):
+    return os.path.join(_config_dir(), name)
+
+
+# Saved settings (settings.env in the config dir) go into the environment
+# BEFORE anything below reads it. `sudo` drops NETWATCH_* variables unless you
+# use `sudo -E`; the file makes a setting stick. See: config set <name> <value>
+import netwatch_settings  # noqa: E402  pylint: disable=wrong-import-position
+_SETTINGS_REJECTED = netwatch_settings.load(_config_path("settings.env"))[1]
+
 
 # Honeypot listener ports — overridable via env so deployments can move to
 # standard ports (80/23/21/554) without local sed against the repo.
@@ -189,26 +218,6 @@ PRO_ENABLED = current_tier() != "community"
 
 _pro_import_tried = False
 _pro_submods = {}
-
-
-NETWATCH_CONFIG_DIR_ENV = "NETWATCH_CONFIG_DIR"
-
-
-def _config_dir():
-    """Where NetWatch keeps config and credentials.
-
-    `sudo netwatch` runs as root, where `~` is /root, while `netwatch cam list`
-    runs as you — so a home-relative path is really two directories and the two
-    never see each other's cameras, users or tokens. NETWATCH_CONFIG_DIR names
-    the one both should use (the launcher points it at the invoking user's
-    home); unset, it stays the historical ~/.config/netwatch. Read at call time
-    so it can be redirected after import. Mirrors netwatch_pro._paths."""
-    return os.path.expanduser(
-        os.environ.get(NETWATCH_CONFIG_DIR_ENV, "").strip() or "~/.config/netwatch")
-
-
-def _config_path(name):
-    return os.path.join(_config_dir(), name)
 
 
 def _pro_sub(name):
@@ -321,6 +330,11 @@ hosts = defaultdict(lambda: {
     "bytes_in": 0, "bytes_out": 0, "packets": 0,
     "ports": set(), "protocols": set(), "first_seen": None, "last_seen": None,
     "hostname": "", "resolved": False, "threat_score": 0, "tags": set(),
+    # scan_ports: LOCAL ports this host opened connections to (TCP SYN, or UDP
+    # from a client port). Scan detection uses this, not "ports": "ports" also
+    # holds our own client ports, so a busy server looked like a scanner.
+    "scan_ports": set(),
+    "last_seen_ts": 0.0,   # epoch seconds; "last_seen" is display text only
 })
 dns_queries = []
 alerts = []
@@ -415,20 +429,37 @@ SCAN_THRESHOLD = 50
 TOR_PORTS = {9001, 9002, 9003, 9030, 9050, 9051, 9150}
 
 # Whitelist
-WHITELIST_SCAN = {
-    "127.0.0.1", "10.0.1.1", "100.66.15.102", "100.85.81.110",
-    "160.79.104.10", "142.251.211.91", "172.253.62.188",
-    "149.154.166.110", "209.177.145.120",
-    "207.251.86.235",  # webcams.nyctmc.org - LocalTipoff
-}
+# Shipped defaults hold only loopback and large CDN/Google ranges. Addresses
+# that belong to one site (your router, VPN peers, services you use) go in
+#   NETWATCH_WHITELIST=198.51.100.7,203.0.113.     (a trailing "." = prefix)
+WHITELIST_SCAN = {"127.0.0.1"}
 WHITELIST_PREFIXES = (
     "216.239.", "104.16.", "104.17.", "104.18.", "199.232.",
     "151.101.", "142.250.", "142.251.", "172.253.", "172.217.",
-    "207.251.",  # NYC DOT camera range
     "18.238.",   # CloudFront
     "18.155.",   # CloudFront
     "108.138.",  # CloudFront
 )
+
+def _load_user_whitelist(raw=None):
+    """Add NETWATCH_WHITELIST entries. Returns the entries that were rejected."""
+    global WHITELIST_PREFIXES
+    raw = os.environ.get("NETWATCH_WHITELIST", "") if raw is None else raw
+    bad = []
+    for item in (x.strip() for x in raw.split(",")):
+        if not item:
+            continue
+        if item.endswith(".") and re.fullmatch(r"(\d{1,3}\.){1,3}", item):
+            if item not in WHITELIST_PREFIXES:
+                WHITELIST_PREFIXES = WHITELIST_PREFIXES + (item,)
+            continue
+        try:
+            WHITELIST_SCAN.add(str(ipaddress.ip_address(item)))
+        except ValueError:
+            bad.append(item)
+    return bad
+
+_WHITELIST_REJECTED = _load_user_whitelist()
 
 # Known services for OSINT enrichment
 KNOWN_SERVICES = {
@@ -449,10 +480,45 @@ def get_local_ips():
             if "inet " in line:
                 ips.add(line.strip().split()[1].split("/")[0])
     except Exception:
-        ips.add("10.0.1.9")
+        ips.add("127.0.0.1")
     return ips
 
 LOCAL_IPS = get_local_ips()
+
+def _is_private_ip(ip):
+    """True for RFC 1918, loopback, link-local and CGNAT (100.64/10) IPv4.
+    String checks only: this runs for every packet."""
+    if ip.startswith(("10.", "192.168.", "127.", "169.254.")):
+        return True
+    if ip.startswith(("172.", "100.")):
+        try:
+            second = int(ip.split(".", 2)[1])
+        except (ValueError, IndexError):
+            return False
+        return 16 <= second <= 31 if ip[1] == "7" else 64 <= second <= 127
+    return False
+
+def _default_cidr(max_hosts_prefix=22):
+    """The private subnet on IFACE, or None. Only home/office-sized private
+    networks qualify (/22 or smaller): a default must never sweep a public
+    range or a cloud provider's shared /16."""
+    try:
+        out = subprocess.check_output(["ip", "-4", "-o", "addr", "show", "dev", IFACE],
+                                      text=True, timeout=5, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    for tok in str(out).split():
+        if "/" not in tok:
+            continue
+        try:
+            iface = ipaddress.ip_interface(tok)
+        except ValueError:
+            continue
+        if (iface.version == 4 and _is_private_ip(str(iface.ip))
+                and not iface.ip.is_loopback and not iface.ip.is_link_local
+                and iface.network.prefixlen >= max_hosts_prefix):
+            return str(iface.network)
+    return None
 
 # ─── OSINT Enrichment ───────────────────────────────────
 
@@ -475,45 +541,79 @@ KNOWN_INFRA = ("cloudfront", "google", "amazon", "aws", "telegram",
                "microsoft", "apple", "akamai", "fastly",
                "cloudflare", "github", "facebook", "meta", "netflix")
 
-def enrich_host(ip):
+def score_host(ip):
+    """Apply the port-behaviour rules to one host. Safe to call again and
+    again: a rule adds its points one time, when it first matches, so the
+    score follows a host that starts to scan after it was first seen.
+    Call with `lock` held when the sniffer is running."""
     h = hosts[ip]
-    if h.get("_enriched"):
+    if _is_private_ip(ip) or ip in LOCAL_IPS or is_whitelisted(ip):
         return
-    hostname = resolve_host(ip)
-    h["hostname"] = hostname
-    h["resolved"] = True
-    h["tags"] = set()
-
-    is_known = any(k in hostname.lower() for k in KNOWN_INFRA) if hostname else False
-    is_local = ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("172.16.") or ip in LOCAL_IPS
-
-    if "cloudfront" in hostname:
-        h["tags"].add("CDN")
-    elif "google" in hostname:
-        h["tags"].add("Google")
-    elif "amazon" in hostname or "aws" in hostname:
-        h["tags"].add("AWS")
-    elif "telegram" in hostname:
-        h["tags"].add("Telegram")
-
-    # NOTE: is_known is based on reverse DNS which is attacker-controllable.
-    # We still tag for DISPLAY, but NEVER skip threat scoring based on PTR alone.
-    # Only truly local IPs and hardcoded whitelisted IPs skip scoring.
-    if is_local or is_whitelisted(ip):
-        h["_enriched"] = True
-        return
-
-    port_count = len(h["ports"])
-    if port_count > SCAN_THRESHOLD:
+    applied = h.setdefault("_scored", set())
+    if "SCANNER" not in applied and len(h.get("scan_ports") or ()) > SCAN_THRESHOLD:
+        applied.add("SCANNER")
         h["tags"].add("SCANNER")
         h["threat_score"] += 30
-    if h["ports"] & SUS_PORTS:
+    if "SUS-PORT" not in applied and h["ports"] & SUS_PORTS:
+        applied.add("SUS-PORT")
         h["tags"].add("SUS-PORT")
         h["threat_score"] += 20
     if h["ports"] & {23, 3389}:
         h["tags"].add("REMOTE-ACCESS")
 
-    h["_enriched"] = True
+def enrich_host(ip):
+    """Resolve the hostname one time (blocking DNS — never call with `lock`
+    held), add display tags, then score."""
+    h = hosts[ip]
+    try:
+        if h.get("_enriched"):
+            return
+        hostname = resolve_host(ip)
+        with lock:
+            h["hostname"] = hostname
+            h["resolved"] = True
+            # Reverse DNS is attacker-controllable: these tags are for DISPLAY
+            # only and never skip scoring.
+            if "cloudfront" in hostname:
+                h["tags"].add("CDN")
+            elif "google" in hostname:
+                h["tags"].add("Google")
+            elif "amazon" in hostname or "aws" in hostname:
+                h["tags"].add("AWS")
+            elif "telegram" in hostname:
+                h["tags"].add("Telegram")
+            h["_enriched"] = True
+            score_host(ip)
+    finally:
+        h.pop("_enriching", None)
+
+_ENRICH_BATCH = 20        # hostname lookups started per maintenance pass
+_ENRICH_MAX_ACTIVE = 40   # lookups allowed in flight (slow DNS must not pile up threads)
+
+def _maintain_hosts():
+    """Housekeeping, about every 1.5 s: cap alerts and hosts, re-score every
+    host, and start hostname lookups for hosts that have none yet."""
+    with lock:
+        if len(alerts) > MAX_ALERTS:
+            del alerts[:len(alerts) - MAX_ALERTS]
+        if len(hosts) > MAX_HOSTS:
+            oldest = sorted(hosts, key=lambda k: hosts[k].get("last_seen_ts") or 0.0)
+            for k in oldest[:len(hosts) - MAX_HOSTS]:
+                del hosts[k]
+        active = 0
+        pending = []
+        for ip, h in list(hosts.items()):
+            score_host(ip)
+            if h.get("_enriching"):
+                active += 1
+            elif not h.get("_enriched"):
+                pending.append(ip)
+        pending = pending[:max(0, min(_ENRICH_BATCH, _ENRICH_MAX_ACTIVE - active))]
+        for ip in pending:
+            hosts[ip]["_enriching"] = True
+    for ip in pending:
+        threading.Thread(target=enrich_host, args=(ip,), daemon=True).start()
+    return len(pending)
 
 # ─── Logging ─────────────────────────────────────────────
 
@@ -723,7 +823,38 @@ _alert_last_global = 0.0
 
 
 def _alerts_cfg_path():
-    return os.path.join(os.path.expanduser("~"), ".config", "netwatch", "alerts.json")
+    # The shared config dir, not "~": `sudo netwatch` and `netwatch alert set`
+    # run as different users, and a home-relative path gave each its own file,
+    # so a webhook saved by one was never seen by the other.
+    return _config_path("alerts.json")
+
+
+def _migrate_legacy_config():
+    """Copy alerts.json / remotes.json from this user's ~/.config/netwatch into
+    the shared config dir when the shared dir has none. Returns names copied."""
+    legacy = os.path.join(os.path.expanduser("~"), ".config", "netwatch")
+    target = _config_dir()
+    moved = []
+    try:
+        if os.path.realpath(legacy) == os.path.realpath(target):
+            return moved
+    except OSError:
+        return moved
+    for name in ("alerts.json", "remotes.json"):
+        src, dst = os.path.join(legacy, name), os.path.join(target, name)
+        try:
+            if not os.path.isfile(src) or os.path.exists(dst):
+                continue
+            with open(src, "rb") as f:
+                data = f.read(1024 * 1024)
+            os.makedirs(target, exist_ok=True, mode=0o700)
+            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            moved.append(name)
+        except OSError:
+            continue
+    return moved
 
 
 def _load_alerts_cfg():
@@ -746,6 +877,55 @@ def _save_alerts_cfg(cfg):
         json.dump(cfg, f)
 
 
+def _config_lines(parts):
+    """config | config set <name> <value> | config unset <name> -> output lines."""
+    global _cve_client
+    path = _config_path("settings.env")
+    sub = parts[1].lower() if len(parts) > 1 else "show"
+    if sub in ("set", "unset"):
+        if len(parts) < (4 if sub == "set" else 3):
+            return [f"  usage: config set <name> <value>   |   config unset <name>",
+                    f"  {DIM}names: {', '.join(netwatch_settings.SETTINGS)}{RESET}"]
+        env_key = netwatch_settings.resolve(parts[2])
+        if not env_key:
+            return [f"  {RED}Unknown setting '{_ansi_strip(parts[2])[:40]}'.{RESET}",
+                    f"  {DIM}names: {', '.join(netwatch_settings.SETTINGS)}{RESET}"]
+        name = netwatch_settings.short_name(env_key)
+        value = " ".join(parts[3:]) if sub == "set" else None
+        ok, msg = netwatch_settings.save(path, env_key, value)
+        if not ok:
+            return [f"  {RED}{name}: {msg}{RESET}"]
+        if value is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = msg
+            if env_key == "NETWATCH_WHITELIST":
+                _load_user_whitelist(msg)
+        if env_key == "NETWATCH_NVD_API_KEY":
+            _cve_client = None      # the client keeps the key it was built with
+        with _ipapi_lock:
+            _ipapi_cache.clear()    # a different geo provider gives different answers
+        shown = netwatch_settings.mask(env_key, msg) if value is not None else "removed"
+        out = [f"  {GREEN}{name} = {shown}{RESET}  {DIM}(saved in {path}){RESET}"]
+        if env_key in netwatch_settings.NEEDS_RESTART or (value is None and env_key == "NETWATCH_WHITELIST"):
+            out.append(f"  {YELLOW}Restart NetWatch to apply this one.{RESET}")
+        return out
+    if sub not in ("show", "list"):
+        return ["  usage: config   |   config set <name> <value>   |   config unset <name>"]
+    out = [f"  {BOLD}Saved settings{RESET}  {DIM}{path}{RESET}"]
+    for name, shown, source, desc in netwatch_settings.describe(path):
+        value = f"{GREEN}{shown}{RESET} {DIM}({source}){RESET}" if source else f"{DIM}not set{RESET}"
+        out.append(f"  {CYAN}{name:<15}{RESET} {value}")
+        out.append(f"  {'':<15} {DIM}{desc}{RESET}")
+    out.append(f"  {DIM}Change with: config set <name> <value>. The real environment wins over the file.{RESET}")
+    return out
+
+
+def _disp_config(parts):
+    for line in _config_lines(parts):
+        add_console(line)
+
+
 def _webhook_kind(url):
     if "discord.com/api/webhooks" in url or "discordapp.com/api/webhooks" in url:
         return "discord"
@@ -764,19 +944,32 @@ def _sanitize_alert_field(s, cap=256):
     return s[:cap].strip()
 
 
+_last_webhook_error = ""
+
+
 def _send_webhook(url, title, msg):
-    """POST one alert. Fails closed on non-https or internal/blocked hosts."""
-    if not req_lib or not url:
+    """POST one alert. Fails closed on non-https or internal/blocked hosts.
+    The reason for a failure is kept in _last_webhook_error."""
+    global _last_webhook_error
+    _last_webhook_error = ""
+    if not req_lib:
+        _last_webhook_error = "the 'requests' package is not installed"
+        return False
+    if not url:
+        _last_webhook_error = "no webhook is set"
         return False
     from urllib.parse import urlparse
     parsed = urlparse(url)
     if parsed.scheme != "https":
+        _last_webhook_error = "the webhook URL is not https://"
         return False
     host = parsed.hostname
     if not host:
+        _last_webhook_error = "the webhook URL has no host name"
         return False
     ip, _reason = _resolve_safe(host)   # SSRF guard: blocks internal/link-local
     if not ip:
+        _last_webhook_error = f"cannot use host {_sanitize_alert_field(host, 80)}: {_reason or 'no DNS answer'}"
         return False
     kind = _webhook_kind(url)
     text = f"🛰 NetWatch: {_sanitize_alert_field(title, 120)} — {_sanitize_alert_field(msg, 300)}"
@@ -790,8 +983,15 @@ def _send_webhook(url, title, msg):
         payload = {"title": _sanitize_alert_field(title, 120), "text": text[:2000]}
     try:
         r = req_lib.post(url, json=payload, timeout=5)
-        return 200 <= r.status_code < 300
-    except Exception:
+        if 200 <= r.status_code < 300:
+            return True
+        hint = {401: " (the webhook token is wrong)", 403: " (the webhook token is wrong)",
+                404: " (the webhook was deleted or the URL is wrong)",
+                429: " (rate limited; wait a minute)"}.get(r.status_code, "")
+        _last_webhook_error = f"the service answered HTTP {r.status_code}{hint}"
+        return False
+    except Exception as e:
+        _last_webhook_error = f"network error: {_safe_error(e)}"
         return False
 
 
@@ -807,7 +1007,7 @@ _REMOTE_RESERVED = frozenset({"add", "rm", "remove", "list", "ls", "del", "delet
 
 
 def _remotes_cfg_path():
-    return os.path.join(os.path.expanduser("~"), ".config", "netwatch", "remotes.json")
+    return _config_path("remotes.json")   # shared dir: see _alerts_cfg_path
 
 
 def _load_remotes():
@@ -1602,10 +1802,20 @@ def handle_ftp(client, addr):
                 p1 = pasv_port >> 8
                 p2 = pasv_port & 0xFF
                 # Get our IP for the response
+                our_ip = None
                 try:
-                    our_ip = [x for x in LOCAL_IPS if not x.startswith("127") and ":" not in x][0]
-                except IndexError:
-                    our_ip = "10.0.1.9"
+                    # The address the client reached us on is the one it can
+                    # reach again; LOCAL_IPS order is arbitrary on a host with
+                    # several interfaces (VPN, Docker).
+                    _ctl = client.getsockname()[0]
+                    if isinstance(_ctl, str) and ipaddress.ip_address(_ctl).version == 4 \
+                            and not _ctl.startswith(("0.", "127.")):
+                        our_ip = _ctl
+                except Exception:
+                    our_ip = None
+                if not our_ip:
+                    _cands = sorted(x for x in LOCAL_IPS if not x.startswith("127") and ":" not in x)
+                    our_ip = _cands[0] if _cands else "127.0.0.1"
                 ip_parts = our_ip.replace(".", ",")
                 send(f"227 Entering Passive Mode ({ip_parts},{p1},{p2}).")
                 ftp_log("PASV", f"port {pasv_port}")
@@ -2244,17 +2454,7 @@ def parse_dns(data):
         return None
 
 def _is_benign(ip):
-    if ip in LOCAL_IPS or is_whitelisted(ip):
-        return True
-    if ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("172.16."):
-        return True
-    if ip.startswith("100."):
-        try:
-            if ipaddress.ip_address(ip) in ipaddress.ip_network("100.64.0.0/10"):
-                return True
-        except ValueError:
-            pass
-    return False
+    return ip in LOCAL_IPS or _is_private_ip(ip) or is_whitelisted(ip)
 
 def check_suspicious(src_ip, dst_ip, src_port, dst_port):
     if _is_benign(src_ip) and _is_benign(dst_ip):
@@ -2267,8 +2467,11 @@ def check_suspicious(src_ip, dst_ip, src_port, dst_port):
                 if alert not in [a["msg"] for a in alerts[-20:]]:
                     alerts.append({"time": now_str, "msg": alert})
         for ip in (src_ip, dst_ip):
-            if not _is_benign(ip) and len(hosts[ip]["ports"]) > SCAN_THRESHOLD:
-                alert = f"PORT SCAN: {ip} ({len(hosts[ip]['ports'])} ports)"
+            if ip not in hosts or _is_benign(ip):
+                continue
+            probed = len(hosts[ip].get("scan_ports") or ())
+            if probed > SCAN_THRESHOLD:
+                alert = f"PORT SCAN: {ip} ({probed} ports)"
                 if alert not in [a["msg"] for a in alerts[-20:]]:
                     alerts.append({"time": now_str, "msg": alert})
 
@@ -2284,6 +2487,8 @@ def traffic_monitor():
                            "msg": f"Sniffer error: {e}"})
         return
 
+    last_sec = 0
+    now_str = ""
     while True:
         try:
             data, _ = sock.recvfrom(65535)
@@ -2297,12 +2502,22 @@ def traffic_monitor():
             continue
 
         protocol, src_ip, dst_ip, pkt_len, ip_payload = parse_ip(eth_payload)
-        now_str = datetime.now().strftime("%H:%M:%S")
+        now_ts = time.time()
+        if int(now_ts) != last_sec:          # format the clock once per second
+            last_sec = int(now_ts)
+            now_str = time.strftime("%H:%M:%S", time.localtime(now_ts))
 
         src_port = dst_port = 0
         dns_domain = None
+        opens_conn = False   # this packet starts a connection toward dst_port
         if protocol in (6, 17):
             src_port, dst_port = parse_ports(ip_payload)
+            if protocol == 6:
+                # SYN set, ACK clear = a new inbound attempt (replies carry ACK)
+                opens_conn = len(ip_payload) > 13 and (ip_payload[13] & 0x12) == 0x02
+            else:
+                # UDP has no handshake: a packet from a client port to us
+                opens_conn = src_port >= 1024 and dst_port != 0
             if protocol == 17 and dst_port == 53 and len(ip_payload) > 20:
                 dns_domain = parse_dns(ip_payload[8:])
                 if dns_domain and len(dns_domain) <= 3:
@@ -2323,15 +2538,21 @@ def traffic_monitor():
                 hosts[src_ip]["bytes_in"] += pkt_len
             for ip in (src_ip, dst_ip):
                 if ip not in LOCAL_IPS:
-                    hosts[ip]["packets"] += 1
-                    hosts[ip]["last_seen"] = now_str
-                    if not hosts[ip]["first_seen"]:
-                        hosts[ip]["first_seen"] = now_str
-                    if len(hosts[ip]["ports"]) < 500:
+                    h = hosts[ip]
+                    h["packets"] += 1
+                    h["last_seen"] = now_str
+                    h["last_seen_ts"] = now_ts
+                    if not h["first_seen"]:
+                        h["first_seen"] = now_str
+                    if len(h["ports"]) < 500:
                         if src_port:
-                            hosts[ip]["ports"].add(src_port)
+                            h["ports"].add(src_port)
                         if dst_port:
-                            hosts[ip]["ports"].add(dst_port)
+                            h["ports"].add(dst_port)
+            if opens_conn and dst_ip in LOCAL_IPS and src_ip not in LOCAL_IPS:
+                probed = hosts[src_ip]["scan_ports"]
+                if len(probed) < 500:
+                    probed.add(dst_port)
 
         check_suspicious(src_ip, dst_ip, src_port, dst_port)
 
@@ -2360,7 +2581,7 @@ def osint_geolocate(target):
             return {"error": "private IP — no geolocation"}
     except ValueError:
         pass
-    r = _proxied_get(f"http://ip-api.com/json/{urllib.parse.quote(target, safe='')}", timeout=10)
+    r = _ipapi_get(urllib.parse.quote(target, safe=''), timeout=10)
     if not r:
         return {"error": "request failed (install requests or check proxy)"}
     try:
@@ -2775,7 +2996,7 @@ def osint_ssl(target, port=443):
                             try:
                                 fmt = "%b %d %H:%M:%S %Y %Z"
                                 not_after = datetime.strptime(cert["notAfter"], fmt)
-                                result["days_left"] = (not_after - datetime.utcnow()).days
+                                result["days_left"] = (not_after - datetime.now(timezone.utc).replace(tzinfo=None)).days
                             except Exception:
                                 pass
             except ssl.SSLCertVerificationError:
@@ -2930,7 +3151,7 @@ def osint_trace_enriched(target):
                 try:
                     addr = ipaddress.ip_address(ip)
                     if not addr.is_private and geo_count < max_geo:
-                        geo = _proxied_get(f"http://ip-api.com/json/{ip}?fields=city,country,isp,as", timeout=3)
+                        geo = _ipapi_get(f"{ip}?fields=city,country,isp,as", timeout=3)
                         geo_count += 1
                         if geo:
                             gdata = geo.json()
@@ -2972,7 +3193,7 @@ def osint_asn(ip):
         ipaddress.ip_address(ip)
     except ValueError:
         return {"error": "invalid IP address"}
-    r = _proxied_get(f"http://ip-api.com/json/{ip}?fields=as,org,isp,query,country,city", timeout=10)
+    r = _ipapi_get(f"{ip}?fields=as,org,isp,query,country,city", timeout=10)
     if not r:
         return {"error": "request failed"}
     try:
@@ -2990,7 +3211,7 @@ def osint_abuse(ip):
     if r:
         attacks = r.text.strip()
         result["blocklist_de"] = attacks if attacks else "clean"
-    r2 = _proxied_get(f"http://ip-api.com/json/{ip}?fields=proxy,hosting,mobile,query", timeout=8)
+    r2 = _ipapi_get(f"{ip}?fields=proxy,hosting,mobile,query", timeout=8)
     if r2:
         try:
             d = r2.json()
@@ -3451,6 +3672,7 @@ _HELP_SECTIONS = [
     ]),
     ("Scanning", None, [
         ("scan <ip>", "Quick nmap"), ("deep <ip>", "Full + vulns"),
+        ("cve <ip|CVE-id>", "Known CVEs, exploited first"),
         ("stealth <ip>", "Tor scan"), ("recon <ip>", "Full OSINT profile"),
         ("banner <ip> <p>", "Grab banner"), ("trace <ip>", "Traceroute"),
         ("fullrecon <ip>", "7-phase chain"), ("sweep [cidr]", "ARP+ping+scan"),
@@ -3470,12 +3692,14 @@ _HELP_SECTIONS = [
     ]),
     ("Attack Analysis", None, [
         ("inspect [n]", "Honeypot event"), ("analyze <ip>", "Attacker profile"),
+        ("replay [list|<n>]", "Replay a captured attacker session"),
         ("decode <data>", "Decode payload"), ("sessions", "Attacker IPs"),
         ("attackers", "Honeypot IPs"), ("profile <ip>", "Recon report"),
         ("timeline <ip>", "Event history"), ("report <ip>", "Save report"),
     ]),
     ("Tracking", None, [
         ("track <ip> [s]", "Live packet tail"), ("untrack <ip>", "Stop tracking"),
+        ("tracking", "List active tracks"),
         ("conns <ip>", "TCP connections"), ("sniff <ip> [s]", "Payload capture"),
         ("trackdns <ip>", "DNS queries"), ("tracked <ip>", "Summary"),
     ]),
@@ -3500,6 +3724,7 @@ _HELP_SECTIONS = [
         ("proxy rotate", "Toggle rotation"), ("proxy start", "Boot Tor circuits"),
     ]),
     ("Mesh Radio", None, [
+        ("mesh connect [port]", "Connect or reconnect the radio"), ("mesh disconnect", "Release the radio"),
         ("mesh send <text>", "Send message"), ("mesh status", "Connection info"),
         ("mesh nodes", "List nodes"), ("mesh alert on/off", "Toggle forwarding"),
     ]),
@@ -3517,11 +3742,17 @@ _HELP_SECTIONS = [
         ("mfa [enroll|confirm|…]", "Two-factor logins, lockouts, sign-out-everywhere (Enterprise)"),
         ("apikey [new|revoke]", "Scoped API keys for programmatic access (Enterprise)"),
         ("sso [test]", "Single sign-on via your IdP — OpenID Connect (Enterprise)"),
+        ("users [add|…]", "Team accounts for the web dashboard (Business)"),
+        ("audit [verify]", "Tamper-evident action log (Enterprise)"),
+        ("compliance [pdf]", "Control-coverage report (Enterprise)"),
         ("license", "Show tier / license status"),
     ]),
     ("System", None, [
         ("status", "Service info"), ("dashboard / d", "Return to TUI"),
-        ("clear", "Clear screen"), ("help", "This reference"),
+        ("clear", "Clear screen"), ("help [word]", "This reference, or search it"),
+        ("config [set|unset]", "Saved settings: API keys, whitelist, ports"),
+        ("doctor", "Check Python packages + system tools"),
+        ("cli / console", "Switch to the command-line / console screen"),
         ("rotate-key", "New Fernet key (invalidate sessions)"),
         ("rotate-token", "New web auth token"),
         ("show-token", "Print current web auth token + file path"),
@@ -3548,6 +3779,38 @@ def _help_to_console():
                 add_console(f"  {cmd:<20s} {desc}")
             else:
                 add_console(f"  {desc}")
+
+
+def _help_search(term):
+    """help <word>: the help entries whose command or description has the word."""
+    term = _ansi_strip(term).lower()[:40]
+    hits = [(cat, cmd, desc) for cat, _sub, cmds in _HELP_SECTIONS
+            for cmd, desc in cmds if cmd and (term in cmd.lower() or term in desc.lower())]
+    if not hits:
+        add_console(f"{YELLOW}No help entry has '{term}'.{RESET}{_did_you_mean(term)}")
+        return
+    add_console(f"{BOLD}{len(hits)} help entries for '{term}':{RESET}")
+    for cat, cmd, desc in hits:
+        add_console(f"  {GREEN}{cmd:<26s}{RESET} {desc}  {DIM}[{cat}]{RESET}")
+
+
+def _help_command_words():
+    """The first word of every command in the help table (both sides of a/b)."""
+    words = set()
+    for _cat, _sub, cmds in _HELP_SECTIONS:
+        for cmd, _desc in cmds:
+            head = cmd.split(" <")[0].split(" [")[0]
+            for alt in head.split("/"):
+                if alt.split():
+                    words.add(alt.split()[0])
+    return words
+
+
+def _did_you_mean(word):
+    """' Did you mean: a, b?' for a mistyped command, or ''."""
+    import difflib
+    close = difflib.get_close_matches(word, sorted(_help_command_words() | _TAB_NAMES), n=3, cutoff=0.7)
+    return f" Did you mean: {', '.join(close)}?" if close else ""
 
 
 def _help_to_print():
@@ -3753,6 +4016,7 @@ def handle_command(cmd):
         "diffarp":    (1, None,                    _cmd_diffarp,      f"{BOLD}{YELLOW}ARP TABLE DIFF — checking for changes...{RESET}"),
         "sweep":      (1, None,                    _cmd_sweep,        f"{BOLD}{RED}NETWORK SWEEP — ARP + ping + scan...{RESET}"),
         "speed":      (1, None,                    _cmd_speed,        ""),
+        "cve":        (2, r'^[A-Za-z0-9][A-Za-z0-9.\-:/_~*%+!]*$', _cmd_cve, f"{CYAN}CVE lookup: {{}}...{RESET}"),
     }
     if action in _SIMPLE_THREAD_CMDS and len(parts) >= _SIMPLE_THREAD_CMDS[action][0]:
         min_args, pattern, func, msg = _SIMPLE_THREAD_CMDS[action]
@@ -3781,7 +4045,7 @@ def handle_command(cmd):
         "sniff": (2, _disp_sniff), "tracked": (2, _disp_tracked),
         "subnet": (1, _disp_subnet), "pcap": (1, _disp_pcap),
         "blockall": (1, _disp_blockall), "tag": (1, _disp_tag), "note": (1, _disp_note),
-        "watch": (1, _disp_watch), "mesh": (1, _disp_mesh), "ifinfo": (1, _disp_ifinfo),
+        "watch": (1, _disp_watch), "mesh": (1, _disp_mesh), "config": (1, _disp_config), "ifinfo": (1, _disp_ifinfo),
         "proxy": (1, _disp_proxy), "replay": (1, _disp_replay),
         "doctor": (1, _disp_doctor), "deps": (1, _disp_doctor), "check": (1, _disp_doctor),
         "expose": (1, _disp_expose), "checkme": (1, _disp_expose),
@@ -3861,7 +4125,10 @@ def handle_command(cmd):
         app_state.cli_scroll = 0
         app_state.console_scroll = 0
     elif action == "help":
-        _help_to_console()
+        if len(parts) >= 2:
+            _help_search(parts[1])
+        else:
+            _help_to_console()
     elif action == "status":
         _disp_summary(parts)
     elif action in ("rotate-key", "rotatekey"):
@@ -3875,7 +4142,7 @@ def handle_command(cmd):
     elif action in ("restart-tunnel", "restarttunnel", "change-tunnel", "changetunnel", "new-tunnel"):
         _disp_restart_tunnel()
     else:
-        add_console(f"{RED}Unknown: '{action}'. Type 'help' for commands.{RESET}")
+        add_console(f"{RED}Unknown: '{action}'.{_did_you_mean(action)} Type 'help' for commands.{RESET}")
 
 
 def _disp_rotate_key():
@@ -4090,7 +4357,8 @@ def _disp_expose(parts):
     reachability probe. Pro: external nmap -sV fingerprint + hardening report."""
     add_console(f"{BOLD}NetWatch expose — what the internet can see{RESET}")
     pub = None
-    r = _proxied_get("http://ip-api.com/json/?fields=query,country,city,isp,hosting,proxy", timeout=8)
+    # our own exit address: it changes with the proxy, so never cache it
+    r = _ipapi_get("?fields=query,country,city,isp,hosting,proxy", timeout=8, cache=False)
     if r is not None:
         try:
             d = r.json()
@@ -4190,7 +4458,8 @@ def _disp_alerts(parts):
             add_console(f"  {YELLOW}No webhook set. Use: alert set <url>{RESET}")
             return
         ok = notify_attack("Test alert", "NetWatch alert webhook is working.")
-        add_console("  ✅ delivered" if ok else f"  {RED}❌ failed — check URL/network{RESET}")
+        why = f": {_last_webhook_error}" if (not ok and _last_webhook_error) else " — check URL/network"
+        add_console("  ✅ delivered" if ok else f"  {RED}❌ failed{why}{RESET}")
         return
     cfg = _load_alerts_cfg()
     if cfg.get("url"):
@@ -4498,7 +4767,10 @@ def _cmd_fullrecon(target):
     _osint_record("FULLRECON", target, "7-phase recon complete")
 
 def _cmd_sweep(cidr=None):
-    cidr = cidr or "10.0.1.0/24"
+    cidr = cidr or _default_cidr()
+    if not cidr:
+        add_console(f"  {YELLOW}No private subnet found on {IFACE}. Usage: sweep <cidr>{RESET}")
+        return
     add_console(f"  {CYAN}[1/3] ARP scan...{RESET}")
     try:
         result = subprocess.run(["arp-scan", "-l", "-I", IFACE], capture_output=True, text=True, timeout=30)
@@ -6272,7 +6544,10 @@ def _disp_tracked(parts):
     track_summary(parts[1])
 
 def _disp_subnet(parts):
-    cidr = parts[1] if len(parts) >= 2 else "10.0.1.0/24"
+    cidr = parts[1] if len(parts) >= 2 else _default_cidr()
+    if not cidr:
+        add_console(f"{YELLOW}No private subnet found on {IFACE}. Usage: subnet <cidr>{RESET}")
+        return
     add_console(f"{CYAN}Ping sweeping {cidr}...{RESET}")
     threading.Thread(target=_cmd_subnet_sweep, args=(cidr,), daemon=True).start()
 
@@ -6375,17 +6650,38 @@ def _disp_mesh(parts):
             add_console(f"{RED}Message too long (200 char max for LoRa){RESET}"); return
         if mesh_send(text):
             add_console(f"{GREEN}Sent: {text}{RESET}")
+        elif mesh_interface:
+            add_console(f"{RED}Mesh: {_mesh_last_error or 'send failed'}{RESET}")
         else:
-            add_console(f"{RED}Mesh not connected{RESET}")
+            add_console(f"{RED}Mesh not connected — try: mesh connect{RESET}")
+    elif sub == "connect":
+        if not _HAS_MESH:
+            add_console(f"  {YELLOW}Meshtastic is not installed: pip3 install meshtastic{RESET}")
+            return
+        dev = parts[2] if len(parts) >= 3 else None
+        if dev and not re.match(r'^/dev/(tty[A-Za-z]+[0-9]{0,3}|serial/by-(id|path)/[A-Za-z0-9._:\-]{1,120})$', dev):
+            add_console(f"  {RED}Usage: mesh connect [/dev/ttyACM0]{RESET}")
+            return
+        if mesh_interface:
+            _mesh_disconnect()
+        add_console(f"  {CYAN}Mesh: connecting{' on ' + dev if dev else ''}...{RESET}")
+        threading.Thread(target=_mesh_connect, args=(dev,), daemon=True).start()
+    elif sub == "disconnect":
+        add_console(f"  {GREEN}Mesh: disconnected{RESET}" if _mesh_disconnect()
+                    else f"  {DIM}Mesh: not connected{RESET}")
     elif sub == "status":
         if mesh_interface:
-            add_console(f"  {GREEN}Mesh: connected{RESET}")
+            add_console(f"  {GREEN}Mesh: connected{' on ' + _mesh_port if _mesh_port else ''}{RESET}")
             add_console(f"  Nodes: {len(mesh_nodes)}  Messages: {len(mesh_messages)}")
             add_console(f"  Alert forwarding: {'ON' if mesh_alert_fwd else 'OFF'}")
         else:
             add_console(f"  {YELLOW}Mesh: not connected{RESET}")
             if not _HAS_MESH:
                 add_console(f"  {DIM}Install: pip3 install meshtastic{RESET}")
+            else:
+                if _mesh_last_error:
+                    add_console(f"  {DIM}Last attempt: {_mesh_last_error}{RESET}")
+                add_console(f"  {DIM}Try: mesh connect [/dev/ttyACM0]{RESET}")
     elif sub == "nodes":
         if not mesh_nodes:
             add_console(f"  {DIM}No mesh nodes seen yet{RESET}")
@@ -6399,7 +6695,7 @@ def _disp_mesh(parts):
         else:
             add_console(f"  {DIM}Usage: mesh alert on/off{RESET}")
     else:
-        add_console(f"  {DIM}mesh send <text> | mesh status | mesh nodes | mesh alert on/off{RESET}")
+        add_console(f"  {DIM}mesh connect [port] | mesh disconnect | mesh send <text> | mesh status | mesh nodes | mesh alert on/off{RESET}")
 
 def _disp_ifinfo(parts):
     try:
@@ -6598,6 +6894,146 @@ def _cmd_dnsinfo(target):
     _osint_record("DNS", target, f"{total} records ({', '.join(data.keys())})")
 
 
+# -- CVE LOOKUP (netwatch_cve.py: NVD API, known-exploited first)
+_cve_client = None
+_CVE_HOST_RE = re.compile(
+    r'^[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)*$')
+CVE_SHOW_PER_SERVICE = 8
+
+def _cve_target_is_host(target):
+    """True when `cve <target>` will scan a host (not a CVE id or a CPE name)."""
+    import netwatch_cve
+    return not (netwatch_cve.is_cve_id(target) or netwatch_cve.is_cpe(target))
+
+def _nvd_http_get(url, params, headers, timeout):
+    """Transport for netwatch_cve: same proxy session as every other lookup."""
+    sess = _proxy_session(_get_proxy())
+    if not sess:
+        return 0, None
+    try:
+        r = sess.get(url, params=params, headers=headers, timeout=timeout)
+    except Exception:
+        return 0, None
+    body = None
+    if r.status_code == 200:
+        try:
+            body = r.json()
+        except ValueError:
+            body = None
+    return r.status_code, body
+
+def _get_cve_client():
+    global _cve_client
+    if _cve_client is None:
+        import netwatch_cve
+        _cve_client = netwatch_cve.NvdClient(
+            _nvd_http_get,
+            api_key=os.environ.get("NETWATCH_NVD_API_KEY", "").strip() or None,
+            cache_path=_config_path("cve_cache.json"))
+    return _cve_client
+
+def _cve_line(f):
+    sev = f.get("severity") or "?"
+    color = RED if sev in ("CRITICAL", "HIGH") else YELLOW if sev == "MEDIUM" else WHITE
+    score = f"{f['score']:.1f}" if f.get("score") is not None else "n/a"
+    kev = f" {BG_RED}{WHITE} EXPLOITED {RESET}" if f.get("kev") else ""
+    summary = _ansi_strip(f.get("summary", ""))[:90]
+    return f"  {color}{f['id']:<17}{score:>5} {sev:<9}{RESET}{kev} {DIM}{summary}{RESET}"
+
+def _cve_print_findings(label, findings):
+    import netwatch_cve
+    if not findings:
+        add_console(f"  {GREEN}{label}: no CVE on record for this version{RESET}")
+        return
+    c = netwatch_cve.summarize(findings)
+    add_console(f"  {BOLD}{label}{RESET} — {c['total']} CVE, {c['kev']} known exploited, "
+                f"{c['CRITICAL']} critical, {c['HIGH']} high")
+    for f in findings[:CVE_SHOW_PER_SERVICE]:
+        add_console(_cve_line(f))
+    if len(findings) > CVE_SHOW_PER_SERVICE:
+        add_console(f"  {DIM}... {len(findings) - CVE_SHOW_PER_SERVICE} more, lower rank{RESET}")
+
+def _cve_scan_services(target):
+    """nmap version scan of the top 100 ports -> (services, error text)."""
+    import netwatch_cve
+    argv = ["nmap", "-sV", "--version-light", "-F", "-T4", "-Pn", "-oX", "-"]
+    if ":" in target:
+        argv.append("-6")
+    try:
+        res = subprocess.run(argv + [target], capture_output=True, text=True, timeout=300)
+    except FileNotFoundError:
+        return [], "nmap is not installed"
+    except subprocess.TimeoutExpired:
+        return [], "version scan timed out"
+    return netwatch_cve.parse_nmap_xml(res.stdout), ""
+
+def _cmd_cve(target):
+    """cve <CVE-id> | cve <cpe> | cve <ip|host> (version scan, then NVD)."""
+    import netwatch_cve
+    client = _get_cve_client()
+    try:
+        if netwatch_cve.is_cve_id(target):
+            f = client.lookup_cve(target)
+            if not f:
+                add_console(f"  {YELLOW}{target.upper()} is not in NVD.{RESET}")
+                return
+            add_console(_cve_line(f))
+            if f.get("kev"):
+                add_console(f"  {RED}In the CISA known-exploited catalog since {f['kev_added']}"
+                            f"{', fix due ' + f['kev_due'] if f.get('kev_due') else ''}.{RESET}")
+            add_console(f"  {DIM}Published {f.get('published') or 'unknown'}{RESET}")
+            _osint_record("CVE", f["id"], f"{f.get('severity') or '?'} {f.get('score')}"
+                                          f"{' exploited' if f.get('kev') else ''}")
+            return
+        if netwatch_cve.is_cpe(target):
+            findings, _cached = client.lookup_cpe(target)
+            _cve_print_findings(target, findings)
+            if client.missing_for(target):
+                add_console(f"  {YELLOW}NVD has {client.missing_for(target)} more CVE for this version "
+                            f"that were not fetched.{RESET}")
+            _osint_record("CVE", target, f"{len(findings)} CVE")
+            return
+        try:
+            ipaddress.ip_address(target)
+        except ValueError:
+            if len(target) > 253 or not _CVE_HOST_RE.match(target):
+                add_console(f"  {RED}Usage: cve <ip|host> | cve CVE-2024-1234 | cve cpe:2.3:a:vendor:product:version{RESET}")
+                return
+        services, err = _cve_scan_services(target)
+        if err:
+            add_console(f"  {RED}{err}{RESET}")
+            return
+        if not services:
+            add_console(f"  {YELLOW}No open port in the top 100.{RESET}")
+            return
+        versioned = [svc for svc in services if svc["cpes"]]
+        add_console(f"  {GREEN}{len(services)} open ports, {len(versioned)} with a product version.{RESET}")
+        if not versioned:
+            add_console(f"  {DIM}nmap found no product version, so there is nothing to match.{RESET}")
+            return
+        if not os.environ.get("NETWATCH_NVD_API_KEY") and len(versioned) > 2:
+            add_console(f"  {DIM}No NVD key: one lookup each 6.5 s. Set NETWATCH_NVD_API_KEY for 10x speed.{RESET}")
+        results, skipped = client.lookup_services(versioned)
+        total = kev = 0
+        for svc, cpe, findings in results:
+            name = _ansi_strip(f"{svc['product']} {svc['version']}".strip()) or svc["service"]
+            _cve_print_findings(f"{svc['port']}/{svc['proto']} {name}", findings)
+            if client.missing_for(cpe):
+                add_console(f"  {YELLOW}NVD has {client.missing_for(cpe)} more CVE for this version "
+                            f"that were not fetched; the list above is not complete.{RESET}")
+            total += len(findings)
+            kev += sum(1 for f in findings if f.get("kev"))
+        if skipped:
+            add_console(f"  {DIM}{skipped} more services not checked (limit {netwatch_cve.MAX_SERVICES_PER_SCAN}).{RESET}")
+        add_console(f"  {DIM}Match is by version only. A distribution can fix a CVE and keep the "
+                    f"version number, so confirm before you act.{RESET}")
+        with lock:
+            if target in hosts and total:
+                hosts[target]["tags"].add("KEV" if kev else "VULN")
+        _osint_record("CVE", target, f"{total} CVE ({kev} exploited) on {len(versioned)} services")
+    except netwatch_cve.NvdError as e:
+        add_console(f"  {RED}{e}{RESET}")
+
 def _cmd_portscan(target):
     results = osint_port_scan(target)
     if not results:
@@ -6701,6 +7137,104 @@ def _proxied_get(url, timeout=10):
         return sess.get(url, timeout=timeout, headers=headers)
     except Exception:
         return None
+
+_IPAPI_TTL = 3600      # an address does not change country within the hour
+_IPAPI_MAX = 2000
+_ipapi_cache = {}      # query -> (epoch, response)
+_ipapi_lock = threading.Lock()
+_geo_terms_warned = False
+
+
+class _GeoResponse:
+    """A provider answer in ip-api's field names, so callers need one shape."""
+    status_code = 200
+
+    def __init__(self, data):
+        self._data = data
+
+    def json(self):
+        return dict(self._data)
+
+
+def _geo_provider():
+    """Which geo service is in use: 'ip-api-pro', 'ipinfo-lite' or 'ip-api-free'."""
+    if os.environ.get("NETWATCH_IPAPI_KEY", "").strip():
+        return "ip-api-pro"
+    if os.environ.get("NETWATCH_IPINFO_TOKEN", "").strip():
+        return "ipinfo-lite"
+    return "ip-api-free"
+
+
+def _ipinfo_lite_get(query, timeout):
+    """IPinfo Lite (free token, HTTPS, no request limit, commercial use allowed
+    with attribution, CC BY-SA 4.0). It gives country and ASN only: no city, no
+    ISP detail, no proxy/hosting flags. Mapped to ip-api field names."""
+    token = os.environ.get("NETWATCH_IPINFO_TOKEN", "").strip()
+    target = urllib.parse.unquote(query.split("?", 1)[0]) or "me"
+    if target != "me":
+        try:
+            target = str(ipaddress.ip_address(target))
+        except ValueError:
+            return _GeoResponse({"status": "fail", "query": target,
+                                 "message": "IPinfo Lite needs an IP address, not a name"})
+    r = _proxied_get(f"https://api.ipinfo.io/lite/{target}"
+                     f"?token={urllib.parse.quote(token, safe='')}", timeout=timeout)
+    if r is None or getattr(r, "status_code", None) != 200:
+        return None
+    try:
+        d = r.json()
+    except Exception:
+        return None
+    if not isinstance(d, dict) or not d.get("ip"):
+        return None
+    asn, name = str(d.get("asn") or ""), str(d.get("as_name") or "")
+    return _GeoResponse({
+        "status": "success", "query": str(d.get("ip")),
+        "country": str(d.get("country") or ""), "countryCode": str(d.get("country_code") or ""),
+        "as": f"{asn} {name}".strip(), "org": name, "isp": name,
+        "source": "IPinfo",
+    })
+
+
+def _ipapi_get(query, timeout=10, cache=True):
+    """Geo/ASN lookup for `query` ("<ip>[?fields=...]"), with a one-hour cache.
+
+    Three providers, picked by environment:
+      NETWATCH_IPAPI_KEY     ip-api.com paid endpoint: HTTPS, full detail.
+      NETWATCH_IPINFO_TOKEN  IPinfo Lite: free, HTTPS, commercial use allowed
+                             with attribution; country + ASN only.
+      (neither)              ip-api.com free endpoint: plain HTTP, 45 requests
+                             a minute, and its terms do NOT allow commercial use.
+    The cache keeps batch commands (geoall, fullrecon) inside the free limit."""
+    global _geo_terms_warned
+    provider = _geo_provider()
+    if cache:
+        with _ipapi_lock:
+            hit = _ipapi_cache.get((provider, query))
+            if hit and time.time() - hit[0] < _IPAPI_TTL:
+                return hit[1]
+    if provider == "ipinfo-lite":
+        r = _ipinfo_lite_get(query, timeout)
+    elif provider == "ip-api-pro":
+        key = os.environ.get("NETWATCH_IPAPI_KEY", "").strip()
+        sep = "&" if "?" in query else "?"
+        r = _proxied_get(f"https://pro.ip-api.com/json/{query}{sep}key={urllib.parse.quote(key, safe='')}",
+                         timeout=timeout)
+    else:
+        if not _geo_terms_warned and tier_at_least("pro"):
+            _geo_terms_warned = True
+            with lock:
+                _capped_append(alerts, {"time": datetime.now().strftime("%H:%M:%S"),
+                                        "msg": "Geo lookups use the free ip-api endpoint (non-commercial terms, plain HTTP). "
+                                               "Set NETWATCH_IPINFO_TOKEN (free) or NETWATCH_IPAPI_KEY."}, MAX_ALERTS)
+        r = _proxied_get(f"http://ip-api.com/json/{query}", timeout=timeout)
+    if cache and r is not None and getattr(r, "status_code", None) == 200:
+        with _ipapi_lock:
+            if len(_ipapi_cache) >= _IPAPI_MAX:
+                for old in sorted(_ipapi_cache, key=lambda k: _ipapi_cache[k][0])[:_IPAPI_MAX // 10]:
+                    del _ipapi_cache[old]
+            _ipapi_cache[(provider, query)] = (time.time(), r)
+    return r
 
 def _test_proxy(entry):
     if not req_lib:
@@ -7467,7 +8001,7 @@ def _section_mesh(limit=20):
         lines.append(f"  {DIM}Supported: T-Beam, Heltec, RAK, LilyGo{RESET}")
         if _mesh_last_error:
             lines.append(f"  {DIM}Last attempt: {_mesh_last_error}{RESET}")
-        lines.append(f"  {DIM}Tip: NETWATCH_MESH_PORT=/dev/ttyACM0 to force a device.{RESET}")
+        lines.append(f"  {DIM}Tip: type  mesh connect /dev/ttyACM0  (or set NETWATCH_MESH_PORT).{RESET}")
         return lines
     lines.append(f"  {BOLD}{GREEN}MESH RADIO CONNECTED{RESET}")
     lines.append(f"  {DIM}Nodes: {len(mesh_nodes)}  |  Messages: {len(mesh_messages)}  |  Alert fwd: {'ON' if mesh_alert_fwd else 'OFF'}{RESET}")
@@ -7908,16 +8442,7 @@ def draw_dashboard():
         enrich_counter += 1
         if enrich_counter % 5 == 0:
             try:
-                with lock:
-                    if len(alerts) > MAX_ALERTS:
-                        del alerts[:len(alerts) - MAX_ALERTS]
-                    if len(hosts) > MAX_HOSTS:
-                        oldest = sorted(hosts.keys(), key=lambda k: hosts[k].get("last_seen") or "")[:len(hosts) - MAX_HOSTS]
-                        for k in oldest:
-                            del hosts[k]
-                    for ip in list(hosts.keys())[:20]:
-                        if not hosts[ip].get("_enriched"):
-                            threading.Thread(target=enrich_host, args=(ip,), daemon=True).start()
+                _maintain_hosts()
             except Exception:
                 pass
 
@@ -8072,71 +8597,7 @@ _sse_count = 0
 _SSE_MAX = 5
 _sse_lock = threading.Lock()
 
-_LOGIN_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NetWatch — Login</title><style>
-*{margin:0;padding:0;box-sizing:border-box}body{background:#080a0e;color:#c8ccd4;font-family:'JetBrains Mono','Fira Code',monospace;
-display:flex;justify-content:center;align-items:center;min-height:100vh}
-.box{background:#0d1117;border:1px solid #1a1f2b;border-radius:8px;padding:40px;width:340px;text-align:center}
-h1{color:#ff3333;font-size:22px;margin-bottom:8px;letter-spacing:2px}
-.sub{color:#555;font-size:11px;margin-bottom:24px}
-input{width:100%;background:#080a0e;border:1px solid #1a1f2b;color:#c8ccd4;font-family:inherit;
-font-size:14px;padding:10px 14px;border-radius:4px;outline:none;margin-bottom:12px;text-align:center}
-input:focus{border-color:#ff3333}
-button{width:100%;background:#ff3333;color:#080a0e;border:none;padding:10px;border-radius:4px;
-font-family:inherit;font-size:13px;font-weight:700;cursor:pointer;letter-spacing:1px}
-button:hover{background:#ff5555}
-.err{color:#ff3333;font-size:11px;margin-top:8px;min-height:16px}
-.div{color:#333;font-size:10px;margin:14px 0 10px;letter-spacing:1px}
-a.sso{display:block;margin-top:6px;padding:10px;border:1px solid #1a1f2b;border-radius:4px;
-color:#33ff99;text-decoration:none;font-size:12px;letter-spacing:1px}
-a.sso:hover{border-color:#33ff99}
-#mfabox{display:none}
-</style></head><body><div class="box"><h1>NETWATCH</h1><div class="sub">Enter access token to continue</div>
-<div id="credbox">
-<input id="tok" type="password" placeholder="Token" autocomplete="off" autofocus>
-<div class="div">— or sign in (Business) —</div>
-<input id="usr" type="text" placeholder="Username" autocomplete="username">
-<input id="pwd" type="password" placeholder="Password" autocomplete="current-password">
-</div>
-<div id="mfabox">
-<div class="div">— two-factor code —</div>
-<input id="mfa" type="text" inputmode="numeric" placeholder="6-digit code or recovery code" autocomplete="one-time-code">
-</div>
-<button id="go" onclick="go()">AUTHENTICATE</button><div class="err" id="err"></div>
-{% if sso_enabled %}<div class="div">— or —</div>
-<a class="sso" href="/auth/oidc/login">SIGN IN WITH SSO</a>{% endif %}
-</div>
-<script>
-let challenge=null;
-for(const id of ["tok","usr","pwd","mfa"])document.getElementById(id).addEventListener("keydown",e=>{if(e.key==="Enter")go()});
-async function post(body){
-return fetch("/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});}
-async function go(){
-const err=document.getElementById("err");
-let body=null;
-if(challenge){
-const c=document.getElementById("mfa").value.trim();
-if(!c)return;
-body={challenge:challenge,code:c};
-}else{
-const t=document.getElementById("tok").value.trim();
-const u=document.getElementById("usr").value.trim();
-const p=document.getElementById("pwd").value;
-if(t)body={token:t};else if(u&&p)body={user:u,pass:p};else return;
-}
-try{const r=await post(body);
-let data={};try{data=await r.json()}catch(e){}
-if(r.status===429){err.textContent=data.retry_after?("Locked — retry in "+data.retry_after+"s"):"Too many attempts";return}
-if(r.ok&&data.mfa_required){
-challenge=data.challenge;
-document.getElementById("credbox").style.display="none";
-document.getElementById("mfabox").style.display="block";
-document.getElementById("mfa").focus();
-err.textContent="";return}
-if(r.ok){location.reload();return}
-if(challenge){err.textContent="Invalid code"}else{err.textContent="Invalid credentials"}}
-catch(e){err.textContent="Connection error"}}
-</script></body></html>"""
+# _LOGIN_HTML is in netwatch_web_assets.py
 
 
 def _render_login():
@@ -8918,7 +9379,7 @@ _WEB_SAFE_CMDS = {
     "attacks", "abusers", "threats", "expose", "checkme",
     "tag", "note", "watch", "report", "exportips", "diffarp", "mesh",
     "scanall", "geoall", "whoisall", "reconall", "blockall", "sweep",
-    "speed", "ifinfo", "help",
+    "speed", "ifinfo", "help", "cve",
     "block", "unblock", "pcap", "track", "untrack", "conns", "sniff",
     "trackdns", "tracking", "stealth", "clear", "export",
     "join", "compliance", "audit", "cam", "cameras",
@@ -8932,7 +9393,7 @@ _CMD_MIN_ROLE = {c: "operator" for c in (
     "block", "unblock", "blockall", "pcap", "track", "untrack", "sniff",
     "trackdns", "stealth", "tag", "note", "watch", "clear", "export",
     "proxy", "report", "join", "scanall", "geoall", "whoisall", "reconall",
-    "sweep", "mesh", "expose", "compliance", "audit",
+    "sweep", "mesh", "expose", "compliance", "audit", "cve",
 )}
 
 # Subcommands that stay on the LOCAL console even for an operator. Archiving the
@@ -8977,7 +9438,7 @@ _web_cmd_lock = threading.Lock()
 _CMD_RATE_LIMIT = 20
 _CMD_RATE_WINDOW = 60
 _EXPENSIVE_CMDS = {"fullrecon", "scanall", "reconall", "blockall", "sweep", "geoall", "whoisall", "deep",
-                    "block", "unblock", "stealth", "pcap", "expose", "checkme"}
+                    "block", "unblock", "stealth", "pcap", "expose", "checkme", "cve"}
 _EXPENSIVE_RATE_LIMIT = 3
 
 @web_app.route("/api/cmd", methods=["POST"])
@@ -9019,7 +9480,8 @@ def web_cmd():
     if _ROLE_RANK.get(role, 0) < _ROLE_RANK[need]:
         return jsonify({"error": f"'{action}' requires the {need} role "
                                  f"(you are {role})"}), 403
-    if action in _OUTBOUND_CMDS and len(parts) >= 2:
+    if (action in _OUTBOUND_CMDS or (action == "cve" and len(parts) >= 2
+                                           and _cve_target_is_host(parts[1]))) and len(parts) >= 2:
         target = parts[1]
         if _is_internal_target(target):
             return jsonify({"error": f"target '{target}' resolves to internal/metadata IP — blocked"})
@@ -9043,1227 +9505,7 @@ def web_cmd():
     clean = [re.sub(r'\033\[[0-9;]*[a-zA-Z]', '', line) for line in output]
     return jsonify({"output": clean})
 
-WEB_DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NetWatch</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#080a0e;--surface:#0d1117;--border:#1a1f2b;--red:#ff3333;--green:#00ff88;
---cyan:#00d4ff;--yellow:#ffcc00;--magenta:#ff66ff;--blue:#4488ff;--dim:#555;--text:#c8ccd4;
---panel-h:40vh;
-/* semantic aliases — components read these; theme switches still hit the literal vars */
---accent:var(--red);--fg:var(--text);--muted:var(--dim);
---threat-high:var(--red);--threat-med:var(--yellow);--threat-low:var(--green);
---warn:var(--yellow);--info:var(--cyan);--good:var(--green);
---svc-on-bg:#0a2a15;--svc-on-bd:#0f3d1e;
---svc-warn-bg:#2a2a0a;--svc-warn-bd:#3d3d0f;
---svc-off-bg:#1a0a0a;--svc-off-bd:#2a1515;--svc-off-fg:#663333;
---header-grad-from:#12060a}
-.theme-matrix{--bg:#000;--surface:#001100;--border:#003300;--red:#00ff41;--green:#00ff41;
---cyan:#00ff41;--yellow:#33ff33;--magenta:#00ff41;--blue:#00ff41;--dim:#005500;--text:#00ff41;
---svc-on-bg:#002200;--svc-on-bd:#004400;--svc-warn-bg:#002200;--svc-warn-bd:#004400;
---svc-off-bg:#001100;--svc-off-bd:#002200;--svc-off-fg:#005500;--header-grad-from:#001100}
-.theme-midnight{--bg:#020617;--surface:#0f172a;--border:#1e3a5f;--red:#f43f5e;--green:#34d399;
---cyan:#38bdf8;--yellow:#fbbf24;--magenta:#a78bfa;--blue:#60a5fa;--dim:#475569;--text:#e0f2fe;
---svc-on-bg:#053024;--svc-on-bd:#0a4a3a;--svc-warn-bg:#3a2a05;--svc-warn-bd:#5a420a;
---svc-off-bg:#1a0a14;--svc-off-bd:#2a1525;--svc-off-fg:#6b3d4d;--header-grad-from:#1e0a16}
-.theme-cyberpunk{--bg:#050014;--surface:#111827;--border:#f97316;--red:#f97316;--green:#22d3ee;
---cyan:#22d3ee;--yellow:#f9a8d4;--magenta:#f9a8d4;--blue:#818cf8;--dim:#6b21a8;--text:#f9a8d4;
---svc-on-bg:#0a2030;--svc-on-bd:#1a3050;--svc-warn-bg:#301a30;--svc-warn-bd:#502a50;
---svc-off-bg:#1a0a1a;--svc-off-bd:#2a152a;--svc-off-fg:#6b3d6b;--header-grad-from:#1a0530}
-.theme-light{--bg:#f9fafb;--surface:#ffffff;--border:#d1d5db;--red:#dc2626;--green:#047857;
---cyan:#0e7490;--yellow:#b45309;--magenta:#7e22ce;--blue:#1d4ed8;--dim:#6b7280;--text:#111827;
---svc-on-bg:#d1fae5;--svc-on-bd:#a7f3d0;--svc-warn-bg:#fef3c7;--svc-warn-bd:#fcd34d;
---svc-off-bg:#fee2e2;--svc-off-bd:#fca5a5;--svc-off-fg:#991b1b;--header-grad-from:#fee2e2}
-#scanline-overlay{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:50;opacity:0}
-#scanline-overlay.soft{opacity:1;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.03) 3px,rgba(0,0,0,.03) 6px)}
-#scanline-overlay.heavy{opacity:1;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.08) 2px,rgba(0,0,0,.08) 4px)}
-@keyframes status-pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.pulse{animation:status-pulse 1.5s ease-in-out infinite}
-@keyframes row-in{from{opacity:0;transform:translateY(-2px)}to{opacity:1;transform:none}}
-.fade-in tr,.fade-in .nw-row{animation:row-in .18s ease-out both}
-@keyframes spin{to{transform:rotate(360deg)}}
-.spinner{display:inline-block;width:10px;height:10px;border:2px solid var(--muted);
-border-top-color:var(--accent);border-radius:50%;animation:spin .9s linear infinite;vertical-align:-1px;margin-right:6px}
-.empty-state,.loading-state{padding:24px 12px;color:var(--muted);font-size:12px;
-text-align:left;border:1px dashed var(--border);border-radius:6px;background:rgba(255,255,255,.01);
-margin-top:4px}
-.empty-state .label,.loading-state .label{color:var(--fg);font-size:13px;margin-bottom:4px}
-.empty-state .hint{color:var(--muted);font-size:11px}
-.loading-state .label{color:var(--info)}
-body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono','Fira Code',monospace;
-font-size:13px;overflow-x:hidden;min-height:100vh;display:flex;flex-direction:column}
-#header{background:linear-gradient(180deg,var(--header-grad-from) 0%,var(--surface) 100%);
-border-bottom:2px solid var(--accent);padding:10px 20px;display:flex;align-items:center;gap:16px;flex-shrink:0}
-#header h1{color:var(--red);font-size:18px;font-weight:700;letter-spacing:2px}
-.stat{color:var(--dim);font-size:11px}
-.stat b{color:var(--text)}
-.services{display:flex;gap:4px;margin-left:auto;flex-wrap:wrap}
-.svc{padding:2px 6px;border-radius:3px;font-size:9px;font-weight:600;text-transform:uppercase}
-.svc.on{background:var(--svc-on-bg);color:var(--good);border:1px solid var(--svc-on-bd)}
-.svc.warn{background:var(--svc-warn-bg);color:var(--warn);border:1px solid var(--svc-warn-bd)}
-.svc.off{background:var(--svc-off-bg);color:var(--svc-off-fg);border:1px solid var(--svc-off-bd)}
-#tabs{display:flex;gap:0;background:var(--surface);border-bottom:1px solid var(--border);
-padding:0 12px;flex-shrink:0;overflow-x:auto}
-.tab{padding:8px 14px;cursor:pointer;color:var(--dim);font-size:11px;font-weight:600;
-text-transform:uppercase;letter-spacing:1px;border-bottom:2px solid transparent;transition:all .15s;white-space:nowrap}
-.tab:hover{color:var(--text);background:rgba(255,255,255,.03)}
-.tab.active{color:var(--red);border-bottom-color:var(--red);background:rgba(255,51,51,.05)}
-.tab .n{font-size:9px;color:var(--dim);margin-right:3px}
-#content{flex:1;overflow-y:auto;padding:14px 18px;min-height:0}
-table{width:100%;border-collapse:collapse}
-th{text-align:left;color:var(--dim);font-size:10px;text-transform:uppercase;
-letter-spacing:.5px;padding:5px 8px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg)}
-td{padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.03);font-size:12px;
-overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-tr:hover td{background:rgba(255,255,255,.02)}
-tr.clickable{cursor:pointer}
-tr.clickable:hover td{background:rgba(0,212,255,.06)}
-.ip{color:var(--cyan)}.ip.local{color:var(--green)}
-.ip.threat-high{color:var(--red)}.ip.threat-med{color:var(--yellow)}
-.tag{display:inline-block;padding:1px 5px;border-radius:2px;font-size:9px;margin:0 2px;
-background:rgba(255,51,51,.15);color:var(--red)}
-.bar-wrap{height:12px;background:var(--border);border-radius:2px;overflow:hidden;min-width:40px}
-.bar-fill{height:100%;border-radius:2px;transition:width .3s}
-.proto-bar{background:var(--blue)}
-.alert-row{color:var(--red)}
-.hp-cred{color:var(--red)}.hp-telnet{color:var(--yellow)}.hp-ftp{color:var(--magenta)}
-.hp-rtsp{color:var(--blue)}.hp-http{color:var(--dim)}
-.section-title{color:var(--cyan);font-size:13px;font-weight:700;margin:14px 0 6px;
-display:flex;align-items:center;gap:8px}
-.section-title:first-child{margin-top:0}
-.count{color:var(--dim);font-size:10px;font-weight:400}
-#cmd-bar{background:var(--surface);border-top:1px solid var(--border);padding:8px 18px;
-display:flex;gap:10px;align-items:center;flex-shrink:0}
-#cmd-bar label{color:var(--red);font-weight:700;font-size:14px}
-#cmd-input{flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);
-font-family:inherit;font-size:13px;padding:7px 12px;border-radius:4px;outline:none}
-#cmd-input:focus{border-color:var(--accent);box-shadow:0 0 8px rgba(255,51,51,.15)}
-.tab:focus-visible,button:focus-visible,select:focus-visible,
-.ctx-item:focus-visible,.panel-btn:focus-visible,.port-chip:focus-visible{
-outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
-[role="dialog"]{outline:none}
-#kbd-help{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
-background:var(--surface);border:1px solid var(--accent);border-radius:8px;padding:18px 22px;
-z-index:1100;min-width:280px;max-width:90vw;box-shadow:0 16px 48px rgba(0,0,0,.7)}
-#kbd-help.open{display:block}
-#kbd-help h3{color:var(--accent);font-size:12px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
-#kbd-help table{width:100%;font-size:12px}
-#kbd-help td{padding:3px 8px;border:none}
-#kbd-help kbd{background:var(--bg);border:1px solid var(--border);border-radius:3px;
-padding:1px 6px;font-family:inherit;font-size:11px;color:var(--info)}
-#kbd-help .close-hint{color:var(--muted);font-size:10px;margin-top:10px;text-align:right}
-.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
-clip:rect(0,0,0,0);white-space:nowrap;border:0}
-.osint-geo{color:var(--cyan)}.osint-dns{color:var(--magenta)}.osint-scan{color:var(--green)}
-.osint-abuse{color:var(--red)}.osint-whois{color:var(--blue)}
-.ip-click{cursor:pointer;text-decoration:none;border-bottom:1px dashed rgba(0,212,255,.3);transition:all .15s}
-.ip-click:hover{border-bottom-color:var(--cyan);text-shadow:0 0 6px rgba(0,212,255,.3)}
-#ctx-menu{display:none;position:fixed;background:var(--surface);border:1px solid var(--red);
-border-radius:6px;padding:4px 0;z-index:1000;min-width:190px;box-shadow:0 8px 24px rgba(0,0,0,.6)}
-.ctx-hdr{padding:8px 14px;color:var(--cyan);font-weight:700;font-size:12px;border-bottom:1px solid var(--border);
-letter-spacing:.5px;display:flex;align-items:center;gap:6px}
-.ctx-hdr::before{content:">";color:var(--red)}
-.ctx-sep{height:1px;background:var(--border);margin:2px 0}
-.ctx-item{padding:6px 14px;font-size:12px;cursor:pointer;color:var(--text);display:flex;align-items:center;gap:8px;transition:all .1s}
-.ctx-item:hover{background:rgba(255,51,51,.1);color:var(--red)}
-.ctx-item .k{color:var(--dim);font-size:10px;margin-left:auto}
-#output-panel{display:none;position:fixed;bottom:0;left:0;right:0;background:var(--surface);
-border-top:2px solid var(--red);z-index:900;flex-direction:column;height:var(--panel-h);min-height:120px;max-height:85vh}
-#output-panel.open{display:flex}
-#panel-drag{height:6px;cursor:ns-resize;background:transparent;flex-shrink:0;display:flex;align-items:center;justify-content:center}
-#panel-drag::after{content:"";width:40px;height:3px;background:var(--dim);border-radius:2px}
-#panel-drag:hover::after{background:var(--red)}
-#output-hdr{padding:6px 16px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--border);flex-shrink:0}
-#output-hdr .title{color:var(--red);font-weight:700;font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.panel-btn{cursor:pointer;color:var(--dim);font-size:14px;padding:2px 6px;border-radius:3px;border:1px solid transparent}
-.panel-btn:hover{color:var(--red);border-color:var(--border)}
-#output-body{overflow-y:auto;padding:10px 16px;font-size:11px;color:var(--text);flex:1;white-space:pre-wrap;font-family:inherit;line-height:1.6}
-#detail-panel{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
-background:var(--surface);border:2px solid var(--red);border-radius:8px;z-index:950;
-width:700px;max-width:90vw;max-height:80vh;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.8)}
-#detail-panel.open{display:flex}
-#detail-hdr{padding:10px 16px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--border);flex-shrink:0}
-#detail-hdr .title{color:var(--cyan);font-weight:700;font-size:14px;flex:1}
-#detail-body{overflow-y:auto;padding:14px 16px;font-size:12px;flex:1}
-.detail-section{margin-bottom:14px}
-.detail-section h3{color:var(--red);font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
-.detail-row{display:flex;gap:12px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.03)}
-.detail-label{color:var(--dim);min-width:100px;font-size:11px}
-.detail-val{color:var(--text);word-break:break-all}
-.port-chip{display:inline-block;padding:2px 6px;margin:2px;border-radius:3px;font-size:10px;
-background:rgba(0,212,255,.1);color:var(--cyan);border:1px solid rgba(0,212,255,.2)}
-.osint-row{cursor:pointer;transition:background .15s}
-.osint-row:hover td{background:rgba(0,212,255,.06) !important}
-@media(max-width:768px){
-  #header{flex-wrap:wrap;gap:8px;padding:8px 12px}
-  .services{margin-left:0;width:100%}
-  td,th{padding:3px 4px;font-size:11px}
-  #content{padding:10px}
-  #detail-panel{width:95vw}
-  #charts-grid{grid-template-columns:1fr !important}
-  #tabs{background:linear-gradient(90deg,var(--surface) 0%,var(--surface) 92%,rgba(0,0,0,.4) 100%)}
-  .panel-btn,.tab,.ctx-item{min-height:36px;display:flex;align-items:center}
-}
-@media(max-width:640px){
-  #detail-panel{width:100vw;max-width:100vw;height:100vh;max-height:100vh;
-    border-radius:0;border-width:0;top:0;left:0;transform:none}
-  #detail-panel.open{display:flex}
-  .panel-btn{min-width:44px;min-height:44px;justify-content:center}
-  #cmd-input{font-size:14px}
-  #kbd-help{width:100vw;max-width:100vw;border-radius:0;top:0;left:0;transform:none;height:100vh;overflow-y:auto}
-}
-::-webkit-scrollbar{width:6px}
-::-webkit-scrollbar-track{background:var(--bg)}
-::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-::-webkit-scrollbar-thumb:hover{background:#2a3040}
-</style>
-</head>
-<body>
-<div id="header">
-  <h1>NETWATCH</h1>
-  {% if cam_enabled %}<a href="/cam" title="Camera Sentry (Pro)" style="color:var(--green);font-size:11px;text-decoration:none;border:1px solid var(--border);border-radius:3px;padding:3px 8px">&#9673; CAM</a>{% endif %}
-  <span class="stat"><b id="s-pkts">0</b> pkts</span>
-  <span class="stat"><b id="s-bytes">0B</b></span>
-  <span class="stat"><b id="s-hosts">0</b> hosts</span>
-  <span class="stat" style="color:var(--dim)" id="s-time"></span>
-  <div class="services" id="svc-bar"></div>
-  <span class="sr-only" id="theme-sel-label">Theme</span>
-  <select id="theme-sel" aria-labelledby="theme-sel-label" style="background:var(--surface);color:var(--fg);border:1px solid var(--border);padding:3px 6px;font-size:10px;font-family:inherit;border-radius:3px;cursor:pointer" title="Theme">
-    <option value="">Terminal</option><option value="theme-matrix">Matrix</option><option value="theme-midnight">Midnight</option><option value="theme-cyberpunk">Cyberpunk</option><option value="theme-light">Light</option>
-  </select>
-  <span class="sr-only" id="scan-sel-label">CRT scanlines</span>
-  <select id="scanline-sel" aria-labelledby="scan-sel-label" style="background:var(--surface);color:var(--fg);border:1px solid var(--border);padding:3px 6px;font-size:10px;font-family:inherit;border-radius:3px;cursor:pointer" title="CRT Scanlines">
-    <option value="">CRT Off</option><option value="soft">CRT Soft</option><option value="heavy">CRT Heavy</option>
-  </select>
-  <button id="kbd-help-btn" title="Keyboard shortcuts (press ?)" aria-label="Show keyboard shortcuts" style="background:var(--surface);color:var(--fg);border:1px solid var(--border);padding:2px 8px;font-size:11px;font-family:inherit;border-radius:3px;cursor:pointer">?</button>
-  <span class="pulse" style="width:8px;height:8px;border-radius:50%;background:var(--good);display:inline-block" title="Live updates streaming" aria-label="Live updates streaming"></span>
-</div>
-<div id="scanline-overlay"></div>
-<div id="tabs"></div>
-<div id="charts-row" style="display:none;padding:14px 18px 0">
-  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px" id="charts-grid">
-    <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px;height:155px"><div style="color:var(--cyan);font-size:10px;font-weight:700;margin-bottom:2px">TRAFFIC</div><canvas id="chart-traffic"></canvas></div>
-    <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px;height:155px"><div style="color:var(--cyan);font-size:10px;font-weight:700;margin-bottom:2px">PROTOCOLS</div><canvas id="chart-proto"></canvas></div>
-    <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px;height:155px"><div style="color:var(--cyan);font-size:10px;font-weight:700;margin-bottom:2px">THREATS</div><canvas id="chart-threat"></canvas></div>
-  </div>
-</div>
-<div id="content"></div>
-<div id="cmd-bar">
-  <label>nw&gt;</label>
-  <input id="cmd-input" type="text" placeholder="Type command... (scan / geo / whois / recon / deep / help)  Press / to focus" autocomplete="off" spellcheck="false">
-</div>
-<div id="ctx-menu"></div>
-<div id="output-panel" role="region" aria-label="Command output panel">
-  <div id="panel-drag" role="separator" aria-orientation="horizontal" aria-label="Resize output panel"></div>
-  <div id="output-hdr">
-    <span class="title" id="output-title">OUTPUT</span>
-    <button class="panel-btn" id="output-max" title="Maximize" aria-label="Maximize output panel">&#9634;</button>
-    <button class="panel-btn" id="output-close" title="Close" aria-label="Close output panel">&times;</button>
-  </div>
-  <div id="output-body"></div>
-</div>
-<div id="detail-panel" role="dialog" aria-modal="true" aria-labelledby="detail-title">
-  <div id="detail-hdr">
-    <span class="title" id="detail-title">HOST DETAIL</span>
-    <button class="panel-btn" id="detail-close" title="Close" aria-label="Close host detail">&times;</button>
-  </div>
-  <div id="detail-body"></div>
-</div>
-<div id="kbd-help" role="dialog" aria-modal="true" aria-labelledby="kbd-help-title">
-  <h3 id="kbd-help-title">Keyboard Shortcuts</h3>
-  <table>
-    <tr><td><kbd>1</kbd>–<kbd>9</kbd></td><td>Jump to tab</td></tr>
-    <tr><td><kbd>0</kbd></td><td>Proxy tab</td></tr>
-    <tr><td><kbd>Shift</kbd>+<kbd>M</kbd></td><td>Mesh tab</td></tr>
-    <tr><td><kbd>Shift</kbd>+<kbd>H</kbd></td><td>Help tab</td></tr>
-    <tr><td><kbd>R</kbd></td><td>Replay tab</td></tr>
-    <tr><td><kbd>/</kbd></td><td>Focus command bar</td></tr>
-    <tr><td><kbd>?</kbd></td><td>Toggle this overlay</td></tr>
-    <tr><td><kbd>Esc</kbd></td><td>Close any open panel</td></tr>
-  </table>
-  <div class="close-hint">Esc to close</div>
-</div>
-<script>
-const TABS=["all","hosts","proto","dns","honeypot","scan","nmap","arp","alerts","osint","proxy","mesh","fleet","replay","audit","help"];
-let tab="all",D={};
-function $(s){return document.querySelector(s)}
-function $$(s){return document.querySelectorAll(s)}
-function esc(s){const d=document.createElement("div");d.textContent=s;return d.innerHTML}
-function fmtBytes(b){for(const u of["B","KB","MB","GB"]){if(b<1024)return b.toFixed(1)+u;b/=1024}return b.toFixed(1)+"TB"}
-
-function initTabs(){
-  const c=$("#tabs");
-  c.setAttribute("role","tablist");
-  TABS.forEach((t,i)=>{
-    const d=document.createElement("button");
-    d.className="tab"+(t===tab?" active":"");
-    d.setAttribute("role","tab");
-    d.setAttribute("aria-selected",t===tab?"true":"false");
-    d.style.background="transparent";d.style.border="none";d.style.borderBottom="2px solid transparent";
-    d.innerHTML=`<span class="n">${i<9?i+1:0}</span>${t.toUpperCase()}`;
-    d.onclick=()=>_activateTabIdx(i);
-    c.appendChild(d);
-  });
-}
-
-function ipClass(h){
-  if(h.local)return"ip local";
-  if(h.threat_score>=30)return"ip threat-high";
-  if(h.threat_score>=10)return"ip threat-med";
-  return"ip";
-}
-function hpClass(svc){
-  if(["credential","malware_attempt","ftp_upload"].includes(svc))return"hp-cred";
-  if(["telnet","telnet_cmd"].includes(svc))return"hp-telnet";
-  if(svc.startsWith("ftp"))return"hp-ftp";
-  if(svc.startsWith("rtsp"))return"hp-rtsp";
-  return"hp-http";
-}
-
-function renderHosts(list,limit){
-  const h=list||D.hosts||[];
-  const show=h.slice(0,limit||h.length);
-  let s=`<table><tr><th style="width:140px">IP</th><th style="width:160px">Hostname</th><th style="width:80px">In</th><th style="width:80px">Out</th><th style="width:60px">Pkts</th><th style="width:50px">Ports</th><th style="width:60px">Threat</th><th>Tags</th></tr>`;
-  show.forEach(h=>{
-    const tags=h.tags.map(t=>`<span class="tag">${esc(t)}</span>`).join("");
-    const thr=h.threat_score>0?`<span style="color:${h.threat_score>=30?'var(--red)':h.threat_score>=10?'var(--yellow)':'var(--dim)'}">${h.threat_score}</span>`:`<span style="color:var(--dim)">0</span>`;
-    s+=`<tr class="clickable" onclick="showHostDetail('${esc(h.ip)}')"><td class="${ipClass(h)}"><span class="ip-click" data-ip="${esc(h.ip)}">${esc(h.ip)}</span></td><td>${esc(h.hostname)}</td><td>${fmtBytes(h.bytes_in)}</td><td>${fmtBytes(h.bytes_out)}</td><td>${h.packets.toLocaleString()}</td><td>${h.ports}</td><td>${thr}</td><td>${tags}</td></tr>`;
-  });
-  return s+"</table>";
-}
-function _empty(label,hint){return`<div class="empty-state"><div class="label">${esc(label)}</div><div class="hint">${esc(hint||"")}</div></div>`}
-function _loading(label){return`<div class="loading-state"><div class="label"><span class="spinner"></span>${esc(label)}</div></div>`}
-function renderProto(expanded){
-  const p=D.protocols||[];
-  if(!p.length)return _empty("No protocol data yet","Waiting for tshark to start capturing — check the TSHARK service indicator.");
-  const max=p[0]?.count||1;
-  let s=`<table><tr><th style="width:200px">Protocol</th><th style="width:100px">Count</th><th>Distribution</th></tr>`;
-  p.forEach(x=>{
-    const pct=((x.count/max)*100).toFixed(0);
-    s+=`<tr><td style="color:var(--blue)">${esc(x.name)}</td><td>${x.count.toLocaleString()}</td><td><div class="bar-wrap"><div class="bar-fill proto-bar" style="width:${pct}%"></div></div></td></tr>`;
-  });
-  return s+"</table>";
-}
-function renderDNS(limit){
-  const d=(D.dns||[]).slice(-(limit||50)).reverse();
-  if(!d.length)return _empty("No DNS queries yet","Run nslookup or wait for traffic with DNS lookups.");
-  let s=`<table><tr><th style="width:80px">Time</th><th style="width:140px">IP</th><th>Domain</th></tr>`;
-  d.forEach(e=>{s+=`<tr><td style="color:var(--dim)">${esc(e.time)}</td><td class="ip"><span class="ip-click" data-ip="${esc(e.ip)}">${esc(e.ip)}</span></td><td style="color:var(--magenta)">${esc(e.domain)}</td></tr>`});
-  return s+"</table>";
-}
-function renderHP(limit){
-  // HTTP events live in the Scan tab (they're high-volume scanner noise that drowns out
-  // credential/telnet/ftp/rtsp signal). Mirrors the TUI's _section_honeypot(show_http=False) default.
-  const h=(D.honeypot||[]).filter(e=>e.service!=="http").slice(-(limit||50)).reverse();
-  if(!h.length)return _empty("No honeypot hits yet","Console mode shows a remote node's attacks; sensor mode listens locally on :2323 / :2121 / :8080 / :8554 (map 23/21/80/554 via NAT).");
-  let s=`<table><tr><th style="width:70px">Time</th><th style="width:100px">Service</th><th style="width:130px">IP</th><th>Summary</th></tr>`;
-  h.forEach(e=>{s+=`<tr><td style="color:var(--dim)">${esc(e.time)}</td><td class="${hpClass(e.service)}">${esc(e.service)}</td><td class="ip"><span class="ip-click" data-ip="${esc(e.ip)}">${esc(e.ip)}</span></td><td>${esc(e.summary)}</td></tr>`});
-  return s+"</table>";
-}
-function renderScan(limit){
-  // HTTP probes split out from the honeypot tab — Mirai/CVE scanners hammer :80 constantly,
-  // so this view is its own signal class (path coverage, user agents, scanner identification).
-  const h=(D.honeypot||[]).filter(e=>e.service==="http").slice(-(limit||100)).reverse();
-  if(!h.length)return _empty("No HTTP probes yet","HTTP scan/probe traffic appears here once attackers hit :80.");
-  let s=`<table><tr><th style="width:70px">Time</th><th style="width:130px">IP</th><th>Probe</th></tr>`;
-  h.forEach(e=>{s+=`<tr><td style="color:var(--dim)">${esc(e.time)}</td><td class="ip"><span class="ip-click" data-ip="${esc(e.ip)}">${esc(e.ip)}</span></td><td>${esc(e.summary)}</td></tr>`});
-  return s+"</table>";
-}
-function renderNmap(){
-  const n=D.nmap||[];
-  const status=D.nmap_running?`<span style="color:var(--yellow);animation:pulse 1s infinite">SCANNING...</span>`:`<span style="color:var(--dim)">idle</span>`;
-  let s=`<div class="section-title">NMAP ${status} <span class="count">(${n.length} results)</span></div>`;
-  if(!n.length)return s+_empty("No scans yet","Type 'scan <ip>' or 'deep <ip>' in the command bar.");
-  const ips=new Set();
-  n.forEach(r=>{const m=r.line.match(/(\d+\.\d+\.\d+\.\d+)/);if(m)ips.add(m[1])});
-  if(ips.size){
-    s+=`<div style="margin:8px 0;display:flex;gap:6px;flex-wrap:wrap">`;
-    ips.forEach(ip=>{s+=`<span class="ip-click port-chip" data-ip="${esc(ip)}" onclick="showScanDetail('${esc(ip)}')" style="cursor:pointer">${esc(ip)}</span>`});
-    s+=`</div>`;
-  }
-  s+=`<table><tr><th style="width:70px">Time</th><th>Result</th></tr>`;
-  n.slice(-30).reverse().forEach(r=>{
-    const m=r.line.match(/(\d+\.\d+\.\d+\.\d+)/);
-    const click=m?` class="clickable" onclick="showScanDetail('${esc(m[1])}')"`:"";
-    s+=`<tr${click}><td style="color:var(--dim)">${esc(r.time)}</td><td>${esc(r.line)}</td></tr>`;
-  });
-  return s+"</table>";
-}
-function renderARP(){
-  const a=D.arp||[];
-  if(!a.length)return _empty("No ARP entries yet","ARP monitor watches your subnet — devices appear as they speak on the wire.");
-  let s=`<table><tr><th style="width:180px">MAC</th><th style="width:140px">IP</th><th>State</th></tr>`;
-  a.forEach(e=>{s+=`<tr class="clickable" onclick="showHostDetail('${esc(e.ip)}')"><td style="color:var(--cyan)">${esc(e.mac)}</td><td class="ip"><span class="ip-click" data-ip="${esc(e.ip)}">${esc(e.ip)}</span></td><td style="color:var(--dim)">${esc(e.state)}</td></tr>`});
-  return s+"</table>";
-}
-function renderAlerts(){
-  const a=(D.alerts||[]).slice(-50).reverse();
-  if(!a.length)return _empty("All quiet","No threat alerts yet. Alerts appear here when scoring fires or honeypots see credentials.");
-  let s=`<table><tr><th style="width:70px">Time</th><th>Alert</th></tr>`;
-  a.forEach(e=>{
-    const m=e.msg.match(/(\d+\.\d+\.\d+\.\d+)/);
-    const click=m?` class="clickable" onclick="showHostDetail('${esc(m[1])}')"`:"";
-    s+=`<tr class="alert-row"${click}><td>${esc(e.time)}</td><td>${esc(e.msg)}</td></tr>`;
-  });
-  return s+"</table>";
-}
-function renderOSINT(){
-  const o=(D.osint||[]).slice(-50).reverse();
-  if(!o.length)return _empty("No OSINT results yet","Run geo, whois, abuse, ssl, recon, etc. — results show here as they finish.");
-  let s=`<table><tr><th style="width:70px">Time</th><th style="width:60px">Type</th><th style="width:160px">Target</th><th>Result</th><th style="width:60px">Detail</th></tr>`;
-  o.forEach(r=>{
-    const cls={"GEO":"osint-geo","DNS":"osint-dns","SCAN":"osint-scan","ABUSE":"osint-abuse","WHOIS":"osint-whois","CRT":"osint-dns","SSL":"osint-geo","PING":"osint-scan","SECHDR":"osint-abuse","TECH":"osint-whois"}[r.type]||"";
-    const isIP=/^\d+\.\d+\.\d+\.\d+$/.test(r.target);
-    const detailBtn=isIP?`<span class="port-chip" style="cursor:pointer" onclick="showHostDetail('${esc(r.target)}')">View</span>`:"";
-    s+=`<tr class="osint-row"><td style="color:var(--dim)">${esc(r.time)}</td><td class="${cls}" style="font-weight:700">${esc(r.type)}</td><td>${isIP?`<span class="ip-click" data-ip="${esc(r.target)}">${esc(r.target)}</span>`:esc(r.target)}</td><td style="white-space:normal;word-break:break-word">${esc(r.result)}</td><td>${detailBtn}</td></tr>`;
-  });
-  return s+"</table>";
-}
-function renderProxy(){
-  let s="";
-  if(D.proxy_active){s+=`<div style="color:var(--green);font-weight:700;margin-bottom:12px">PROXY ACTIVE</div>`}
-  else{s+=`<div style="color:var(--dim);margin-bottom:12px">Proxy not active. Use <span style="color:var(--green)">proxy add socks5 127.0.0.1:9050</span> to configure.</div>`}
-  return s;
-}
-let _replayCache=null,_replayCacheAt=0,_replayProto="ftp",_replayFilter="";
-let _fleetCache=null,_fleetTimer=null;
-function renderFleet(){
-  let s=`<div class="section-title">REMOTE NODES — live <span class="count" id="fleet-count">(loading...)</span></div>`;
-  s+=`<div id="fleet-body">${_loading("Connecting to remote node(s)...")}</div>`;
-  setTimeout(_fleetMount,0);
-  return s;
-}
-function _fleetMount(){
-  _fleetRefresh();
-  if(_fleetTimer)clearInterval(_fleetTimer);
-  // auto-refresh on the node's poll cadence while this tab is open
-  _fleetTimer=setInterval(()=>{ if(tab==="fleet")_fleetRefresh(); else {clearInterval(_fleetTimer);_fleetTimer=null;} }, 12000);
-}
-async function _fleetRefresh(){
-  try{const r=await fetch("/api/fleet",{credentials:"same-origin"});_fleetCache=await r.json();}
-  catch(e){_fleetCache={nodes:[],total:0};}
-  _fleetPaint();
-}
-function _hiveNudge(){
-  // One-line invite to join the community hive. Server says joined via
-  // /api/state (D.hive_joined); dismissal is per-browser (localStorage).
-  try{
-    if((typeof D==="object"&&D&&D.hive_joined)||localStorage.getItem("nw_hive_nudge")==="off")return "";
-  }catch(e){return "";}
-  return `<div class="meta" style="border:1px solid var(--dim);border-radius:4px;padding:6px 10px;margin-bottom:10px">🐝 Join the hive — burned once, blocked everywhere. Run <b>join community</b> in the command bar. <a href="#" onclick="localStorage.setItem('nw_hive_nudge','off');_fleetPaint();return false" style="color:var(--dim)">dismiss</a></div>`;
-}
-function _fleetPaint(){
-  const body=document.getElementById("fleet-body");if(!body)return;
-  const d=_fleetCache||{nodes:[]};
-  const cnt=document.getElementById("fleet-count");if(cnt)cnt.textContent="("+(d.total||0)+")";
-  if((!d.nodes||!d.nodes.length)&&!d.apiary){
-    body.innerHTML=_hiveNudge()+_empty("No fleet nodes","Track a node:  remote add droplet https://<tunnel-or-ip:9090> <web-token>  —  or run a hub:  collector  (nodes join it with:  join <hub> <id> <key>).");
-    return;
-  }
-  let h=_hiveNudge();
-  for(const n of d.nodes){
-    h+=`<div class="section-title">◉ ${esc(n.name)} <span class="count">${esc(n.url)}${n.age!=null?" · "+n.age+"s ago":""}</span></div>`;
-    const data=n.data;
-    if(!data){h+=`<div class="empty">connecting...</div>`;continue;}
-    if(data._error){h+=`<div class="empty" style="color:var(--red)">${esc(data._error)} — check url / token</div>`;continue;}
-    const num=v=>(typeof v==="number"&&isFinite(v))?v:0;
-    const td=(data.threat_dist&&typeof data.threat_dist==="object")?data.threat_dist:{};
-    h+=`<div class="meta">Uptime ${esc(String(data.uptime||"?"))} · ${num(data.host_count)} hosts · ${num(data.total_packets).toLocaleString()} pkts · ${esc(String(data.total_bytes_fmt||"?"))} · iface ${esc(String(data.iface||"?"))}</div>`;
-    h+=`<div class="meta">Threats: <span style="color:var(--red)">high=${num(td.high)}</span> med=${num(td.medium)} low=${num(td.low)} clean=${num(td.clean)}</div>`;
-    const hp=Array.isArray(data.honeypot)?data.honeypot.filter(e=>e&&typeof e==="object"):[];
-    if(hp.length){
-      const by={};
-      for(const e of hp){const ip=String(e.ip||"?");(by[ip]=by[ip]||[]).push(e);}
-      h+=`<table><tr><th style="width:140px">Attacker</th><th style="width:70px">Hits</th><th>Services</th></tr>`;
-      Object.entries(by).sort((a,b)=>b[1].length-a[1].length).slice(0,10).forEach(([ip,evs])=>{
-        const svcs=[...new Set(evs.map(e=>String(e.service||"?")))].join(",");
-        h+=`<tr><td class="ip" style="color:var(--red)">${esc(ip)}</td><td>${evs.length}</td><td>${esc(svcs)}</td></tr>`;
-      });
-      h+=`</table>`;
-    }else{h+=`<div class="empty">No honeypot hits in the current window.</div>`;}
-    const al=Array.isArray(data.alerts)?data.alerts.filter(a=>a&&typeof a==="object"):[];
-    if(al.length){
-      h+=`<div class="section-title">Latest alerts</div>`;
-      al.slice(-6).forEach(a=>{h+=`<div class="alert-row"><span style="color:var(--dim)">${esc(String(a.time||""))}</span> ${esc(String(a.msg||""))}</div>`;});
-    }
-  }
-  if(!d.paying&&d.total>1){h+=`<div class="empty">+${d.total-1} more node(s) hidden — upgrade to Pro for full fleet view.</div>`;}
-  if(d.seats&&typeof d.seats==="object"){
-    const lim=d.seats.limit,used=Number(d.seats.used||0);
-    const full=(lim!=null&&used>=Number(lim));
-    h+=`<div class="meta" style="${full?"color:var(--red)":""}">Hub seats: ${used}/${lim==null?"unlimited":Number(lim)}${full?" — FULL (revoke a node or upgrade)":""}</div>`;
-  }
-  if(d.apiary){h+=_renderApiary(d.apiary);}
-  body.innerHTML=h;
-}
-function _renderApiary(ap){
-  let h=`<div class="section-title">APIARY HUB — fleet rollup <span class="count">${Number(ap.total_events||0).toLocaleString()} events · ${Number(ap.nodes_active||0)} active</span></div>`;
-  const nodes=Array.isArray(ap.nodes)?ap.nodes:[];
-  if(nodes.length){
-    h+=`<table><tr><th>Node</th><th style="width:80px">Events</th><th>Last seen</th></tr>`;
-    nodes.slice(0,12).forEach(n=>{
-      const rev=n&&n.revoked?` <span style="color:var(--red)">[revoked]</span>`:"";
-      h+=`<tr><td>${esc(String((n&&(n.name||n.node_id))||"?"))}${rev}</td><td>${Number((n&&n.events)||0).toLocaleString()}</td><td style="color:var(--dim)">${esc(String((n&&n.last_seen)||"-"))}</td></tr>`;
-    });
-    h+=`</table>`;
-  }
-  const svc=Array.isArray(ap.top_services)?ap.top_services:[];
-  if(svc.length){h+=`<div class="meta">Top services: ${svc.slice(0,6).map(x=>esc(String(x[0]))+":"+Number(x[1]||0)).join("  ")}</div>`;}
-  const src=Array.isArray(ap.top_sources)?ap.top_sources:[];
-  if(src.length){h+=`<div class="meta">Top sources: ${src.slice(0,6).map(x=>esc(String(x[0]))+"("+Number(x[1]||0)+")").join("  ")}</div>`;}
-  const cx=ap.cortex;
-  if(cx){
-    h+=`<div class="section-title">CORTEX brain <span class="count">${Number(cx.attackers||0).toLocaleString()} attackers · ${Number(cx.trained_on||0).toLocaleString()} events · peak novelty ${Number(cx.peak_score||0)}</span></div>`;
-    const at=Array.isArray(cx.top_attackers)?cx.top_attackers:[];
-    if(at.length){
-      h+=`<table><tr><th>Attacker</th><th style="width:70px">Novelty</th><th style="width:60px">Hits</th><th>Services</th></tr>`;
-      at.slice(0,8).forEach(a=>{
-        const svcs=Array.isArray(a&&a.services)?a.services.map(s=>esc(String(s))).join(", "):"";
-        h+=`<tr><td>${esc(String((a&&a.ip)||"?"))}</td><td>${Number((a&&a.score)||0)}</td><td>${Number((a&&a.hits)||0).toLocaleString()}</td><td style="color:var(--dim)">${svcs}</td></tr>`;
-      });
-      h+=`</table>`;
-    }
-  }
-  return h;
-}
-function renderReplay(){
-  let s=`<div class="section-title">SESSION REPLAY
-    <span class="count" id="replay-count">(loading...)</span>
-    <span style="margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-      <input id="replay-filter" placeholder="filter ip / id..." value="${esc(_replayFilter)}"
-        style="background:var(--bg);border:1px solid var(--border);color:var(--fg);font:inherit;font-size:11px;padding:3px 8px;border-radius:3px;width:160px;outline:none">
-      <button onclick="_replayRefresh(true)" aria-label="Refresh sessions" title="Refresh"
-        style="background:var(--surface);color:var(--fg);border:1px solid var(--border);padding:3px 10px;border-radius:3px;cursor:pointer;font:inherit;font-size:11px">&#x21bb; Refresh</button>
-    </span>
-  </div>`;
-  s+=`<div id="replay-body">${_loading("Loading captured sessions...")}</div>`;
-  // schedule render after innerHTML flush
-  setTimeout(_replayMount,0);
-  return s;
-}
-function _replayMount(){
-  const inp=document.getElementById("replay-filter");
-  if(inp){
-    inp.oninput=()=>{_replayFilter=inp.value.trim().toLowerCase();_replayPaint()};
-    inp.focus();const v=inp.value;inp.value="";inp.value=v;
-  }
-  _replayRefresh(false);
-}
-async function _replayRefresh(force){
-  const fresh=force||!_replayCache||(Date.now()-_replayCacheAt>15000);
-  if(fresh){
-    try{
-      const r=await fetch("/api/replay");
-      _replayCache=await r.json();_replayCacheAt=Date.now();
-    }catch(e){_replayCache=[]}
-  }
-  _replayPaint();
-}
-function _replayPaint(){
-  const body=document.getElementById("replay-body");
-  const cnt=document.getElementById("replay-count");
-  if(!body)return;
-  const all=Array.isArray(_replayCache)?_replayCache:[];
-  const f=_replayFilter;
-  const rows=f?all.filter(s=>(s.session_id||"").toLowerCase().includes(f)||(s.ip||"").toLowerCase().includes(f)):all;
-  if(cnt)cnt.textContent=`(${rows.length}${f?` / ${all.length}`:""} sessions)`;
-  if(!rows.length){
-    body.innerHTML=f?_empty("No sessions match the filter","Clear the filter to see all captured sessions.")
-      :_empty("No replay sessions yet","Captured FTP/Telnet sessions land in logs/ — wait for honeypot hits or sync the droplet captures.");
-    return;
-  }
-  let h=`<table class="fade-in"><tr>
-    <th style="width:90px">When</th><th style="width:60px">Proto</th><th style="width:140px">IP</th>
-    <th>Session ID</th><th style="width:80px;text-align:right">Size</th><th style="width:90px">Action</th></tr>`;
-  rows.slice(0,200).forEach(s=>{
-    const when=_fmtAgo(s.started_at_mtime);
-    const protoCls=s.protocol==="telnet"?"hp-telnet":"hp-ftp";
-    h+=`<tr><td style="color:var(--muted)">${esc(when)}</td>`+
-       `<td><span class="${protoCls}" style="font-weight:600;text-transform:uppercase">${esc(s.protocol||"?")}</span></td>`+
-       `<td class="ip"><span class="ip-click" data-ip="${esc(s.ip||"")}">${esc(s.ip||"")}</span></td>`+
-       `<td style="color:var(--fg);font-size:11px">${esc(s.session_id)}</td>`+
-       `<td style="text-align:right;color:var(--muted)">${(s.event_count||0).toLocaleString()}</td>`+
-       `<td><button onclick="showReplayDetail('${esc(s.session_id)}','${esc(s.protocol||"ftp")}')" `+
-       `aria-label="Replay session ${esc(s.session_id)}" `+
-       `style="background:var(--accent);color:var(--bg);border:none;padding:3px 10px;border-radius:3px;cursor:pointer;font:inherit;font-size:11px;font-weight:600">&#9658; Play</button></td></tr>`;
-  });
-  h+=`</table>`;
-  if(rows.length>200)h+=`<div style="color:var(--muted);font-size:11px;padding:8px 0">Showing 200 of ${rows.length}. Use the filter to narrow.</div>`;
-  body.innerHTML=h;
-}
-function _fmtAgo(iso){
-  if(!iso)return"—";
-  const t=new Date(iso).getTime();
-  if(!t)return iso;
-  const s=Math.max(0,Math.floor((Date.now()-t)/1000));
-  if(s<60)return s+"s ago";
-  if(s<3600)return Math.floor(s/60)+"m ago";
-  if(s<86400)return Math.floor(s/3600)+"h ago";
-  return Math.floor(s/86400)+"d ago";
-}
-function showReplayDetail(sid,proto){
-  const p=$("#detail-panel"),b=$("#detail-body"),t=$("#detail-title");
-  t.textContent=`Replay: ${sid} (${proto.toUpperCase()})`;
-  b.innerHTML=`<iframe src="/replay/${encodeURIComponent(sid)}?proto=${encodeURIComponent(proto)}" `+
-    `title="Session replay player for ${esc(sid)}" `+
-    `style="width:100%;height:70vh;border:1px solid var(--border);border-radius:4px;background:var(--bg)"></iframe>`;
-  p.classList.add("open");
-}
-
-function renderMesh(){
-  if(!D.mesh_connected)return _empty("Meshtastic not connected","Plug a LoRa radio (T-Beam / Heltec) over USB and restart NetWatch.");
-  let s=`<div style="color:var(--green);font-weight:700;margin-bottom:8px">MESH RADIO CONNECTED</div>`;
-  s+=`<div style="margin-bottom:12px;color:var(--dim)">Nodes: ${D.mesh_nodes||0} | Messages: ${D.mesh_msgs||0} | Alert forwarding: ${D.mesh_alert_fwd?"ON":"OFF"}</div>`;
-  s+=`<div style="margin-bottom:8px"><input id="mesh-input" type="text" placeholder="Send mesh message..." style="background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:inherit;font-size:12px;padding:6px 10px;border-radius:4px;width:60%;outline:none"><button onclick="sendMesh()" style="background:var(--green);color:var(--bg);border:none;padding:6px 14px;margin-left:6px;border-radius:4px;cursor:pointer;font-family:inherit;font-weight:700">SEND</button></div>`;
-  return s;
-}
-function renderHelp(){
-  const S="color:var(--cyan);font-size:13px;font-weight:700;margin:16px 0 8px;border-bottom:1px solid var(--border);padding-bottom:4px";
-  const C="color:var(--green)";
-  const D2="color:var(--dim);font-size:11px";
-  let s=`<div style="max-width:800px">`;
-  s+=`<div style="color:var(--red);font-size:16px;font-weight:700;margin-bottom:4px">NETWATCH COMMAND REFERENCE</div>`;
-  s+=`<div style="${D2};margin-bottom:16px">Type any command in the bar below. Use @N to reference IPs by index from the hosts list.</div>`;
-  s+=`<div style="${S}">OSINT (16 tools)</div><table>`;
-  s+=`<tr><th style="width:180px">Command</th><th>Description</th></tr>`;
-  const osint=[["geo &lt;ip&gt;","IP geolocation"],["whois &lt;ip/domain&gt;","WHOIS lookup"],["dnsinfo &lt;domain&gt;","DNS enumeration (A/AAAA/MX/NS/TXT/SOA/CNAME/SRV)"],
-    ["rdns &lt;ip&gt;","Reverse DNS (PTR)"],["ssl &lt;host&gt; [port]","TLS certificate inspection"],["secheaders &lt;url&gt;","Security header audit + grade"],
-    ["techstack &lt;url&gt;","Web technology fingerprinting"],["ping &lt;ip&gt; [count]","Jitter analysis + TTL OS guess"],
-    ["health &lt;target&gt;","Full profile (ping + SSL + headers + tech + geo + DNS)"],["etrace &lt;target&gt;","Enriched traceroute with per-hop GeoIP"],
-    ["portscan &lt;ip&gt;","Socket-based top 1000 port scan"],["subnet [cidr]","Threaded ping sweep"],
-    ["crt &lt;domain&gt;","Certificate transparency search"],["headers &lt;url&gt;","HTTP response headers"],
-    ["asn &lt;ip&gt;","ASN/BGP info"],["abuse &lt;ip&gt;","IP reputation check"],["speed","Network speed test"],["ifinfo","Local interface + routing info"]];
-  osint.forEach(([c,d])=>{s+=`<tr><td style="${C}">${c}</td><td>${d}</td></tr>`});
-  s+=`</table>`;
-  s+=`<div style="${S}">Scanning</div><table><tr><th style="width:180px">Command</th><th>Description</th></tr>`;
-  [["scan &lt;ip&gt; [preset]","Nmap scan (quick/syn/udp/ping/full)"],["deep &lt;ip&gt;","All ports + vuln scripts"],
-   ["stealth &lt;ip&gt;","SYN scan through Tor"],["recon &lt;ip&gt;","Full OSINT profile"],["fullrecon &lt;ip&gt;","7-phase recon chain"],
-   ["sweep [cidr]","ARP + ping + port scan"],["banner &lt;ip&gt; &lt;port&gt;","Service banner grab"],["trace &lt;ip&gt;","Traceroute"]
-  ].forEach(([c,d])=>{s+=`<tr><td style="${C}">${c}</td><td>${d}</td></tr>`});
-  s+=`</table>`;
-  s+=`<div style="${S}">Tracking &amp; Capture</div><table><tr><th style="width:180px">Command</th><th>Description</th></tr>`;
-  [["track &lt;ip&gt; [secs]","Live packet tail (tshark)"],["untrack &lt;ip&gt;","Stop tracking"],
-   ["conns &lt;ip&gt;","TCP conversation capture"],["sniff &lt;ip&gt; [secs]","Raw payload capture"],
-   ["trackdns &lt;ip&gt;","DNS query capture"],["tracking","List active tracks"],
-   ["pcap start/stop","PCAP recording to file"]
-  ].forEach(([c,d])=>{s+=`<tr><td style="${C}">${c}</td><td>${d}</td></tr>`});
-  s+=`</table>`;
-  s+=`<div style="${S}">Smart Filters</div><table><tr><th style="width:180px">Command</th><th>Description</th></tr>`;
-  [["top [n]","Top N talkers"],["sus","Suspicious hosts (threat > 0)"],["new [mins]","Recently appeared"],
-   ["loud","Most ports touched"],["find &lt;pattern&gt;","Search all data"],["ports &lt;port&gt;","Hosts using port"],
-   ["country &lt;CC&gt;","Filter by country"],["whowatch","Active attackers"],["summary","Network overview"]
-  ].forEach(([c,d])=>{s+=`<tr><td style="${C}">${c}</td><td>${d}</td></tr>`});
-  s+=`</table>`;
-  s+=`<div style="${S}">Attack Analysis</div><table><tr><th style="width:180px">Command</th><th>Description</th></tr>`;
-  [["inspect [n]","View honeypot event detail"],["analyze &lt;ip&gt;","Attacker profile"],
-   ["decode &lt;data&gt;","Decode payload"],["sessions","All attacker IPs"],
-   ["attackers","Honeypot IPs"],["profile &lt;ip&gt;","Recon report"],
-   ["timeline &lt;ip&gt;","Full event history"],["report &lt;ip&gt;","Save full report"]
-  ].forEach(([c,d])=>{s+=`<tr><td style="${C}">${c}</td><td>${d}</td></tr>`});
-  s+=`</table>`;
-  s+=`<div style="${S}">Defense</div><table><tr><th style="width:180px">Command</th><th>Description</th></tr>`;
-  [["block &lt;ip&gt;","iptables DROP"],["unblock &lt;ip&gt;","Remove block"],
-   ["blocked","List current rules"],["diffarp","ARP table change detection"]
-  ].forEach(([c,d])=>{s+=`<tr><td style="${C}">${c}</td><td>${d}</td></tr>`});
-  s+=`</table>`;
-  s+=`<div style="${S}">Tags, Notes &amp; Watchlist</div><table><tr><th style="width:180px">Command</th><th>Description</th></tr>`;
-  [["tag &lt;ip&gt; &lt;label&gt;","Label an IP"],["tag list","Show all tags"],["note &lt;ip&gt; &lt;text&gt;","Add note"],
-   ["watch &lt;ip&gt;","Add to watchlist"],["watch list","Show watchlist"],["watch rm &lt;ip&gt;","Remove from watchlist"]
-  ].forEach(([c,d])=>{s+=`<tr><td style="${C}">${c}</td><td>${d}</td></tr>`});
-  s+=`</table>`;
-  s+=`<div style="${S}">Batch Operations</div><table><tr><th style="width:180px">Command</th><th>Description</th></tr>`;
-  [["scanall [list]","Scan all IPs in list"],["reconall [list]","Full recon all"],
-   ["geoall [list]","Geolocate all"],["whoisall [list]","WHOIS all"],
-   ["blockall attackers","Block all honeypot IPs"]
-  ].forEach(([c,d])=>{s+=`<tr><td style="${C}">${c}</td><td>${d}</td></tr>`});
-  s+=`</table>`;
-  s+=`<div style="${D2};margin-top:8px">Lists: hosts, attackers, arp, nmap, watchlist, tracked, blocked</div>`;
-  s+=`<div style="${S}">Proxy / Tor</div><table><tr><th style="width:180px">Command</th><th>Description</th></tr>`;
-  [["proxy add &lt;type&gt; &lt;h:p&gt;","Add proxy (socks4/socks5/http)"],["proxy list","Show configured proxies"],
-   ["proxy test [n]","Test proxy connection"],["proxy start","Start Tor circuits"],["proxy rotate","Toggle rotation"]
-  ].forEach(([c,d])=>{s+=`<tr><td style="${C}">${c}</td><td>${d}</td></tr>`});
-  s+=`</table>`;
-  s+=`<div style="${S}">Mesh Radio</div><table><tr><th style="width:180px">Command</th><th>Description</th></tr>`;
-  [["mesh send &lt;text&gt;","Send mesh message"],["mesh status","Connection info"],
-   ["mesh nodes","List mesh nodes"],["mesh alert on/off","Toggle alert forwarding"]
-  ].forEach(([c,d])=>{s+=`<tr><td style="${C}">${c}</td><td>${d}</td></tr>`});
-  s+=`</table>`;
-  s+=`<div style="${S}">Export &amp; System</div><table><tr><th style="width:180px">Command</th><th>Description</th></tr>`;
-  [["exportips [list]","Save IPs to file"],["report &lt;ip&gt;","Full text report"],
-   ["export","Save traffic JSON"],["clear","Clear output"],
-   ["status","Service info"],["help","This page"]
-  ].forEach(([c,d])=>{s+=`<tr><td style="${C}">${c}</td><td>${d}</td></tr>`});
-  s+=`</table>`;
-  s+=`<div style="${D2};margin-top:16px;border-top:1px solid var(--border);padding-top:8px">Keyboard: 1-0 = tab switch &nbsp;|&nbsp; / = focus command bar &nbsp;|&nbsp; ESC = close panels &nbsp;|&nbsp; Click any IP for context menu</div>`;
-  s+=`</div>`;
-  return s;
-}
-
-let _charts={};
-function _css(n){return getComputedStyle(document.body).getPropertyValue(n).trim()||"#c8ccd4"}
-function _rgba(hex,a){
-  const h=hex.replace("#","");
-  if(h.length!==3&&h.length!==6)return hex;
-  const v=h.length===3?h.split("").map(c=>c+c).join(""):h;
-  const r=parseInt(v.slice(0,2),16),g=parseInt(v.slice(2,4),16),b=parseInt(v.slice(4,6),16);
-  return`rgba(${r},${g},${b},${a})`;
-}
-function _chartPalette(){
-  return{
-    fg:_css("--fg"),muted:_css("--muted"),accent:_css("--accent"),
-    info:_css("--info"),good:_css("--good"),warn:_css("--warn"),
-    magenta:_css("--magenta"),blue:_css("--blue"),
-    threatHigh:_css("--threat-high"),threatMed:_css("--threat-med"),threatLow:_css("--threat-low"),
-    grid:_rgba(_css("--fg")||"#fff",.05),gridSubtle:_rgba(_css("--fg")||"#fff",.03)
-  };
-}
-function initCharts(){
-  if(typeof Chart==="undefined")return;
-  if(_charts.traffic)return;
-  const ctx1=document.getElementById("chart-traffic");
-  const ctx2=document.getElementById("chart-proto");
-  const ctx3=document.getElementById("chart-threat");
-  if(!ctx1||!ctx2||!ctx3)return;
-  const p=_chartPalette();
-  const cfg={responsive:true,maintainAspectRatio:false,animation:{duration:300},
-    plugins:{legend:{labels:{color:p.fg,font:{size:10}}}}};
-  _charts.traffic=new Chart(ctx1,{type:"line",data:{labels:[],datasets:[
-    {label:"Packets",data:[],borderColor:p.info,backgroundColor:_rgba(p.info,.1),fill:true,tension:.3,pointRadius:0},
-    {label:"Bytes (KB)",data:[],borderColor:p.accent,backgroundColor:_rgba(p.accent,.1),fill:true,tension:.3,pointRadius:0,yAxisID:"y1"}
-  ]},options:{...cfg,scales:{x:{ticks:{color:p.muted,maxTicksLimit:8},grid:{color:p.gridSubtle}},
-    y:{ticks:{color:p.info},grid:{color:p.grid}},
-    y1:{position:"right",ticks:{color:p.accent},grid:{drawOnChartArea:false}}}}});
-  _charts.proto=new Chart(ctx2,{type:"doughnut",data:{labels:[],datasets:[{data:[],
-    backgroundColor:[p.info,p.accent,p.good,p.warn,p.magenta,p.blue,p.threatMed,p.threatLow,p.fg,p.muted]}]},
-    options:{...cfg,plugins:{...cfg.plugins,legend:{position:"right",labels:{color:p.fg,font:{size:10},padding:8}}}}});
-  _charts.threat=new Chart(ctx3,{type:"bar",data:{labels:["Clean","Low","Medium","High"],datasets:[{data:[0,0,0,0],
-    backgroundColor:[_rgba(p.good,.15),_rgba(p.warn,.15),_rgba(p.threatMed,.18),_rgba(p.threatHigh,.2)],
-    borderColor:[p.good,p.warn,p.threatMed,p.threatHigh],borderWidth:1}]},
-    options:{...cfg,plugins:{...cfg.plugins,legend:{display:false}},
-    scales:{x:{ticks:{color:p.muted},grid:{color:p.gridSubtle}},
-    y:{ticks:{color:p.muted},grid:{color:p.grid}}}}});
-}
-function _destroyCharts(){
-  ["traffic","proto","threat"].forEach(k=>{if(_charts[k]){_charts[k].destroy();delete _charts[k]}});
-}
-
-let _tsData=[];
-function updateCharts(){
-  if(!_charts.traffic)return;
-  const td=D.threat_dist||{};
-  _charts.threat.data.datasets[0].data=[td.clean||0,td.low||0,td.medium||0,td.high||0];
-  _charts.threat.update();
-  const p=D.protocols||[];
-  _charts.proto.data.labels=p.map(x=>x.name);
-  _charts.proto.data.datasets[0].data=p.map(x=>x.count);
-  _charts.proto.update();
-}
-function loadTimeseries(){
-  fetch("/api/timeseries").then(r=>r.json()).then(samples=>{
-    if(!_charts.traffic||!samples.length)return;
-    _tsData=samples;
-    const labels=samples.map(s=>{const d=new Date(s.ts*1000);return d.getHours()+":"+String(d.getMinutes()).padStart(2,"0")});
-    let prevPkts=samples[0].packets;let prevBytes=samples[0].bytes;
-    const pktRates=[];const byteRates=[];
-    samples.forEach((s,i)=>{
-      if(i===0){pktRates.push(0);byteRates.push(0);return}
-      pktRates.push(s.packets-prevPkts);
-      byteRates.push(Math.round((s.bytes-prevBytes)/1024));
-      prevPkts=s.packets;prevBytes=s.bytes;
-    });
-    _charts.traffic.data.labels=labels;
-    _charts.traffic.data.datasets[0].data=pktRates;
-    _charts.traffic.data.datasets[1].data=byteRates;
-    _charts.traffic.update();
-  }).catch(()=>{});
-}
-
-function render(){
-  const c=$("#content"),cr=$("#charts-row");
-  let html="";
-  if(tab==="all"){
-    cr.style.display="block";
-    html+=`<div class="section-title">HOSTS <span class="count">(${D.host_count||0})</span></div>`;
-    html+=renderHosts(null,10);
-    html+=`<div class="section-title">PROTOCOLS <span class="count">(${(D.protocols||[]).length})</span></div>`;
-    html+=renderProto();
-    html+=`<div class="section-title">DNS <span class="count">(${(D.dns||[]).length})</span></div>`;
-    html+=renderDNS(5);
-    html+=`<div class="section-title">HONEYPOT <span class="count">(${(D.honeypot||[]).filter(e=>e.service!=="http").length})</span></div>`;
-    html+=renderHP(5);
-    if((D.alerts||[]).length){html+=`<div class="section-title" style="color:var(--red)">ALERTS <span class="count">(${D.alerts.length})</span></div>`;html+=renderAlerts()}
-  }else{cr.style.display="none"}
-  if(tab==="hosts"){
-    html+=`<div class="section-title">HOSTS <span class="count">(${D.host_count||0})</span></div>`;
-    html+=renderHosts();
-  }else if(tab==="proto"){
-    html+=`<div class="section-title">PROTOCOLS</div>`;
-    html+=renderProto(true);
-  }else if(tab==="dns"){
-    html+=`<div class="section-title">DNS QUERIES</div>`;
-    html+=renderDNS();
-  }else if(tab==="honeypot"){
-    html+=`<div class="section-title">HONEYPOT EVENTS</div>`;
-    html+=renderHP();
-  }else if(tab==="scan"){
-    html+=`<div class="section-title">SCAN PROBES <span class="count">(${(D.honeypot||[]).filter(e=>e.service==="http").length})</span></div>`;
-    html+=renderScan();
-  }else if(tab==="nmap"){
-    html+=renderNmap();
-  }else if(tab==="arp"){
-    html+=`<div class="section-title">DEVICES (ARP) <span class="count">(${(D.arp||[]).length})</span></div>`;
-    html+=renderARP();
-  }else if(tab==="alerts"){
-    html+=`<div class="section-title" style="color:var(--red)">ALERTS <span class="count">(${(D.alerts||[]).length})</span></div>`;
-    html+=renderAlerts();
-  }else if(tab==="osint"){
-    html+=`<div class="section-title">OSINT RESULTS <span class="count">(${(D.osint||[]).length})</span></div>`;
-    html+=renderOSINT();
-  }else if(tab==="proxy"){
-    html+=`<div class="section-title">PROXY / TOR</div>`;
-    html+=renderProxy();
-  }else if(tab==="mesh"){
-    html+=`<div class="section-title">MESH RADIO</div>`;
-    html+=renderMesh();
-  }else if(tab==="fleet"){
-    html+=renderFleet();
-  }else if(tab==="replay"){
-    html+=renderReplay();
-  }else if(tab==="audit"){
-    html+=renderAudit();
-  }else if(tab==="help"){
-    html+=renderHelp();
-  }
-  c.innerHTML=html;
-  if(tab==="all"){initCharts();updateCharts()}
-  if(tab==="audit"){loadAudit()}
-}
-
-let _auditCache=null;
-async function loadAudit(){
-  try{const r=await fetch("/api/audit",{credentials:"same-origin"});_auditCache=await r.json();}
-  catch(e){_auditCache={error:"fetch failed"};}
-  const el=document.getElementById("audit-body");if(el)el.innerHTML=_auditPaint();
-}
-function _auditPaint(){
-  const d=_auditCache;if(!d)return `<div class="empty">loading…</div>`;
-  if(d.error)return `<div class="empty" style="color:var(--red)">${esc(String(d.error))}</div>`;
-  if(d.enabled===false)return _empty("Audit trail (Enterprise)",esc(String(d.hint||"Enterprise feature")));
-  const recs=Array.isArray(d.records)?d.records:[];
-  const v=d.verify||{};
-  let h=v.ok?`<div class="meta" style="color:var(--green)">✓ Hash chain intact — ${Number(v.records||recs.length)} records</div>`
-            :`<div class="meta" style="color:var(--red)">✗ TAMPER DETECTED: ${esc(String(v.error||"chain broken"))}</div>`;
-  if(!recs.length)return h+_empty("No audit records yet","Actions like block, login, and license changes are chained here.");
-  h+=`<table><tr><th style="width:150px">Time</th><th style="width:80px">Actor</th><th style="width:150px">Action</th><th>Detail</th></tr>`;
-  recs.slice().reverse().forEach(r=>{
-    h+=`<tr><td style="color:var(--dim)">${esc(String(r.ts||"").slice(0,19))}</td><td>${esc(String(r.actor||""))}</td><td>${esc(String(r.action||""))}</td><td style="color:var(--dim)">${esc(JSON.stringify(r.detail||{}))}</td></tr>`;
-  });
-  return h+`</table>`;
-}
-function renderAudit(){
-  return `<div class="section-title">AUDIT TRAIL <span class="count">tamper-evident</span></div><div id="audit-body"><div class="empty">loading…</div></div>`;
-}
-
-function updateHeader(){
-  $("#s-time").textContent=D.time||"";
-  $("#s-pkts").textContent=(D.total_packets||0).toLocaleString();
-  $("#s-bytes").textContent=D.total_bytes_fmt||"0B";
-  $("#s-hosts").textContent=D.host_count||0;
-  const svcs=[
-    ["SNIFF",true],["TSHARK",(D.protocols||[]).length>0],
-    ["TCPDUMP",D.tcpdump_active],["NMAP",D.nmap_running],["TOR",D.proxy_active],
-    ["MESH",D.mesh_connected]
-  ];
-  $("#svc-bar").innerHTML=svcs.map(([n,on])=>`<span class="svc ${on?"on":n==="NMAP"?"warn":"off"}">${n}</span>`).join("");
-}
-
-let evtSrc,_tsCounter=0;
-let _lastCounts="",_renderPending=false;
-let _sseBackoff=1000,_sseExpired=false;
-function _sseStatus(state){
-  const dot=document.querySelector("#header .pulse");
-  if(!dot)return;
-  if(state==="ok"){dot.style.background="var(--good)";dot.title="Live updates streaming"}
-  else if(state==="retry"){dot.style.background="var(--warn)";dot.title="Reconnecting..."}
-  else if(state==="expired"){dot.style.background="var(--threat-high)";dot.title="Session expired"}
-}
-function _showAuthExpired(){
-  if(_sseExpired)return;
-  _sseExpired=true;
-  const wrap=document.createElement("div");
-  wrap.id="auth-expired";
-  wrap.setAttribute("role","alertdialog");
-  wrap.style.cssText="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.75);z-index:1200;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(2px)";
-  wrap.innerHTML=`<div style="background:var(--surface);border:1px solid var(--threat-high);border-radius:8px;padding:22px 28px;max-width:90vw;width:380px;text-align:center">
-    <div style="color:var(--threat-high);font-weight:700;font-size:14px;margin-bottom:10px">SESSION EXPIRED</div>
-    <div style="color:var(--fg);font-size:12px;margin-bottom:14px;line-height:1.5">Your auth cookie is no longer valid (token rotation or restart).<br>Reload and paste the current token.</div>
-    <button onclick="location.reload()" style="background:var(--accent);color:var(--bg);border:none;padding:8px 22px;border-radius:4px;cursor:pointer;font:inherit;font-weight:600">Reload</button>
-  </div>`;
-  document.body.appendChild(wrap);
-}
-function connect(){
-  if(_sseExpired)return;
-  try{evtSrc=new EventSource("/api/stream")}catch(e){console.warn("SSE construct failed:",e);return}
-  evtSrc.onopen=()=>{_sseBackoff=1000;_sseStatus("ok")};
-  evtSrc.onmessage=e=>{
-    try{
-      D=JSON.parse(e.data);
-      updateHeader();
-      const counts=`${D.host_count}|${(D.dns||[]).length}|${(D.honeypot||[]).length}|${(D.nmap||[]).length}|${(D.alerts||[]).length}|${(D.osint||[]).length}|${(D.arp||[]).length}|${D.nmap_running}|${tab}`;
-      if(counts!==_lastCounts&&tab!=="replay"){
-        _lastCounts=counts;
-        if(!_renderPending){
-          _renderPending=true;
-          requestAnimationFrame(()=>{
-            const el=$("#content");
-            const scrollY=el?el.scrollTop:0;
-            render();
-            if(el)el.scrollTop=scrollY;
-            _renderPending=false;
-          });
-        }
-      }
-      if(tab==="all"&&_charts.traffic){updateCharts();_tsCounter++;if(_tsCounter%10===0)loadTimeseries()}
-    }catch(err){console.warn("SSE parse error:",err)}
-  };
-  evtSrc.onerror=()=>{
-    if(evtSrc){evtSrc.close();evtSrc=null}
-    // Probe / to detect 401 vs simple disconnect — if 401, prompt re-auth.
-    fetch("/api/state",{credentials:"same-origin"}).then(r=>{
-      if(r.status===401){_showAuthExpired();_sseStatus("expired");return}
-      _sseStatus("retry");
-      setTimeout(connect,_sseBackoff);
-      _sseBackoff=Math.min(_sseBackoff*2,30000);
-    }).catch(()=>{
-      _sseStatus("retry");
-      setTimeout(connect,_sseBackoff);
-      _sseBackoff=Math.min(_sseBackoff*2,30000);
-    });
-  };
-}
-
-async function sendMesh(){
-  const inp=document.getElementById("mesh-input");
-  if(!inp)return;
-  const text=inp.value.trim();
-  if(!text)return;
-  inp.value="";
-  try{
-    await fetch("/api/mesh/send",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});
-  }catch(e){}
-}
-
-const CTX_ACTIONS=[
-  {label:"View Detail",cmd:"_detail",k:"v"},
-  {sep:true},
-  {label:"Scan",cmd:"scan",k:"s"},{label:"Deep Scan",cmd:"deep",k:"d"},
-  {label:"Geo",cmd:"geo",k:"g"},{label:"Whois",cmd:"whois",k:"w"},
-  {label:"DNS Info",cmd:"dnsinfo",k:""},{label:"Abuse",cmd:"abuse",k:""},
-  {label:"ASN",cmd:"asn",k:""},{label:"SSL Cert",cmd:"ssl",k:""},
-  {sep:true},
-  {label:"Traceroute",cmd:"trace",k:"t"},{label:"Ping",cmd:"ping",k:"p"},
-  {label:"Port Scan",cmd:"portscan",k:""},
-  {sep:true},
-  {label:"Analyze",cmd:"analyze",k:"a"},{label:"Timeline",cmd:"timeline",k:""},
-  {label:"Full Recon",cmd:"fullrecon",k:"f"},
-  {sep:true},
-  {label:"Tag",cmd:"tag",k:"",prompt:true},{label:"Watch",cmd:"watch",k:""},
-  {label:"Note",cmd:"note",k:"",prompt:true},
-];
-
-function showCtxMenu(ip,x,y){
-  const m=$("#ctx-menu");
-  let html=`<div class="ctx-hdr">${esc(ip)}</div>`;
-  CTX_ACTIONS.forEach(a=>{
-    if(a.sep){html+=`<div class="ctx-sep"></div>`;return}
-    html+=`<div class="ctx-item" data-cmd="${a.cmd}" data-ip="${esc(ip)}" data-prompt="${a.prompt||false}">${a.label}${a.k?`<span class="k">${a.k}</span>`:""}</div>`;
-  });
-  m.innerHTML=html;
-  m.style.left=Math.min(x,window.innerWidth-200)+"px";
-  m.style.top=Math.min(y,window.innerHeight-m.scrollHeight-20)+"px";
-  m.style.display="block";
-  m.querySelectorAll(".ctx-item").forEach(el=>{
-    el.onclick=()=>{
-      const cmd=el.dataset.cmd,ip=el.dataset.ip;
-      m.style.display="none";
-      if(cmd==="_detail"){showHostDetail(ip);return}
-      if(el.dataset.prompt==="true"){
-        const val=prompt(cmd+" "+ip+" — enter value:");
-        if(val)runCmd(cmd+" "+ip+" "+val);
-      }else{runCmd(cmd+" "+ip)}
-    };
-  });
-}
-
-function showOutput(title,lines){
-  const p=$("#output-panel");
-  $("#output-title").textContent=title;
-  $("#output-body").innerHTML=lines.map(l=>esc(l)).join("\n");
-  p.classList.add("open");
-}
-
-async function runCmd(cmd){
-  showOutput("Running: "+cmd,["..."]);
-  try{
-    const r=await fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd})});
-    const d=await r.json();
-    if(d.error){showOutput("Error",["Error: "+d.error])}
-    else{showOutput(cmd,d.output||["(no output)"])}
-  }catch(err){showOutput("Error",["Connection error: "+err.message])}
-}
-
-async function showHostDetail(ip){
-  const p=$("#detail-panel"),b=$("#detail-body"),t=$("#detail-title");
-  t.textContent="Loading "+ip+"...";
-  b.innerHTML=`<div style="color:var(--dim)">Fetching...</div>`;
-  p.classList.add("open");
-  try{
-    const r=await fetch("/api/host/"+ip);
-    const d=await r.json();
-    if(d.error){b.innerHTML=`<div style="color:var(--red)">${esc(d.error)}</div>`;t.textContent=ip;return}
-    t.textContent=ip+(d.hostname?` (${d.hostname})`:"");
-    let html=`<div class="detail-section"><h3>Overview</h3>`;
-    html+=`<div class="detail-row"><span class="detail-label">Traffic In</span><span class="detail-val">${fmtBytes(d.bytes_in)}</span></div>`;
-    html+=`<div class="detail-row"><span class="detail-label">Traffic Out</span><span class="detail-val">${fmtBytes(d.bytes_out)}</span></div>`;
-    html+=`<div class="detail-row"><span class="detail-label">Packets</span><span class="detail-val">${(d.packets||0).toLocaleString()}</span></div>`;
-    html+=`<div class="detail-row"><span class="detail-label">Threat Score</span><span class="detail-val" style="color:${d.threat_score>=30?'var(--red)':d.threat_score>=10?'var(--yellow)':'var(--green)'}">${d.threat_score}</span></div>`;
-    html+=`<div class="detail-row"><span class="detail-label">First Seen</span><span class="detail-val">${esc(d.first_seen||"—")}</span></div>`;
-    html+=`<div class="detail-row"><span class="detail-label">Last Seen</span><span class="detail-val">${esc(d.last_seen||"—")}</span></div>`;
-    if(d.geo)html+=`<div class="detail-row"><span class="detail-label">Geo</span><span class="detail-val">${esc(d.geo)}</span></div>`;
-    if(d.asn)html+=`<div class="detail-row"><span class="detail-label">ASN</span><span class="detail-val">${esc(d.asn)}</span></div>`;
-    if(d.notes)html+=`<div class="detail-row"><span class="detail-label">Notes</span><span class="detail-val" style="color:var(--yellow)">${esc(d.notes)}</span></div>`;
-    if(d.watchlisted)html+=`<div class="detail-row"><span class="detail-label">Status</span><span class="detail-val" style="color:var(--red)">WATCHLISTED</span></div>`;
-    html+=`</div>`;
-    if(d.ports&&d.ports.length){
-      html+=`<div class="detail-section"><h3>Open Ports (${d.ports.length})</h3><div style="display:flex;flex-wrap:wrap;gap:4px">`;
-      d.ports.forEach(p=>{html+=`<span class="port-chip">${p}</span>`});
-      html+=`</div></div>`;
-    }
-    if(d.tags&&d.tags.length){
-      html+=`<div class="detail-section"><h3>Tags</h3><div style="display:flex;gap:4px;flex-wrap:wrap">`;
-      d.tags.forEach(t=>{html+=`<span class="tag">${esc(t)}</span>`});
-      html+=`</div></div>`;
-    }
-    if(d.nmap_results&&d.nmap_results.length){
-      html+=`<div class="detail-section"><h3>Scan Results (${d.nmap_results.length})</h3>`;
-      d.nmap_results.forEach(r=>{html+=`<div style="padding:2px 0;color:var(--green);font-size:11px">${esc(r.line)}</div>`});
-      html+=`</div>`;
-    }
-    if(d.osint_results&&d.osint_results.length){
-      html+=`<div class="detail-section"><h3>OSINT (${d.osint_results.length})</h3>`;
-      d.osint_results.forEach(r=>{html+=`<div style="padding:2px 0;font-size:11px"><span style="color:var(--cyan);font-weight:700;margin-right:8px">${esc(r.type)}</span>${esc(r.result)}</div>`});
-      html+=`</div>`;
-    }
-    if(d.honeypot_events&&d.honeypot_events.length){
-      html+=`<div class="detail-section"><h3>Honeypot Activity (${d.honeypot_events.length})</h3>`;
-      d.honeypot_events.forEach(e=>{html+=`<div style="padding:2px 0;font-size:11px"><span style="color:var(--dim)">${esc(e.time)}</span> <span style="color:var(--red)">${esc(e.service)}</span> ${esc(e.summary)}</div>`});
-      html+=`</div>`;
-    }
-    if(d.dns_queries&&d.dns_queries.length){
-      html+=`<div class="detail-section"><h3>DNS Queries (${d.dns_queries.length})</h3>`;
-      d.dns_queries.forEach(q=>{html+=`<div style="padding:2px 0;font-size:11px"><span style="color:var(--dim)">${esc(q.time)}</span> <span style="color:var(--magenta)">${esc(q.domain)}</span></div>`});
-      html+=`</div>`;
-    }
-    if(d.has_recon){
-      html+=`<div class="detail-section"><h3>Full Recon</h3><button onclick="showReconDetail('${esc(ip)}')" style="background:var(--red);color:white;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-family:inherit;font-weight:700">View Recon Report</button></div>`;
-    }
-    html+=`<div style="margin-top:12px;display:flex;gap:6px;flex-wrap:wrap">`;
-    ["scan","deep","geo","whois","abuse","recon","portscan","trace","ping"].forEach(cmd=>{
-      html+=`<button onclick="runCmd('${cmd} ${esc(ip)}')" style="background:var(--surface);color:var(--text);border:1px solid var(--border);padding:4px 10px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:11px">${cmd}</button>`;
-    });
-    html+=`</div>`;
-    b.innerHTML=html;
-  }catch(err){b.innerHTML=`<div style="color:var(--red)">Error: ${esc(err.message)}</div>`}
-}
-
-async function showScanDetail(ip){
-  const p=$("#detail-panel"),b=$("#detail-body"),t=$("#detail-title");
-  t.textContent="Scan Logs: "+ip;
-  b.innerHTML=`<div style="color:var(--dim)">Loading scan data...</div>`;
-  p.classList.add("open");
-  try{
-    const r=await fetch("/api/scan_log/"+ip);
-    const d=await r.json();
-    let html="";
-    if(d.scans&&d.scans.length){
-      d.scans.forEach(s=>{
-        html+=`<div class="detail-section"><h3>${esc(s.file)}</h3><pre style="background:var(--bg);padding:10px;border-radius:4px;overflow-x:auto;font-size:11px;color:var(--green);border:1px solid var(--border)">${esc(s.content)}</pre></div>`;
-      });
-    }else{
-      html=`<div style="color:var(--dim)">No scan logs found for ${esc(ip)}</div>`;
-      html+=`<button onclick="runCmd('scan ${esc(ip)}');$('#detail-panel').classList.remove('open')" style="background:var(--red);color:white;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-family:inherit;font-weight:700;margin-top:12px">Run Scan Now</button>`;
-    }
-    b.innerHTML=html;
-  }catch(err){b.innerHTML=`<div style="color:var(--red)">Error: ${esc(err.message)}</div>`}
-}
-
-async function showReconDetail(ip){
-  const b=$("#detail-body");
-  b.innerHTML=`<div style="color:var(--dim)">Loading recon report...</div>`;
-  try{
-    const r=await fetch("/api/recon/"+ip);
-    const d=await r.json();
-    if(d.error){b.innerHTML=`<div style="color:var(--red)">${esc(d.error)}</div>`;return}
-    let html=`<div class="detail-section"><h3>Recon Report: ${esc(ip)}</h3>`;
-    Object.entries(d).forEach(([k,v])=>{
-      if(k==="ip"||k==="timestamp")return;
-      const val=Array.isArray(v)?v.join(", "):typeof v==="object"?JSON.stringify(v):String(v);
-      if(val&&val!=="[]"&&val!=="{}")html+=`<div class="detail-row"><span class="detail-label">${esc(k)}</span><span class="detail-val" style="white-space:normal">${esc(val)}</span></div>`;
-    });
-    html+=`</div>`;
-    b.innerHTML=html;
-  }catch(err){b.innerHTML=`<div style="color:var(--red)">Error: ${esc(err.message)}</div>`}
-}
-
-// Resizable output panel
-(function(){
-  const drag=$("#panel-drag"),panel=$("#output-panel");
-  let startY,startH;
-  drag.addEventListener("mousedown",e=>{
-    startY=e.clientY;startH=panel.offsetHeight;
-    const onMove=e2=>{
-      const h=startH+(startY-e2.clientY);
-      panel.style.height=Math.max(120,Math.min(window.innerHeight*.85,h))+"px";
-    };
-    const onUp=()=>{document.removeEventListener("mousemove",onMove);document.removeEventListener("mouseup",onUp)};
-    document.addEventListener("mousemove",onMove);
-    document.addEventListener("mouseup",onUp);
-    e.preventDefault();
-  });
-  // Touch support
-  drag.addEventListener("touchstart",e=>{
-    startY=e.touches[0].clientY;startH=panel.offsetHeight;
-    const onMove=e2=>{
-      const h=startH+(startY-e2.touches[0].clientY);
-      panel.style.height=Math.max(120,Math.min(window.innerHeight*.85,h))+"px";
-      e2.preventDefault();
-    };
-    const onUp=()=>{document.removeEventListener("touchmove",onMove);document.removeEventListener("touchend",onUp)};
-    document.addEventListener("touchmove",onMove,{passive:false});
-    document.addEventListener("touchend",onUp);
-  },{passive:true});
-})();
-
-// Maximize/restore output panel
-let _panelMaxed=false;
-$("#output-max").onclick=()=>{
-  const p=$("#output-panel");
-  if(_panelMaxed){p.style.height="var(--panel-h)";_panelMaxed=false}
-  else{p.style.height="85vh";_panelMaxed=true}
-};
-
-document.addEventListener("click",e=>{
-  const el=e.target.closest(".ip-click");
-  if(el&&!e.target.closest("tr.clickable")){showCtxMenu(el.dataset.ip,e.clientX,e.clientY);e.stopPropagation();return}
-  if(!e.target.closest("#ctx-menu"))$("#ctx-menu").style.display="none";
-});
-
-$("#output-close").onclick=()=>{$("#output-panel").classList.remove("open");$("#output-panel").style.height=""};
-$("#detail-close").onclick=()=>{$("#detail-panel").classList.remove("open");if(_lastFocus)try{_lastFocus.focus()}catch(e){}};
-
-// Focus trap for detail-panel (modal dialog)
-let _lastFocus=null;
-function _focusable(el){
-  return Array.from(el.querySelectorAll('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),iframe,[tabindex]:not([tabindex="-1"])'));
-}
-document.addEventListener("keydown",e=>{
-  const dp=$("#detail-panel");
-  if(!dp.classList.contains("open")||e.key!=="Tab")return;
-  const items=_focusable(dp);
-  if(!items.length)return;
-  const first=items[0],last=items[items.length-1];
-  if(e.shiftKey&&document.activeElement===first){last.focus();e.preventDefault()}
-  else if(!e.shiftKey&&document.activeElement===last){first.focus();e.preventDefault()}
-});
-// Remember last focus when opening modal, restore on close
-const _origShowDetail=showHostDetail;
-showHostDetail=async function(ip){
-  _lastFocus=document.activeElement;
-  await _origShowDetail(ip);
-  const dp=$("#detail-panel"),first=_focusable(dp)[0];
-  if(first)first.focus();
-};
-const _origShowScan=showScanDetail;
-showScanDetail=async function(ip){
-  _lastFocus=document.activeElement;
-  await _origShowScan(ip);
-  const dp=$("#detail-panel"),first=_focusable(dp)[0];
-  if(first)first.focus();
-};
-const _origShowReplay=showReplayDetail;
-showReplayDetail=function(sid,proto){
-  _lastFocus=document.activeElement;
-  _origShowReplay(sid,proto);
-  const dp=$("#detail-panel"),first=_focusable(dp)[0];
-  if(first)first.focus();
-};
-
-$("#cmd-input").addEventListener("keydown",async e=>{
-  if(e.key!=="Enter")return;
-  const cmd=e.target.value.trim();
-  if(!cmd)return;
-  e.target.value="";
-  runCmd(cmd);
-});
-
-function _activateTabIdx(i){
-  if(i<0||i>=TABS.length)return;
-  tab=TABS[i];
-  $$(".tab").forEach((t,j)=>{t.classList.toggle("active",j===i);if(j===i)t.setAttribute("aria-selected","true");else t.setAttribute("aria-selected","false")});
-  render();
-}
-function _tabIdx(name){return TABS.indexOf(name)}
-document.addEventListener("keydown",e=>{
-  if(document.activeElement===$("#cmd-input"))return;
-  if(e.key==="Escape"){
-    if($("#kbd-help").classList.contains("open")){$("#kbd-help").classList.remove("open");return}
-    if($("#detail-panel").classList.contains("open")){$("#detail-panel").classList.remove("open");return}
-    $("#ctx-menu").style.display="none";
-    if($("#output-panel").classList.contains("open")){$("#output-panel").classList.remove("open");$("#output-panel").style.height="";return}
-    return;
-  }
-  if(e.key==="?"||(e.key==="/"&&e.shiftKey)){
-    e.preventDefault();$("#kbd-help").classList.toggle("open");return;
-  }
-  if(e.shiftKey){
-    if(e.key==="M"||e.key==="m"){const i=_tabIdx("mesh");if(i>=0){e.preventDefault();_activateTabIdx(i);return}}
-    if(e.key==="H"||e.key==="h"){const i=_tabIdx("help");if(i>=0){e.preventDefault();_activateTabIdx(i);return}}
-    return;
-  }
-  if(e.key==="r"||e.key==="R"){const i=_tabIdx("replay");if(i>=0){e.preventDefault();_activateTabIdx(i);return}}
-  const n=parseInt(e.key);
-  if(n>=1&&n<=9&&n<=TABS.length){_activateTabIdx(n-1);return}
-  if(e.key==="0"&&TABS.length>=10){_activateTabIdx(9);return}
-  if(e.key==="/"){e.preventDefault();$("#cmd-input").focus()}
-});
-
-// Theme + Scanline persistence
-const _themeSel=$("#theme-sel"),_scanSel=$("#scanline-sel"),_scanOverlay=$("#scanline-overlay");
-_themeSel.value=localStorage.getItem("nw_theme")||"";
-document.body.className=_themeSel.value;
-_scanSel.value=localStorage.getItem("nw_scanline")||"";
-_scanOverlay.className=_scanSel.value;
-_themeSel.onchange=()=>{
-  document.body.className=_themeSel.value;
-  localStorage.setItem("nw_theme",_themeSel.value);
-  _destroyCharts();
-  if(tab==="all"){initCharts();updateCharts();loadTimeseries()}
-};
-_scanSel.onchange=()=>{_scanOverlay.className=_scanSel.value;localStorage.setItem("nw_scanline",_scanSel.value)};
-
-initTabs();
-$("#kbd-help-btn").onclick=()=>$("#kbd-help").classList.toggle("open");
-$("#kbd-help").onclick=e=>{if(e.target.id==="kbd-help")$("#kbd-help").classList.remove("open")};
-connect();
-fetch("/api/state").then(r=>r.json()).then(d=>{D=d;updateHeader();render()}).catch(()=>{});
-</script>
-</body>
-</html>"""
+# WEB_DASHBOARD_HTML is in netwatch_web_assets.py
 
 @web_app.route("/api/recon/<ip>")
 def web_recon_detail(ip):
@@ -10356,64 +9598,7 @@ def web_replay_player(session_id):
 # All three routes sit behind _web_auth (allowlist + token/RBAC) like every
 # other web_app route; they are GET-only so no new CSRF surface.
 
-_CAM_HTML = r"""<!DOCTYPE html><html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NetWatch · Camera Sentry</title>
-<style>
- body{background:#0a0e0a;color:#cfe;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:24px}
- h1{color:#7df58a;font-weight:400;letter-spacing:1px;margin:0 0 4px}
- .sub{color:#5a8;margin-bottom:24px;font-size:11px}
- a{color:#7df58a;text-decoration:none}
- a:hover{color:#fff;background:#143}
- .nav{margin-bottom:16px}
- .nav a{padding:4px 10px;border:1px solid #2a4;border-radius:3px;margin-right:8px}
- .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
- .cam{background:#0e1810;border:1px solid #143;border-radius:4px;overflow:hidden}
- .cam img{width:100%;display:block;aspect-ratio:16/9;object-fit:cover;background:#000}
- .cam .bar{display:flex;justify-content:space-between;padding:6px 10px;font-size:11px}
- .on{color:#7df58a}.off{color:#f87}
- .empty{padding:40px;text-align:center;color:#588}
- h2{color:#5a8;font-weight:400;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin:24px 0 8px}
- ul{list-style:none;padding:0;margin:0}
- li{padding:3px 0;border-bottom:1px solid #0f1a10;color:#9cb;font-size:11px}
-</style></head><body>
-<div class="nav"><a href="/">&larr; dashboard</a><a href="/cam" id="refresh">&#8635; refresh</a></div>
-<h1>CAMERA SENTRY</h1>
-<div class="sub">Live feeds — motion + person detection alerts flow into your configured channels</div>
-<div id="grid" class="grid"><div class="empty">loading&hellip;</div></div>
-<h2>Recent events</h2>
-<ul id="events"><li>loading&hellip;</li></ul>
-<script>
-const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let mounted=false;
-async function load(){
-  let st;
-  try{
-    const r=await fetch('/api/cam/status');
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    st=await r.json();
-  }catch(e){
-    document.getElementById('grid').innerHTML=`<div class="empty">Failed to load status: ${esc(e.message||e)}</div>`;return;
-  }
-  if(!mounted){
-    mounted=true;
-    const g=document.getElementById('grid');
-    if(!st.cameras.length){g.innerHTML=`<div class="empty">${esc(st.reason||'No cameras configured')} &mdash; add one from the console: <code>cam add blink &lt;name&gt;</code>, <code>cam add rtsp &lt;url&gt;</code> or <code>cam add usb &lt;index&gt;</code></div>`;mounted=false;}
-    else g.innerHTML=st.cameras.map(c=>
-      `<div class="cam"><img src="/api/cam/stream/${esc(c.id)}" alt="camera ${esc(c.id)}">`+
-      `<div class="bar"><span>CAM ${esc(c.id)} &middot; ${esc(c.source)}</span>`+
-      `<span id="cs-${esc(c.id)}"></span></div></div>`).join('');
-  }
-  for(const c of st.cameras){
-    const el=document.getElementById('cs-'+c.id);
-    if(el)el.innerHTML=(c.online?'<span class="on">&#9679; live</span>':'<span class="off">&#9679; offline</span>')+
-      ` &middot; ${esc(c.alerts)} alert${c.alerts===1?'':'s'}`;
-  }
-  document.getElementById('events').innerHTML=
-    (st.events&&st.events.length?st.events.slice().reverse().map(e=>`<li>${esc(e)}</li>`).join(''):'<li>none yet</li>');
-}
-load();setInterval(load,5000);
-</script></body></html>"""
+# _CAM_HTML is in netwatch_web_assets.py
 
 _CAM_UPSELL_HTML = r"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <title>NetWatch · Camera Sentry</title>
@@ -10537,235 +9722,9 @@ def web_replay_api_session(session_id):
             return jsonify({"error": str(e)}), 400
     return jsonify({"error": "session not found"}), 404
 
-_REPLAY_INDEX_HTML = r"""<!DOCTYPE html><html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NetWatch · Replay sessions</title>
-<style>
- body{background:#0a0e0a;color:#cfe;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:24px}
- h1{color:#7df58a;font-weight:400;letter-spacing:1px;margin:0 0 4px}
- .sub{color:#5a8;margin-bottom:24px;font-size:11px}
- a{color:#7df58a;text-decoration:none}
- a:hover{color:#fff;background:#143}
- table{width:100%;border-collapse:collapse;margin-top:8px}
- th{text-align:left;padding:6px 10px;color:#5a8;font-weight:400;border-bottom:1px solid #143;font-size:11px;text-transform:uppercase;letter-spacing:1px}
- td{padding:6px 10px;border-bottom:1px solid #0f1a10}
- tr:hover td{background:#0e1810}
- .empty{padding:40px;text-align:center;color:#588}
- .nav{margin-bottom:16px}
- .nav a{padding:4px 10px;border:1px solid #2a4;border-radius:3px;margin-right:8px}
- .ip{color:#fff}
- .num{color:#999;text-align:right}
- .proto{font-size:10px;padding:1px 6px;border-radius:2px;text-transform:uppercase;letter-spacing:1px}
- .proto.ftp{background:#143;color:#7df58a}
- .proto.telnet{background:#311;color:#f87}
-</style></head><body>
-<div class="nav"><a href="/">← dashboard</a><a href="/replay" id="refresh">↻ refresh</a></div>
-<h1>SESSION REPLAY</h1>
-<div class="sub">Captured honeypot sessions — click any session to scrub the timeline</div>
-<div id="content"><div class="empty">loading…</div></div>
-<script>
-const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function load(){
-  let sessions;
-  try{
-    const r=await fetch('/api/replay');
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    sessions=await r.json();
-  }catch(e){
-    document.getElementById('content').innerHTML=`<div class="empty">Failed to load sessions: ${esc(e.message||e)}</div>`;return;
-  }
-  const el=document.getElementById('content');
-  if(!sessions.length){el.innerHTML='<div class="empty">No sessions captured yet — once attackers hit a honeypot, they\'ll appear here.</div>';return}
-  let h='<table><thead><tr><th>session id</th><th>proto</th><th>attacker ip</th><th>captured</th><th>events</th></tr></thead><tbody>';
-  for(const s of sessions){
-    const ts=String(s.started_at_mtime||'').replace('T',' ').replace(/\..*/,'');
-    const proto=(s.protocol==='telnet')?'telnet':'ftp';  // whitelist
-    const sid=encodeURIComponent(s.session_id);
-    h+=`<tr><td><a href="/replay/${sid}?proto=${proto}">${esc(s.session_id)}</a></td>`+
-       `<td><span class="proto ${proto}">${proto}</span></td>`+
-       `<td class="ip">${esc(s.ip)}</td><td>${esc(ts)} UTC</td><td class="num">${Number(s.event_count)||0}</td></tr>`;
-  }
-  el.innerHTML=h+'</tbody></table>';
-}
-load();
-document.getElementById('refresh').addEventListener('click',e=>{e.preventDefault();load()});
-</script>
-</body></html>"""
+# _REPLAY_INDEX_HTML is in netwatch_web_assets.py
 
-_REPLAY_PLAYER_HTML = r"""<!DOCTYPE html><html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NetWatch · Replay {{ session_id }}</title>
-<style>
- body{background:#0a0e0a;color:#cfe;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;margin:0}
- header{padding:14px 20px;border-bottom:1px solid #143;display:flex;align-items:center;gap:20px;flex-wrap:wrap}
- header h1{color:#7df58a;font:400 14px/1 inherit;letter-spacing:2px;margin:0}
- header .meta{color:#5a8;font-size:11px}
- header .meta b{color:#fff;font-weight:400}
- header a{color:#7df58a;text-decoration:none;padding:3px 8px;border:1px solid #2a4;border-radius:3px;font-size:11px}
- main{display:grid;grid-template-columns:1fr 280px;height:calc(100vh - 130px)}
- #events{overflow-y:auto;padding:12px 18px}
- .ev{padding:3px 0;display:grid;grid-template-columns:70px 80px 1fr;gap:10px;border-radius:2px}
- .ev .t{color:#588;font-size:11px}
- .ev .k{font-size:11px;text-transform:uppercase;letter-spacing:1px}
- .ev[data-k=server] .k{color:#7df58a}
- .ev[data-k=server_fail] .k{color:#f55}
- .ev[data-k=client] .k{color:#fc7}
- .ev[data-k=cred] .k{color:#f9f}
- .ev[data-k=upload] .k,.ev[data-k=upload_saved] .k,.ev[data-k=data_recv] .k{color:#9cf}
- .ev[data-k=download] .k,.ev[data-k=data_send] .k{color:#9cf}
- .ev[data-k=session_end] .k,.ev[data-k=quit] .k{color:#666}
- .ev .x{color:#cfe;word-break:break-all;white-space:pre-wrap}
- .ev.future{opacity:.18}
- .ev.cursor{background:#143}
- #intel{border-left:1px solid #143;padding:14px 16px;overflow-y:auto;background:#070b07}
- #intel h2{color:#5a8;font:400 11px/1 inherit;letter-spacing:2px;text-transform:uppercase;margin:0 0 12px}
- #intel dt{color:#588;font-size:11px;margin-top:10px;text-transform:uppercase;letter-spacing:1px}
- #intel dd{color:#fff;margin:2px 0 0}
- #intel .empty{color:#588;font-style:italic;font-size:11px}
- footer{border-top:1px solid #143;padding:10px 18px;display:flex;align-items:center;gap:14px;background:#070b07}
- footer button{background:#0a0e0a;color:#7df58a;border:1px solid #2a4;padding:4px 12px;border-radius:3px;cursor:pointer;font:inherit}
- footer button:hover{background:#143;color:#fff}
- footer button.active{background:#143;color:#fff}
- #scrub{flex:1;height:6px;-webkit-appearance:none;background:#143;border-radius:3px;outline:none}
- #scrub::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:#7df58a;border-radius:50%;cursor:pointer}
- #scrub::-moz-range-thumb{width:14px;height:14px;background:#7df58a;border-radius:50%;border:none;cursor:pointer}
- #time{color:#fff;font-variant-numeric:tabular-nums;min-width:120px;text-align:right}
- .err{color:#f55;padding:40px;text-align:center}
-</style></head><body>
-<header>
- <h1>NETWATCH · REPLAY</h1>
- <div class="meta">session <b id="sid">{{ session_id }}</b></div>
- <div class="meta">ip <b id="ip">…</b></div>
- <div class="meta">duration <b id="dur">…</b></div>
- <a href="/replay">← all sessions</a>
-</header>
-<main>
- <div id="events"><div class="err">loading…</div></div>
- <div id="intel"><h2>ATTACKER INTEL</h2><div id="intelBody"><div class="empty">loading…</div></div></div>
-</main>
-<footer>
- <button id="home" title="jump to start (Home)">⏮</button>
- <button id="back10" title="-10s (&lt;)">⏪</button>
- <button id="back1" title="-1s (←)">◀</button>
- <button id="play">▶</button>
- <button id="fwd1" title="+1s (→)">▶|</button>
- <button id="fwd10" title="+10s (&gt;)">⏩</button>
- <button id="end" title="jump to end (End)">⏭</button>
- <button data-speed="0.5">0.5×</button>
- <button data-speed="1" class="active">1×</button>
- <button data-speed="2">2×</button>
- <button data-speed="4">4×</button>
- <input type="range" id="scrub" min="0" max="0" value="0" step="1">
- <span id="time">00:00 / 00:00</span>
-</footer>
-<script>
-const sid={{ session_id|tojson }};
-const proto={{ protocol|tojson }};
-const SPEEDS=[0.25,0.5,1,2,4,8];
-let timeline=null,cursor=0,playing=false,speed=1,timer=null,lastTick=0;
-const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function fmt(ms){const s=Math.floor(ms/1000),m=Math.floor(s/60);return `${String(m).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`}
-function renderIntel(intel){
- const b=document.getElementById('intelBody');
- if(!intel||!intel.ip){b.innerHTML='<div class="empty">No OSINT recon yet for this IP. Run <code>recon</code> from the dashboard.</div>';return}
- const rows=[['IP',intel.ip],['Country',intel.country],['City',intel.city],['ASN',intel.asn],['Org',intel.org],['Abuse',intel.abuse_score],['Hostname',intel.hostname]];
- let h='<dl>';
- for(const [k,v] of rows)if(v||v===0)h+=`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`;
- if(intel.tags&&intel.tags.length)h+=`<dt>Tags</dt><dd>${esc(intel.tags.join(', '))}</dd>`;
- if(intel.notes)h+=`<dt>Notes</dt><dd>${esc(intel.notes)}</dd>`;
- b.innerHTML=h+'</dl>';
-}
-function renderEvents(){
- const el=document.getElementById('events');
- if(!timeline.events.length){el.innerHTML='<div class="err">No events captured in this session (banner-only).</div>';return}
- let h='',lastCursorIdx=-1;
- for(let i=0;i<timeline.events.length;i++){
-  const e=timeline.events[i],fut=e.t_ms>cursor;
-  if(!fut)lastCursorIdx=i;
-  h+=`<div class="ev${fut?' future':''}" data-k="${esc(e.kind)}" data-i="${i}"><span class="t">${fmt(e.t_ms)}</span><span class="k">${esc(e.kind)}</span><span class="x">${esc(e.text)}</span></div>`;
- }
- el.innerHTML=h;
- const cur=el.querySelector(`[data-i="${lastCursorIdx}"]`);
- if(cur){cur.classList.add('cursor');cur.scrollIntoView({block:'nearest'})}
-}
-function updateScrubber(){
- document.getElementById('scrub').value=cursor;
- document.getElementById('time').textContent=`${fmt(cursor)} / ${fmt(timeline.duration_ms)}`;
-}
-function setCursor(ms){
- cursor=Math.max(0,Math.min(timeline.duration_ms,ms|0));
- lastTick=performance.now();
- updateScrubber();renderEvents();
-}
-function setSpeed(v){
- speed=v;lastTick=performance.now();
- document.querySelectorAll('[data-speed]').forEach(x=>x.classList.toggle('active',parseFloat(x.dataset.speed)===v));
-}
-function stepSpeed(dir){
- const i=SPEEDS.indexOf(speed);
- const ni=Math.max(0,Math.min(SPEEDS.length-1,(i<0?2:i)+dir));
- setSpeed(SPEEDS[ni]);
-}
-function play(){
- if(!playing && cursor>=timeline.duration_ms) cursor=0;  // restart from end
- playing=!playing;
- document.getElementById('play').textContent=playing?'❚❚':'▶';
- lastTick=performance.now();
- if(playing&&!timer)tick();
-}
-function tick(){
- if(!playing){timer=null;return}
- const now=performance.now(),dt=(now-lastTick)*speed;lastTick=now;
- cursor=Math.min(timeline.duration_ms,cursor+dt);
- updateScrubber();renderEvents();
- if(cursor>=timeline.duration_ms){playing=false;document.getElementById('play').textContent='▶';timer=null;return}
- timer=requestAnimationFrame(tick);
-}
-async function load(){
- try{
-  const r=await fetch(`/api/replay/${encodeURIComponent(sid)}?proto=${proto}`);
-  if(!r.ok){document.getElementById('events').innerHTML=`<div class="err">${esc((await r.json()).error||'load failed')}</div>`;return}
-  timeline=await r.json();
-  document.getElementById('ip').textContent=timeline.ip;
-  document.getElementById('dur').textContent=fmt(timeline.duration_ms);
-  document.getElementById('scrub').max=Math.max(timeline.duration_ms,1);
-  // Auto-slow sub-2-second captures so playback is actually visible
-  // (many FTP probes are sub-100ms TLS handshakes that would flash past).
-  if(timeline.duration_ms>0 && timeline.duration_ms<2000){
-    setSpeed(0.25);
-    document.getElementById('dur').title='Auto-slowed to 0.25× — session is under 2s';
-  }
-  renderIntel(timeline.intel);renderEvents();updateScrubber();
- }catch(e){document.getElementById('events').innerHTML=`<div class="err">${esc(e)}</div>`}
-}
-document.getElementById('play').addEventListener('click',play);
-document.getElementById('back1').addEventListener('click',()=>setCursor(cursor-1000));
-document.getElementById('fwd1').addEventListener('click',()=>setCursor(cursor+1000));
-document.getElementById('back10').addEventListener('click',()=>setCursor(cursor-10000));
-document.getElementById('fwd10').addEventListener('click',()=>setCursor(cursor+10000));
-document.getElementById('home').addEventListener('click',()=>setCursor(0));
-document.getElementById('end').addEventListener('click',()=>setCursor(timeline?timeline.duration_ms:0));
-document.getElementById('scrub').addEventListener('input',e=>setCursor(parseInt(e.target.value,10)));
-document.querySelectorAll('[data-speed]').forEach(b=>b.addEventListener('click',()=>setSpeed(parseFloat(b.dataset.speed))));
-document.addEventListener('keydown',e=>{
- if(!timeline)return;
- const tag=(e.target.tagName||'').toLowerCase();
- if(tag==='input'||tag==='textarea')return;
- switch(e.key){
-  case ' ':e.preventDefault();play();break;
-  case 'ArrowLeft':e.preventDefault();setCursor(cursor-1000);break;
-  case 'ArrowRight':e.preventDefault();setCursor(cursor+1000);break;
-  case '<':case ',':e.preventDefault();setCursor(cursor-10000);break;
-  case '>':case '.':e.preventDefault();setCursor(cursor+10000);break;
-  case 'Home':e.preventDefault();setCursor(0);break;
-  case 'End':e.preventDefault();setCursor(timeline.duration_ms);break;
-  case '+':case '=':e.preventDefault();stepSpeed(1);break;
-  case '-':case '_':e.preventDefault();stepSpeed(-1);break;
- }
-});
-load();
-</script>
-</body></html>"""
+# _REPLAY_PLAYER_HTML is in netwatch_web_assets.py
 
 # -- TIME-SERIES SAMPLING
 
@@ -10791,38 +9750,129 @@ def web_timeseries():
 
 # -- MESHTASTIC MESH RADIO
 
-def _mesh_connect():
-    global mesh_interface, _mesh_last_error
+_mesh_connect_lock = threading.Lock()
+_mesh_port = ""          # device the radio is connected on
+MESH_TEXT_MAX_BYTES = 200   # LoRa payload limit is ~230 bytes; leave room for the header
+
+
+def _mesh_candidate_ports(explicit=""):
+    """Serial ports to try, best first. An explicit port wins. Otherwise the
+    Meshtastic library's own list (filtered by USB vendor, so a GPS or an
+    Arduino is not probed), then every USB serial device as a fallback."""
+    import glob
+    if explicit:
+        return [explicit]
+    found = []
+    try:
+        found = [p for p in _meshtastic_lib.util.findPorts(True) if isinstance(p, str)]
+    except Exception:
+        found = []
+    return found or sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+
+
+def _mesh_error_text(port, exc):
+    """A reason the user can act on, from a failed open of `port`."""
+    text = _ansi_strip(str(exc))[:120]
+    low = f"{type(exc).__name__} {text}".lower()
+    if isinstance(exc, PermissionError) or "permission denied" in low:
+        return (f"{port}: permission denied — run with sudo, or add your user to the "
+                f"dialout group (sudo usermod -aG dialout $USER, then log in again)")
+    if "exclusively lock" in low or "busy" in low or "resource temporarily unavailable" in low:
+        return f"{port}: another program has the port open (close the meshtastic CLI or app)"
+    if "timed out" in low or "timeout" in low:
+        return (f"{port}: no answer from a Meshtastic device — wrong port, or the device "
+                f"is still booting; try: mesh connect <port>")
+    if isinstance(exc, FileNotFoundError) or "no such file" in low:
+        return f"{port}: device not found — check the cable and the port name"
+    return f"{port}: {type(exc).__name__}{': ' + text if text else ''}"
+
+
+def _mesh_connect(port=None):
+    """Open the radio. Returns True when connected.
+
+    Slow by nature: the library waits up to 30 s per port for a device to
+    answer, so call this from a background thread (start-up and `mesh connect`
+    do). NETWATCH_MESH_TIMEOUT (default 20 s; library default 300 s) bounds the
+    wait for the radio's config after it has answered."""
+    global mesh_interface, _mesh_last_error, _mesh_port
     if not _HAS_MESH:
         _mesh_last_error = "meshtastic not installed (pip install meshtastic)"
         return False
-    import glob
-    # Explicit device wins (e.g. NETWATCH_MESH_PORT=/dev/ttyACM0 for the LilyGo);
-    # otherwise auto-detect USB serial.
-    explicit = os.environ.get("NETWATCH_MESH_PORT", "").strip()
-    ports = [explicit] if explicit else sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
-    if not ports:
-        _mesh_last_error = "no serial device found — set NETWATCH_MESH_PORT or plug in the device"
-        add_console(f"  {YELLOW}Mesh: {_mesh_last_error}{RESET}")
+    if not _mesh_connect_lock.acquire(blocking=False):
+        _mesh_last_error = "a connect attempt is already running"
         return False
-    last = ""
-    for port in ports:
+    try:
+        explicit = (port or os.environ.get("NETWATCH_MESH_PORT", "")).strip()
+        ports = _mesh_candidate_ports(explicit)
+        if not ports:
+            _mesh_last_error = ("no serial device found — plug in the radio, or name the port: "
+                                "mesh connect /dev/ttyACM0")
+            add_console(f"  {YELLOW}Mesh: {_mesh_last_error}{RESET}")
+            return False
         try:
-            mesh_interface = _mesh_serial.SerialInterface(port)
+            timeout = max(5, min(300, int(os.environ.get("NETWATCH_MESH_TIMEOUT", "20"))))
+        except ValueError:
+            timeout = 20
+        last = ""
+        for dev in ports:
+            try:
+                try:
+                    iface = _mesh_serial.SerialInterface(dev, timeout=timeout)
+                except TypeError:          # older library: no timeout argument
+                    iface = _mesh_serial.SerialInterface(dev)
+            except (Exception, SystemExit) as e:   # the library calls sys.exit() on some errors
+                last = _mesh_error_text(dev, e)
+                continue
+            mesh_interface = iface
+            _mesh_port = dev
             try:
                 from pubsub import pub
                 pub.subscribe(_on_mesh_recv, "meshtastic.receive")
+                pub.subscribe(_on_mesh_lost, "meshtastic.connection.lost")
             except ImportError:
                 pass
             _mesh_last_error = ""
-            add_console(f"  {GREEN}Mesh: connected on {port}{RESET}")
+            add_console(f"  {GREEN}Mesh: connected on {dev}{RESET}")
             return True
-        except Exception as e:
-            last = f"{port}: {type(e).__name__}"
-            continue
-    _mesh_last_error = f"could not open mesh device ({last})"
-    add_console(f"  {YELLOW}Mesh: {_mesh_last_error}{RESET}")
-    return False
+        _mesh_last_error = f"could not open mesh device ({last})"
+        add_console(f"  {YELLOW}Mesh: {_mesh_last_error}{RESET}")
+        return False
+    finally:
+        _mesh_connect_lock.release()
+
+
+def _mesh_disconnect(reason=""):
+    global mesh_interface, _mesh_last_error, _mesh_port
+    iface, mesh_interface = mesh_interface, None
+    _mesh_port = ""
+    if reason:
+        _mesh_last_error = reason
+    if iface is not None:
+        try:
+            iface.close()
+        except Exception:
+            pass
+    return iface is not None
+
+
+def _on_mesh_lost(interface=None, **_kw):
+    """The library reports the radio was unplugged or stopped answering."""
+    if interface is None or interface is mesh_interface:
+        _mesh_disconnect("the radio disconnected — plug it in, then: mesh connect")
+        add_console(f"  {YELLOW}Mesh: {_mesh_last_error}{RESET}")
+
+
+def _mesh_node_name(from_id, fallback):
+    """Long name of a node from the radio's own node list, else the fallback."""
+    try:
+        user = (mesh_interface.nodes or {}).get(from_id, {}).get("user", {})
+        name = user.get("longName") or user.get("shortName")
+        if isinstance(name, str) and name:
+            return name
+    except Exception:
+        pass
+    return fallback
+
 
 def _on_mesh_recv(packet, interface=None):
     decoded = packet.get("decoded", {})
@@ -10830,7 +9880,8 @@ def _on_mesh_recv(packet, interface=None):
     if not text:
         return
     from_id = _ansi_strip(str(packet.get("fromId", "unknown")))
-    from_name = _ansi_strip(str(packet.get("from", from_id)))
+    # "from" is the numeric node number; show the node's name when the radio knows it
+    from_name = _ansi_strip(str(_mesh_node_name(packet.get("fromId"), packet.get("from", from_id))))
     with lock:
         mesh_messages.append({
             "ts": datetime.now().strftime("%H:%M:%S"),
@@ -10853,8 +9904,15 @@ def _on_mesh_recv(packet, interface=None):
             }
 
 def mesh_send(text):
+    global _mesh_last_error
     if not mesh_interface:
+        _mesh_last_error = _mesh_last_error or "not connected — try: mesh connect"
         return False
+    # LoRa limits the payload in BYTES; cut on a character boundary so a
+    # multi-byte character (an emoji, a dash) cannot make the send fail.
+    raw = text.encode("utf-8")
+    if len(raw) > MESH_TEXT_MAX_BYTES:
+        text = raw[:MESH_TEXT_MAX_BYTES].decode("utf-8", errors="ignore")
     try:
         mesh_interface.sendText(text)
         with lock:
@@ -10864,8 +9922,11 @@ def mesh_send(text):
                 "text": text,
                 "type": "sent",
             })
+            if len(mesh_messages) > _MESH_MAX_MSGS:
+                del mesh_messages[:len(mesh_messages) - _MESH_MAX_MSGS]
         return True
-    except Exception:
+    except Exception as e:
+        _mesh_last_error = f"send failed: {type(e).__name__}: {_ansi_strip(str(e))[:100]}"
         return False
 
 def _mesh_forward_alert(msg):
@@ -10891,7 +9952,7 @@ def web_mesh_send():
     if len(text) > 200:
         return jsonify({"error": "message too long (200 char max for LoRa)"})
     ok = mesh_send(text)
-    return jsonify({"ok": ok})
+    return jsonify({"ok": ok} if ok else {"ok": False, "error": _mesh_last_error or "not connected"})
 
 # -- GRAPHQL API (optional)
 
@@ -11007,7 +10068,8 @@ if _HAS_GQL:
             if action in _EXPENSIVE_CMDS and ecnt >= _EXPENSIVE_RATE_LIMIT:
                 return _GQL_RunCommand(output=[], error=f"'{action}' rate limited")
             _cmd_rate[rip] = (cnt + 1, ecnt + (1 if action in _EXPENSIVE_CMDS else 0), wstart)
-            if action in _OUTBOUND_CMDS and len(parts) >= 2:
+            if (action in _OUTBOUND_CMDS or (action == "cve" and len(parts) >= 2
+                                           and _cve_target_is_host(parts[1]))) and len(parts) >= 2:
                 if _is_internal_target(parts[1]):
                     return _GQL_RunCommand(output=[], error="internal target blocked")
             if action in ("scan", "deep", "recon", "portscan", "fullrecon", "sweep", "subnet") and len(parts) >= 2:
@@ -11124,6 +10186,11 @@ def _cli_subcommand(argv):
     if cmd in ("--version", "-V", "version"):
         print(f"netwatch {VERSION}  (tier: {current_tier()})")
         return 0
+    if cmd == "config":
+        lines = _config_lines(argv)
+        for line in lines:
+            print(line)
+        return 1 if any(RED in line or "usage:" in line for line in lines[:1]) else 0
     try:
         from netwatch_activate import main as _lic_main  # paid add-on only
     except Exception:
@@ -11452,15 +10519,22 @@ def _cli_subcommand(argv):
 
 _CLI_SUBCOMMANDS = ("activate", "register", "license", "status", "collector",
                     "ask", "cam", "join", "users", "report", "audit", "compliance",
-                    "mfa", "apikey", "apikeys", "sso",
+                    "mfa", "apikey", "apikeys", "sso", "config",
                     "--version", "-V", "version")
 
 
 def main():
     global IFACE, _APP_RUNNING
     _argv = sys.argv[1:]
+    _migrated = _migrate_legacy_config()
     if _argv and _argv[0] in _CLI_SUBCOMMANDS:
         return _cli_subcommand(_argv)
+    if _migrated:
+        print(f"{DIM}[*] Moved {', '.join(_migrated)} into {_config_dir()}{RESET}")
+    if _WHITELIST_REJECTED:
+        print(f"{YELLOW}[!] NETWATCH_WHITELIST: ignored {', '.join(_WHITELIST_REJECTED)}{RESET}")
+    for _bad in _SETTINGS_REJECTED:
+        print(f"{YELLOW}[!] settings.env: {_ansi_strip(_bad)}{RESET}")
     if not HAS_RAW_NET:
         if IS_TERMUX:
             print(f"{YELLOW}[!] Termux detected — running passive mode (honeypots + OSINT + web only).{RESET}")
@@ -11581,7 +10655,9 @@ def main():
     # Auto-scan local subnet on startup (local awareness — sensor/both only)
     if RUN_LOCAL_HONEYPOT:
         time.sleep(5)
-        nmap_scan_thread("10.0.1.0/24", "-sn -T4")
+        _lan = _default_cidr()
+        if _lan:   # never sweep a public or cloud-shared range by default
+            nmap_scan_thread(_lan, "-sn -T4")
 
     # Flask honeypot in background thread (so main thread can do console)
     if RUN_LOCAL_HONEYPOT:
@@ -11608,11 +10684,10 @@ def main():
 
     # Meshtastic mesh radio
     if _HAS_MESH:
-        mesh_ok = _mesh_connect()
-        if mesh_ok:
-            print(f"  {GREEN}Meshtastic      : connected{RESET}")
-        else:
-            print(f"  {DIM}Meshtastic      : no device found{RESET}")
+        # In the background: a serial device that is not a radio must not
+        # delay start-up. The mesh tab and `mesh status` show the result.
+        threading.Thread(target=_mesh_connect, daemon=True).start()
+        print(f"  {DIM}Meshtastic      : looking for a radio (see: mesh status){RESET}")
     else:
         print(f"  {DIM}Meshtastic      : not installed{RESET}")
 

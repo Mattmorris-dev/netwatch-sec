@@ -1072,6 +1072,7 @@ class TestRateDictCleanup:
 
 class TestGraphQLSecurity:
     def test_query_length_rejected(self, authed_client):
+        pytest.importorskip("graphene")   # optional extra: netwatch-sec[graphql]
         long_query = "{ hosts { ip " + " " * 5000 + "} }"
         resp = authed_client.post(
             "/graphql",
@@ -1084,6 +1085,7 @@ class TestGraphQLSecurity:
         assert "too long" in resp.get_json()["errors"][0]["message"].lower()
 
     def test_deep_nesting_rejected(self, authed_client):
+        pytest.importorskip("graphene")   # optional extra: netwatch-sec[graphql]
         nested = "{ " * 10 + "hosts { ip }" + " }" * 10
         resp = authed_client.post(
             "/graphql",

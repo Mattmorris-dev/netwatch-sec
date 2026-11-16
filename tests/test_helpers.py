@@ -184,8 +184,8 @@ class TestThreatColor:
 class TestIsWhitelisted:
     @pytest.mark.parametrize("ip,expected", [
         ("127.0.0.1", True),
-        ("10.0.1.1", True),
-        ("100.66.15.102", True),
+        ("10.0.1.1", False),        # site addresses no longer ship as defaults
+        ("100.66.15.102", False),
         ("216.239.1.1", True),
         ("104.16.1.1", True),
         ("142.250.1.1", True),
@@ -194,8 +194,8 @@ class TestIsWhitelisted:
         ("1.1.1.1", False),
         ("192.168.1.1", False),
         ("", False),
-        ("100.85.81.110", True),
-        ("207.251.86.235", True),
+        ("100.85.81.110", False),
+        ("207.251.86.235", False),
         ("18.238.1.1", True),
         ("108.138.1.1", True),
     ])
@@ -223,7 +223,7 @@ class TestGetLocalIps:
     @patch("netwatch.subprocess.check_output", side_effect=Exception("fail"))
     def test_fallback_on_error(self, mock_check):
         ips = netwatch.get_local_ips()
-        assert "10.0.1.9" in ips
+        assert "127.0.0.1" in ips
 
     @patch("netwatch.subprocess.check_output")
     def test_empty_output(self, mock_check):
@@ -299,7 +299,7 @@ class TestEnrichHost:
     @patch("netwatch.resolve_host", return_value="")
     def test_scanner_detection(self, mock_resolve):
         ip = "203.0.113.99"
-        netwatch.hosts[ip]["ports"] = set(range(100))  # over SCAN_THRESHOLD
+        netwatch.hosts[ip]["scan_ports"] = set(range(100))  # over SCAN_THRESHOLD
         netwatch.enrich_host(ip)
         assert "SCANNER" in netwatch.hosts[ip]["tags"]
         assert netwatch.hosts[ip]["threat_score"] >= 30
@@ -495,7 +495,7 @@ class TestCheckSuspicious:
 
     def test_port_scan_detection(self):
         ip = "203.0.113.99"
-        netwatch.hosts[ip]["ports"] = set(range(100))
+        netwatch.hosts[ip]["scan_ports"] = set(range(100))
         netwatch.check_suspicious(ip, "10.0.1.1", 80, 80)
         assert any("PORT SCAN" in a["msg"] for a in netwatch.alerts)
 

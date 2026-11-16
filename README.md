@@ -8,7 +8,7 @@
 [![Downloads](https://static.pepy.tech/badge/netwatch-sec)](https://pepy.tech/project/netwatch-sec)
 [![Downloads/month](https://static.pepy.tech/badge/netwatch-sec/month)](https://pepy.tech/project/netwatch-sec)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Flask](https://img.shields.io/badge/Flask-2.3+-000000?logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
 [![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-A22846?logo=raspberrypi&logoColor=white)](https://www.raspberrypi.org/)
 [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)](https://www.linux.org/)
@@ -20,7 +20,7 @@
 [![Status: Active](https://img.shields.io/badge/status-active-brightgreen.svg)]()
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pr0xy_22)
 
-**All-in-one network security dashboard** — deploy honeypots, capture traffic, run OSINT, scan targets, block threats, and forward alerts over mesh radio. One command, one file, real-time.
+**All-in-one network security dashboard** — deploy honeypots, capture traffic, run OSINT, scan targets, block threats, and forward alerts over mesh radio. One command, real-time.
 
 ```
 sudo netwatch
@@ -175,6 +175,43 @@ sudo -E netwatch
 ```
 
 Persist by adding to `/etc/netwatch.env` and referencing in the systemd unit's `EnvironmentFile=`. Internet-facing scanners hit the standard ports — non-standard ports stay invisible to most drive-by traffic.
+
+### CVE lookup
+
+`cve <ip>` runs an nmap version scan, matches every product version it finds against the [NVD](https://nvd.nist.gov/) CVE API, and lists the results with entries from the CISA Known Exploited Vulnerabilities catalog first. Results are cached for 24 hours in `cve_cache.json` in the config directory. It needs outbound HTTPS to `services.nvd.nist.gov` only.
+
+```bash
+NETWATCH_NVD_API_KEY=<key> sudo -E netwatch   # optional, free key: 10x faster lookups
+```
+
+The match is by version string. A distribution can fix a CVE and keep the version number, so confirm a finding before you act on it.
+
+### Saved settings
+
+Settings are saved with one command, so you do not need environment variables or `sudo -E`:
+
+```
+config                               show every setting and where its value comes from
+config set nvd-key <key>             save a setting (takes effect at once unless it says "restart")
+config unset nvd-key                 remove it
+```
+
+From the shell, use the same user that starts NetWatch: `sudo netwatch config set nvd-key <key>`.
+
+| Name | Purpose |
+|------|---------|
+| `whitelist` | Addresses that skip threat scoring: `198.51.100.7,203.0.113.` (a trailing `.` is a prefix). The shipped list holds loopback and large CDN ranges only. |
+| `nvd-key` | NVD API key for `cve` (free; raises the rate limit). |
+| `ipinfo-token` | [IPinfo Lite](https://ipinfo.io/lite) token (free). Geo lookups then use HTTPS and **commercial use is allowed with attribution**. It gives country and ASN only: no city, ISP detail or proxy flags. |
+| `ipapi-key` | ip-api.com paid key: HTTPS and full detail. Used before `ipinfo-token` when both are set. |
+| `mesh-port`, `mesh-timeout` | Serial device of the Meshtastic radio, and seconds to wait for its config. |
+| `http-port`, `telnet-port`, `ftp-port`, `rtsp-port`, `retention-days` | Honeypot ports and log retention (restart to apply). |
+
+With no `ipinfo-token` and no `ipapi-key`, geo lookups use the free ip-api.com endpoint: plain HTTP, 45 requests a minute, **non-commercial use only**.
+
+The file is `settings.env` in the config directory (mode 0600). A `NETWATCH_*` variable in the real environment wins over the file. Settings that change who can log in or which program is run (token, tier, `NETWATCH_WEB_ALLOW`, binary paths) cannot be saved there on purpose; give those on the command line.
+
+Geo data from IPinfo Lite is licensed CC BY-SA 4.0: [IP address data powered by IPinfo](https://ipinfo.io).
 
 ### Replay tunables
 
@@ -355,6 +392,8 @@ Browser UI on `:9090` with live SSE updates, 5 themes, and CRT scanline effects.
 |---------|-------------|
 | `scan <ip> [preset]` | Nmap scan (quick/syn/udp/ping/full) |
 | `deep <ip>` | All ports + vuln scripts |
+| `cve <ip\|host>` | Version scan, then known CVEs for each product version — known-exploited first |
+| `cve <CVE-id>` / `cve <cpe>` | Look up one CVE, or one product version, in NVD |
 | `stealth <ip>` | SYN scan through Tor |
 | `recon <ip>` | Full OSINT profile |
 | `fullrecon <ip>` | 7-phase recon chain |
@@ -391,6 +430,9 @@ Requires root. Disabled automatically in passive mode.
 | `dashboard` / `d` | Return to dashboard screen |
 | `clear` | Wipe console buffer |
 | `help` | Show full reference overlay |
+| `help <word>` | Search the reference (`help cve`, `help traceroute`) |
+| `config` | Saved settings: API keys, whitelist, ports |
+| `doctor` | Check Python packages and system tools |
 | `rotate-key` | New Fernet key (invalidates web sessions) |
 | `rotate-token` | New web auth token (invalidates sessions) |
 
@@ -427,7 +469,8 @@ proxy start                        proxy stop
 ### Mesh Radio
 
 ```
-mesh send <text>     mesh status     mesh nodes     mesh alert on/off
+mesh connect [/dev/ttyACM0]     mesh disconnect     mesh status
+mesh send <text>     mesh nodes     mesh alert on/off
 ```
 
 ## Honeypots
@@ -465,7 +508,7 @@ mutation { runCommand(cmd: "geo 8.8.8.8") { output } }
 
 ```bash
 python3 -m pytest tests/ -q
-# 2516 tests, ~90s on a Pi 5
+# 2749 tests, ~90s on a Pi 5
 ```
 
 Lint (CI threshold `--fail-under=9.0`):
@@ -497,7 +540,7 @@ pylint $(git ls-files '*.py') --fail-under=9.0
 | Component | Details |
 |-----------|---------|
 | **OS** | Linux (Debian, Ubuntu, Raspbian, Parrot, Kali) — also runs on Termux (Android) in passive mode |
-| **Python** | 3.9+ |
+| **Python** | 3.11+ |
 | **Root** | Recommended (raw sockets, iptables, sub-1024 binding). Non-root and Termux run in passive mode (honeypots, OSINT, web, nmap connect-scan). |
 | **System** | nmap, tshark, tcpdump, traceroute |
 | **Python** | flask, requests, python-whois, dnspython, markupsafe, cryptography |
@@ -567,4 +610,4 @@ NetWatch is built and maintained solo. If it saves you time or protects your net
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE)
+AGPL-3.0 — see [LICENSE](LICENSE)
