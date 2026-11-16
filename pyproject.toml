@@ -62,7 +62,7 @@ netwatch = "netwatch:main"
 # All four top-level modules must ship: netwatch.py imports replay at import
 # time, and the shipper/crowdsec modules are loaded on demand — a wheel with
 # only "netwatch" breaks on a clean install.
-py-modules = ["netwatch", "replay", "netwatch_shipper", "netwatch_crowdsec", "netwatch_cve"]
+py-modules = ["netwatch", "netwatch_web_assets", "netwatch_cve", "replay", "netwatch_shipper", "netwatch_crowdsec"]
 
 [tool.setuptools.packages.find]
 exclude = ["tests*", "docs*", "logs*", "ftp_root*", ".claude*", "pro_beta*",
