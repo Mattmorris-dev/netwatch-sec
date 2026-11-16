@@ -88,7 +88,7 @@ def parse_nmap_xml(xml_text):
     if "<!ENTITY" in xml_text:      # nmap never emits entity declarations
         return []
     try:
-        root = ET.fromstring(xml_text)
+        root = ET.fromstring(xml_text)   # nosec B314 - nmap wrote it locally; entity declarations refused above
     except ET.ParseError:
         return []
     services = []

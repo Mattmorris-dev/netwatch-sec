@@ -250,3 +250,86 @@ class TestFtpPassiveAddress:
         import inspect
         src = inspect.getsource(netwatch.handle_ftp)
         assert "client.getsockname()" in src and '"10.0.1.9"' not in src
+
+
+class TestSharedConfigPaths:
+    """alerts.json / remotes.json live in the shared config dir, so the webhook
+    that `netwatch alert set` saves is the one `sudo netwatch` reads."""
+
+    def test_paths_follow_config_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("NETWATCH_CONFIG_DIR", str(tmp_path))
+        assert netwatch._alerts_cfg_path() == str(tmp_path / "alerts.json")
+        assert netwatch._remotes_cfg_path() == str(tmp_path / "remotes.json")
+
+    def test_set_as_one_user_is_read_as_another(self, tmp_path, monkeypatch):
+        shared = tmp_path / "shared"
+        monkeypatch.setenv("NETWATCH_CONFIG_DIR", str(shared))
+        monkeypatch.setenv("HOME", str(tmp_path / "home-user"))
+        netwatch._save_alerts_cfg({"url": "https://example.com/hook"})
+        monkeypatch.setenv("HOME", str(tmp_path / "home-root"))      # now "sudo"
+        assert netwatch._load_alerts_cfg()["url"] == "https://example.com/hook"
+
+    def test_legacy_file_is_copied_once(self, tmp_path, monkeypatch):
+        home, shared = tmp_path / "home", tmp_path / "shared"
+        legacy = home / ".config" / "netwatch"
+        legacy.mkdir(parents=True)
+        (legacy / "alerts.json").write_text('{"url": "https://old.example/hook"}')
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("NETWATCH_CONFIG_DIR", str(shared))
+        assert netwatch._migrate_legacy_config() == ["alerts.json"]
+        assert (shared / "alerts.json").stat().st_mode & 0o777 == 0o600
+        assert netwatch._load_alerts_cfg()["url"] == "https://old.example/hook"
+        (shared / "alerts.json").write_text('{"url": "https://new.example/hook"}')
+        assert netwatch._migrate_legacy_config() == []               # never overwrites
+        assert netwatch._load_alerts_cfg()["url"] == "https://new.example/hook"
+
+    def test_same_dir_is_a_no_op(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("NETWATCH_CONFIG_DIR", str(tmp_path / ".config" / "netwatch"))
+        assert netwatch._migrate_legacy_config() == []
+
+
+class TestWebhookFailureReason:
+    def _send(self, url, post=None, resolve=("93.184.216.34", "")):
+        with patch("netwatch._resolve_safe", return_value=resolve), \
+                patch.object(netwatch.req_lib, "post", post or (lambda *a, **k: None)):
+            ok = netwatch._send_webhook(url, "t", "m")
+        return ok, netwatch._last_webhook_error
+
+    def test_not_https(self):
+        assert self._send("http://example.com/hook") == (False, "the webhook URL is not https://")
+
+    def test_blocked_host(self):
+        ok, why = self._send("https://169.254.169.254/x", resolve=(None, "internal address"))
+        assert not ok and "internal address" in why
+
+    @pytest.mark.parametrize("code,hint", [(404, "deleted"), (401, "token"), (429, "rate limited"), (500, "HTTP 500")])
+    def test_http_status(self, code, hint):
+        class R:
+            status_code = code
+        ok, why = self._send("https://discord.com/api/webhooks/1/x", post=lambda *a, **k: R())
+        assert not ok and hint in why
+
+    def test_network_error(self):
+        def boom(*a, **k):
+            raise TimeoutError()
+        ok, why = self._send("https://hooks.slack.com/services/A/B/C", post=boom)
+        assert not ok and "timed out" in why
+
+    def test_success_clears_the_reason(self):
+        class R:
+            status_code = 204
+        netwatch._last_webhook_error = "old"
+        assert self._send("https://discord.com/api/webhooks/1/x", post=lambda *a, **k: R()) == (True, "")
+
+    def test_alert_test_prints_the_reason(self, tmp_path):
+        class R:
+            status_code = 404
+        p = tmp_path / "alerts.json"
+        p.write_text('{"url": "https://discord.com/api/webhooks/1/x"}')
+        with patch.object(netwatch, "_alerts_cfg_path", return_value=str(p)), \
+                patch("netwatch._resolve_safe", return_value=("162.159.128.233", "")), \
+                patch.object(netwatch.req_lib, "post", lambda *a, **k: R()):
+            netwatch._disp_alerts(["alert", "test"])
+        out = "\n".join(netwatch.console_output)
+        assert "failed: the service answered HTTP 404 (the webhook was deleted or the URL is wrong)" in out

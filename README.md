@@ -176,6 +176,24 @@ sudo -E netwatch
 
 Persist by adding to `/etc/netwatch.env` and referencing in the systemd unit's `EnvironmentFile=`. Internet-facing scanners hit the standard ports — non-standard ports stay invisible to most drive-by traffic.
 
+### CVE lookup
+
+`cve <ip>` runs an nmap version scan, matches every product version it finds against the [NVD](https://nvd.nist.gov/) CVE API, and lists the results with entries from the CISA Known Exploited Vulnerabilities catalog first. Results are cached for 24 hours in `cve_cache.json` in the config directory. It needs outbound HTTPS to `services.nvd.nist.gov` only.
+
+```bash
+NETWATCH_NVD_API_KEY=<key> sudo -E netwatch   # optional, free key: 10x faster lookups
+```
+
+The match is by version string. A distribution can fix a CVE and keep the version number, so confirm a finding before you act on it.
+
+### Local settings
+
+| Variable | Purpose |
+|----------|---------|
+| `NETWATCH_WHITELIST` | Addresses that skip threat scoring: `198.51.100.7,203.0.113.` (a trailing `.` is a prefix). The shipped list holds loopback and large CDN ranges only. |
+| `NETWATCH_NVD_API_KEY` | NVD API key for `cve` (raises the rate limit). |
+| `NETWATCH_IPAPI_KEY` | ip-api.com paid key. With it, geo lookups use HTTPS. Without it they use the free endpoint: plain HTTP, 45 requests a minute, **non-commercial use only**. |
+
 ### Replay tunables
 
 Same-IP telnet attempts roll up into one aggregated session (`all_<ip>`) so a scanner banging your honeypot all day shows as one entry instead of fifty. Inside the timeline, `── ATTEMPT N (timestamp UTC) ──` markers separate bursts. Tune the burst threshold with:
@@ -355,6 +373,8 @@ Browser UI on `:9090` with live SSE updates, 5 themes, and CRT scanline effects.
 |---------|-------------|
 | `scan <ip> [preset]` | Nmap scan (quick/syn/udp/ping/full) |
 | `deep <ip>` | All ports + vuln scripts |
+| `cve <ip\|host>` | Version scan, then known CVEs for each product version — known-exploited first |
+| `cve <CVE-id>` / `cve <cpe>` | Look up one CVE, or one product version, in NVD |
 | `stealth <ip>` | SYN scan through Tor |
 | `recon <ip>` | Full OSINT profile |
 | `fullrecon <ip>` | 7-phase recon chain |
@@ -465,7 +485,7 @@ mutation { runCommand(cmd: "geo 8.8.8.8") { output } }
 
 ```bash
 python3 -m pytest tests/ -q
-# 2516 tests, ~90s on a Pi 5
+# 2641 tests, ~90s on a Pi 5
 ```
 
 Lint (CI threshold `--fail-under=9.0`):

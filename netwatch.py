@@ -814,7 +814,38 @@ _alert_last_global = 0.0
 
 
 def _alerts_cfg_path():
-    return os.path.join(os.path.expanduser("~"), ".config", "netwatch", "alerts.json")
+    # The shared config dir, not "~": `sudo netwatch` and `netwatch alert set`
+    # run as different users, and a home-relative path gave each its own file,
+    # so a webhook saved by one was never seen by the other.
+    return _config_path("alerts.json")
+
+
+def _migrate_legacy_config():
+    """Copy alerts.json / remotes.json from this user's ~/.config/netwatch into
+    the shared config dir when the shared dir has none. Returns names copied."""
+    legacy = os.path.join(os.path.expanduser("~"), ".config", "netwatch")
+    target = _config_dir()
+    moved = []
+    try:
+        if os.path.realpath(legacy) == os.path.realpath(target):
+            return moved
+    except OSError:
+        return moved
+    for name in ("alerts.json", "remotes.json"):
+        src, dst = os.path.join(legacy, name), os.path.join(target, name)
+        try:
+            if not os.path.isfile(src) or os.path.exists(dst):
+                continue
+            with open(src, "rb") as f:
+                data = f.read(1024 * 1024)
+            os.makedirs(target, exist_ok=True, mode=0o700)
+            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            moved.append(name)
+        except OSError:
+            continue
+    return moved
 
 
 def _load_alerts_cfg():
@@ -855,19 +886,32 @@ def _sanitize_alert_field(s, cap=256):
     return s[:cap].strip()
 
 
+_last_webhook_error = ""
+
+
 def _send_webhook(url, title, msg):
-    """POST one alert. Fails closed on non-https or internal/blocked hosts."""
-    if not req_lib or not url:
+    """POST one alert. Fails closed on non-https or internal/blocked hosts.
+    The reason for a failure is kept in _last_webhook_error."""
+    global _last_webhook_error
+    _last_webhook_error = ""
+    if not req_lib:
+        _last_webhook_error = "the 'requests' package is not installed"
+        return False
+    if not url:
+        _last_webhook_error = "no webhook is set"
         return False
     from urllib.parse import urlparse
     parsed = urlparse(url)
     if parsed.scheme != "https":
+        _last_webhook_error = "the webhook URL is not https://"
         return False
     host = parsed.hostname
     if not host:
+        _last_webhook_error = "the webhook URL has no host name"
         return False
     ip, _reason = _resolve_safe(host)   # SSRF guard: blocks internal/link-local
     if not ip:
+        _last_webhook_error = f"cannot use host {_sanitize_alert_field(host, 80)}: {_reason or 'no DNS answer'}"
         return False
     kind = _webhook_kind(url)
     text = f"🛰 NetWatch: {_sanitize_alert_field(title, 120)} — {_sanitize_alert_field(msg, 300)}"
@@ -881,8 +925,15 @@ def _send_webhook(url, title, msg):
         payload = {"title": _sanitize_alert_field(title, 120), "text": text[:2000]}
     try:
         r = req_lib.post(url, json=payload, timeout=5)
-        return 200 <= r.status_code < 300
-    except Exception:
+        if 200 <= r.status_code < 300:
+            return True
+        hint = {401: " (the webhook token is wrong)", 403: " (the webhook token is wrong)",
+                404: " (the webhook was deleted or the URL is wrong)",
+                429: " (rate limited; wait a minute)"}.get(r.status_code, "")
+        _last_webhook_error = f"the service answered HTTP {r.status_code}{hint}"
+        return False
+    except Exception as e:
+        _last_webhook_error = f"network error: {_safe_error(e)}"
         return False
 
 
@@ -898,7 +949,7 @@ _REMOTE_RESERVED = frozenset({"add", "rm", "remove", "list", "ls", "del", "delet
 
 
 def _remotes_cfg_path():
-    return os.path.join(os.path.expanduser("~"), ".config", "netwatch", "remotes.json")
+    return _config_path("remotes.json")   # shared dir: see _alerts_cfg_path
 
 
 def _load_remotes():
@@ -2887,7 +2938,7 @@ def osint_ssl(target, port=443):
                             try:
                                 fmt = "%b %d %H:%M:%S %Y %Z"
                                 not_after = datetime.strptime(cert["notAfter"], fmt)
-                                result["days_left"] = (not_after - datetime.utcnow()).days
+                                result["days_left"] = (not_after - datetime.now(timezone.utc).replace(tzinfo=None)).days
                             except Exception:
                                 pass
             except ssl.SSLCertVerificationError:
@@ -3583,12 +3634,14 @@ _HELP_SECTIONS = [
     ]),
     ("Attack Analysis", None, [
         ("inspect [n]", "Honeypot event"), ("analyze <ip>", "Attacker profile"),
+        ("replay [list|<n>]", "Replay a captured attacker session"),
         ("decode <data>", "Decode payload"), ("sessions", "Attacker IPs"),
         ("attackers", "Honeypot IPs"), ("profile <ip>", "Recon report"),
         ("timeline <ip>", "Event history"), ("report <ip>", "Save report"),
     ]),
     ("Tracking", None, [
         ("track <ip> [s]", "Live packet tail"), ("untrack <ip>", "Stop tracking"),
+        ("tracking", "List active tracks"),
         ("conns <ip>", "TCP connections"), ("sniff <ip> [s]", "Payload capture"),
         ("trackdns <ip>", "DNS queries"), ("tracked <ip>", "Summary"),
     ]),
@@ -3630,11 +3683,16 @@ _HELP_SECTIONS = [
         ("mfa [enroll|confirm|…]", "Two-factor logins, lockouts, sign-out-everywhere (Enterprise)"),
         ("apikey [new|revoke]", "Scoped API keys for programmatic access (Enterprise)"),
         ("sso [test]", "Single sign-on via your IdP — OpenID Connect (Enterprise)"),
+        ("users [add|…]", "Team accounts for the web dashboard (Business)"),
+        ("audit [verify]", "Tamper-evident action log (Enterprise)"),
+        ("compliance [pdf]", "Control-coverage report (Enterprise)"),
         ("license", "Show tier / license status"),
     ]),
     ("System", None, [
         ("status", "Service info"), ("dashboard / d", "Return to TUI"),
-        ("clear", "Clear screen"), ("help", "This reference"),
+        ("clear", "Clear screen"), ("help [word]", "This reference, or search it"),
+        ("doctor", "Check Python packages + system tools"),
+        ("cli / console", "Switch to the command-line / console screen"),
         ("rotate-key", "New Fernet key (invalidate sessions)"),
         ("rotate-token", "New web auth token"),
         ("show-token", "Print current web auth token + file path"),
@@ -3661,6 +3719,38 @@ def _help_to_console():
                 add_console(f"  {cmd:<20s} {desc}")
             else:
                 add_console(f"  {desc}")
+
+
+def _help_search(term):
+    """help <word>: the help entries whose command or description has the word."""
+    term = _ansi_strip(term).lower()[:40]
+    hits = [(cat, cmd, desc) for cat, _sub, cmds in _HELP_SECTIONS
+            for cmd, desc in cmds if cmd and (term in cmd.lower() or term in desc.lower())]
+    if not hits:
+        add_console(f"{YELLOW}No help entry has '{term}'.{RESET}{_did_you_mean(term)}")
+        return
+    add_console(f"{BOLD}{len(hits)} help entries for '{term}':{RESET}")
+    for cat, cmd, desc in hits:
+        add_console(f"  {GREEN}{cmd:<26s}{RESET} {desc}  {DIM}[{cat}]{RESET}")
+
+
+def _help_command_words():
+    """The first word of every command in the help table (both sides of a/b)."""
+    words = set()
+    for _cat, _sub, cmds in _HELP_SECTIONS:
+        for cmd, _desc in cmds:
+            head = cmd.split(" <")[0].split(" [")[0]
+            for alt in head.split("/"):
+                if alt.split():
+                    words.add(alt.split()[0])
+    return words
+
+
+def _did_you_mean(word):
+    """' Did you mean: a, b?' for a mistyped command, or ''."""
+    import difflib
+    close = difflib.get_close_matches(word, sorted(_help_command_words() | _TAB_NAMES), n=3, cutoff=0.7)
+    return f" Did you mean: {', '.join(close)}?" if close else ""
 
 
 def _help_to_print():
@@ -3975,7 +4065,10 @@ def handle_command(cmd):
         app_state.cli_scroll = 0
         app_state.console_scroll = 0
     elif action == "help":
-        _help_to_console()
+        if len(parts) >= 2:
+            _help_search(parts[1])
+        else:
+            _help_to_console()
     elif action == "status":
         _disp_summary(parts)
     elif action in ("rotate-key", "rotatekey"):
@@ -3989,7 +4082,7 @@ def handle_command(cmd):
     elif action in ("restart-tunnel", "restarttunnel", "change-tunnel", "changetunnel", "new-tunnel"):
         _disp_restart_tunnel()
     else:
-        add_console(f"{RED}Unknown: '{action}'. Type 'help' for commands.{RESET}")
+        add_console(f"{RED}Unknown: '{action}'.{_did_you_mean(action)} Type 'help' for commands.{RESET}")
 
 
 def _disp_rotate_key():
@@ -4305,7 +4398,8 @@ def _disp_alerts(parts):
             add_console(f"  {YELLOW}No webhook set. Use: alert set <url>{RESET}")
             return
         ok = notify_attack("Test alert", "NetWatch alert webhook is working.")
-        add_console("  ✅ delivered" if ok else f"  {RED}❌ failed — check URL/network{RESET}")
+        why = f": {_last_webhook_error}" if (not ok and _last_webhook_error) else " — check URL/network"
+        add_console("  ✅ delivered" if ok else f"  {RED}❌ failed{why}{RESET}")
         return
     cfg = _load_alerts_cfg()
     if cfg.get("url"):
@@ -9920,7 +10014,7 @@ function renderHelp(){
   osint.forEach(([c,d])=>{s+=`<tr><td style="${C}">${c}</td><td>${d}</td></tr>`});
   s+=`</table>`;
   s+=`<div style="${S}">Scanning</div><table><tr><th style="width:180px">Command</th><th>Description</th></tr>`;
-  [["scan &lt;ip&gt; [preset]","Nmap scan (quick/syn/udp/ping/full)"],["deep &lt;ip&gt;","All ports + vuln scripts"],
+  [["scan &lt;ip&gt; [preset]","Nmap scan (quick/syn/udp/ping/full)"],["deep &lt;ip&gt;","All ports + vuln scripts"],["cve &lt;ip|CVE-id&gt;","Known CVEs, exploited first"],
    ["stealth &lt;ip&gt;","SYN scan through Tor"],["recon &lt;ip&gt;","Full OSINT profile"],["fullrecon &lt;ip&gt;","7-phase recon chain"],
    ["sweep [cidr]","ARP + ping + port scan"],["banner &lt;ip&gt; &lt;port&gt;","Service banner grab"],["trace &lt;ip&gt;","Traceroute"]
   ].forEach(([c,d])=>{s+=`<tr><td style="${C}">${c}</td><td>${d}</td></tr>`});
@@ -11739,8 +11833,13 @@ _CLI_SUBCOMMANDS = ("activate", "register", "license", "status", "collector",
 def main():
     global IFACE, _APP_RUNNING
     _argv = sys.argv[1:]
+    _migrated = _migrate_legacy_config()
     if _argv and _argv[0] in _CLI_SUBCOMMANDS:
         return _cli_subcommand(_argv)
+    if _migrated:
+        print(f"{DIM}[*] Moved {', '.join(_migrated)} into {_config_dir()}{RESET}")
+    if _WHITELIST_REJECTED:
+        print(f"{YELLOW}[!] NETWATCH_WHITELIST: ignored {', '.join(_WHITELIST_REJECTED)}{RESET}")
     if not HAS_RAW_NET:
         if IS_TERMUX:
             print(f"{YELLOW}[!] Termux detected — running passive mode (honeypots + OSINT + web only).{RESET}")
