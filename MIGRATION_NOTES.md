@@ -1,5 +1,7 @@
 # NetWatch Refactor — Migration Notes
 
+> Historical record of the 2026-05-30 refactor. Since 1.6.2 NetWatch is no longer one file: the web pages are in `netwatch_web_assets.py`, and `netwatch_cve.py` and `netwatch_settings.py` hold the newer features. See CHANGELOG.md.
+
 Date: 2026-05-30
 Scope: In-place edit of `netwatch.py` (single file preserved per user direction
 — launcher scripts and entry path untouched).

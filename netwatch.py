@@ -823,9 +823,8 @@ _alert_last_global = 0.0
 
 
 def _alerts_cfg_path():
-    # The shared config dir, not "~": `sudo netwatch` and `netwatch alert set`
-    # run as different users, and a home-relative path gave each its own file,
-    # so a webhook saved by one was never seen by the other.
+    # Follows NETWATCH_CONFIG_DIR like every other file (it used to ignore it
+    # and always use ~/.config/netwatch).
     return _config_path("alerts.json")
 
 
