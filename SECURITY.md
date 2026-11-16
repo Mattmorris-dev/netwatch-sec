@@ -6,10 +6,10 @@ NetWatch is a defensive network-security tool. We take its own security seriousl
 
 | Version | Supported           |
 | ------- | ------------------- |
-| 1.1.x   | :white_check_mark:  |
-| < 1.1   | :x:                 |
+| 1.6.x   | :white_check_mark:  |
+| < 1.6   | :x:                 |
 
-Only the latest 1.1.x release receives security fixes. We recommend running the most recent version from PyPI (`pip install -U netwatch-sec`) or from `main`.
+Only the latest 1.6.x release receives security fixes. 1.6.2 and later need Python 3.11 or later. We recommend running the most recent version from PyPI (`pip install -U netwatch-sec`) or from `main`.
 
 ## Reporting a Vulnerability
 

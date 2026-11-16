@@ -9,18 +9,18 @@
 [![Downloads/month](https://static.pepy.tech/badge/netwatch-sec/month)](https://pepy.tech/project/netwatch-sec)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Flask](https://img.shields.io/badge/Flask-2.3+-000000?logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
+[![Flask](https://img.shields.io/badge/Flask-3.1+-000000?logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
 [![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-A22846?logo=raspberrypi&logoColor=white)](https://www.raspberrypi.org/)
 [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)](https://www.linux.org/)
 [![Parrot OS](https://img.shields.io/badge/Parrot%20OS-15CDCA?logo=parrotsecurity&logoColor=white)](https://www.parrotsec.org/)
 [![Kali](https://img.shields.io/badge/Kali-557C94?logo=kalilinux&logoColor=white)](https://www.kali.org/)
 [![Platform: Debian](https://img.shields.io/badge/platform-debian-A81D33?logo=debian&logoColor=white)](https://www.debian.org/)
-[![Tests](https://img.shields.io/badge/tests-2516-brightgreen.svg)](tests/)
-[![Version](https://img.shields.io/badge/version-1.6.1-blue.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-2749-brightgreen.svg)](tests/)
+[![Version](https://img.shields.io/badge/version-1.6.2-blue.svg)](CHANGELOG.md)
 [![Status: Active](https://img.shields.io/badge/status-active-brightgreen.svg)]()
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pr0xy_22)
 
-**All-in-one network security dashboard** — deploy honeypots, capture traffic, run OSINT, scan targets, block threats, and forward alerts over mesh radio. One command, real-time.
+**All-in-one network security dashboard** — deploy honeypots, capture traffic, run OSINT, find known CVEs, scan targets, block threats, and forward alerts over mesh radio. One command, real-time.
 
 ```
 sudo netwatch
@@ -28,7 +28,7 @@ sudo netwatch
 
 NetWatch turns any Linux box into a full network security sensor. It deploys 4 honeypot services that lure and log attackers, sniffs all traffic on your interface with raw sockets and tshark, auto-enriches every IP with geolocation and threat scoring, and gives you 100+ commands to investigate, track, and block threats — all from a single terminal or browser.
 
-Built for Raspberry Pi, Kali, Parrot OS, and any Debian-based Linux. Runs as a single Python file with no microservices, no Docker, no cloud dependency.
+Built for Raspberry Pi, Kali, Parrot OS, and any Debian-based Linux. A few Python modules, no microservices, no cloud dependency. Docker is optional.
 
 ---
 
@@ -36,9 +36,9 @@ Built for Raspberry Pi, Kali, Parrot OS, and any Debian-based Linux. Runs as a s
 
 1. **Launch** — `sudo netwatch` starts everything: 4 honeypots bind their ports, raw socket sniffer attaches to your interface, tshark begins protocol analysis, ARP monitor discovers devices, web dashboard opens on :9090
 2. **Capture** — Every packet is parsed for source/destination IPs, ports, protocols, and DNS queries. Honeypots log credentials, commands, file uploads, and malware download attempts
-3. **Enrich** — Each new IP is automatically scored for threat level based on port behavior, known bad ports, and scan patterns. Run OSINT commands to add geolocation, WHOIS, abuse reports, and ASN data
+3. **Enrich** — Every IP is scored, and re-scored as its behaviour changes, from port behaviour, known bad ports and scan patterns. Run OSINT commands to add geolocation, WHOIS, abuse reports and ASN data, and `cve` to find known vulnerabilities in the services a host runs
 4. **Respond** — Block attackers with iptables, tag and watchlist IPs, run deep nmap scans, capture payloads, export reports. Forward critical alerts over LoRa mesh radio for off-grid monitoring
-5. **View** — Full-screen TUI with 11 tabs, or browser dashboard with live charts, clickable IPs, 5 color themes, and CRT scanline effects
+5. **View** — Full-screen TUI with 16 tabs, or browser dashboard with live charts, clickable IPs, 5 color themes, and CRT scanline effects
 
 ---
 
@@ -46,11 +46,11 @@ Built for Raspberry Pi, Kali, Parrot OS, and any Debian-based Linux. Runs as a s
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                     NETWATCH v1.1.0                          │
+│                     NETWATCH v1.6.2                          │
 ├──────────────────────────────────────────────────────────────┤
 │  TERMINAL UI (TUI)        │  WEB DASHBOARD (:9090)           │
 │  Full-screen ANSI         │  Flask + SSE live updates        │
-│  11 tabs, console mode    │  5 themes, CRT scanlines         │
+│  16 tabs, console mode    │  5 themes, CRT scanlines         │
 │  Tab/number key nav       │  Charts, clickable IPs, API      │
 ├──────────────────────────────────────────────────────────────┤
 │  HONEYPOTS                │  TRAFFIC MONITORING              │
@@ -62,7 +62,7 @@ Built for Raspberry Pi, Kali, Parrot OS, and any Debian-based Linux. Runs as a s
 │  SCANNING & RECON         │  OSINT (16 tools)                │
 │  nmap integration         │  GeoIP, WHOIS, DNS enum          │
 │  Port scanning            │  SSL/TLS, HTTP headers           │
-│  Service detection        │  Abuse/ASN, cert transparency    │
+│  CVE lookup (NVD + KEV)   │  Abuse/ASN, cert transparency    │
 │  Stealth (Tor) mode       │  Tech fingerprinting, speedtest  │
 ├──────────────────────────────────────────────────────────────┤
 │  DEFENSE                  │  MESH RADIO                      │
@@ -73,6 +73,8 @@ Built for Raspberry Pi, Kali, Parrot OS, and any Debian-based Linux. Runs as a s
 ```
 
 ## Install
+
+Needs **Python 3.11 or later** (`python3 --version`). Raspberry Pi OS Bookworm, Debian 12, Ubuntu 24.04, Kali and Parrot ship it.
 
 **One-liner (fastest):**
 ```bash
@@ -164,24 +166,25 @@ From the TUI prompt:
 
 ### Honeypot ports
 
-Defaults bind to high ports so root isn't required: HTTP `:8080`, Telnet `:2323`, FTP `:2121`, RTSP `:8554`. Override via env to move to standard ports (needs `CAP_NET_BIND_SERVICE` or root):
+Defaults bind to high ports so root isn't required: HTTP `:8080`, Telnet `:2323`, FTP `:2121`, RTSP `:8554`. To move to the standard ports (needs `CAP_NET_BIND_SERVICE` or root), save them once and restart:
 
 ```bash
-NETWATCH_HTTP_PORT=80 \
-NETWATCH_TELNET_PORT=23 \
-NETWATCH_FTP_PORT=21 \
-NETWATCH_RTSP_PORT=554 \
-sudo -E netwatch
+sudo netwatch config set http-port 80
+sudo netwatch config set telnet-port 23
+sudo netwatch config set ftp-port 21
+sudo netwatch config set rtsp-port 554
 ```
 
-Persist by adding to `/etc/netwatch.env` and referencing in the systemd unit's `EnvironmentFile=`. Internet-facing scanners hit the standard ports — non-standard ports stay invisible to most drive-by traffic.
+`NETWATCH_HTTP_PORT` and the other variables still work and win over the saved value. Internet-facing scanners hit the standard ports — non-standard ports stay invisible to most drive-by traffic.
+
+On a cloud server, also open the honeypot ports in the provider's firewall (for example a DigitalOcean Cloud Firewall). A port that the firewall drops never reaches NetWatch. Do **not** open `:9090`; reach the dashboard through an SSH tunnel or the Cloudflare tunnel.
 
 ### CVE lookup
 
 `cve <ip>` runs an nmap version scan, matches every product version it finds against the [NVD](https://nvd.nist.gov/) CVE API, and lists the results with entries from the CISA Known Exploited Vulnerabilities catalog first. Results are cached for 24 hours in `cve_cache.json` in the config directory. It needs outbound HTTPS to `services.nvd.nist.gov` only.
 
 ```bash
-NETWATCH_NVD_API_KEY=<key> sudo -E netwatch   # optional, free key: 10x faster lookups
+sudo netwatch config set nvd-key <key>   # optional, free key from nvd.nist.gov: 10x faster lookups
 ```
 
 The match is by version string. A distribution can fix a CVE and keep the version number, so confirm a finding before you act on it.
@@ -318,13 +321,13 @@ Three screens, hotkey-toggled. Switching screens keeps your tab and scroll posit
 
 | Screen | Hotkey | Purpose |
 |--------|--------|---------|
-| **Dashboard** | `F1` | 11 tabs, live host/protocol/honeypot view |
+| **Dashboard** | `F1` | 16 tabs, live host/protocol/honeypot view |
 | **Command Line** | `F2` | Full-screen prompt + command output |
 | **Console** | `F3` | Full-screen log of tool output |
 
 ```
 F1 / F2 / F3       Switch screens
-1-9, 0             Jump to tab
+1-9, 0             Jump to tab 1-10 (type a tab name for the rest)
 Type anything      Open command prompt
 Up/Down            History recall
 PgUp / PgDn        Scrollback
@@ -335,7 +338,9 @@ clear              Wipe console buffer
 
 ### Tabs
 
-`all` · `hosts` · `proto` · `dns` · `honeypot` · `nmap` · `arp` · `alerts` · `osint` · `proxy` · `mesh`
+`all` · `hosts` · `proto` · `dns` · `honeypot` · `nmap` · `arp` · `alerts` · `osint` · `proxy` · `mesh` · `fleet` · `scan` · `cam` · `hive` · `audit`
+
+Type a tab name at the prompt to open it. Some tabs show data only with a Pro license.
 
 ## Web Dashboard
 
@@ -473,6 +478,16 @@ mesh connect [/dev/ttyACM0]     mesh disconnect     mesh status
 mesh send <text>     mesh nodes     mesh alert on/off
 ```
 
+The radio connects in the background at start-up. If it does not connect, `mesh status` shows the reason (permission, port in use, no answer, not found). For a permission error, add your user to the `dialout` group or run with `sudo`. Save the port with `config set mesh-port /dev/ttyACM0`.
+
+### Alerts (Discord / Slack / webhook)
+
+```
+alert set <https-webhook-url>     alert test     alert off
+```
+
+`alert test` sends one message and, if it fails, prints the reason (HTTP status, DNS or network).
+
 ## Honeypots
 
 | Service | Port | Captures |
@@ -542,7 +557,7 @@ pylint $(git ls-files '*.py') --fail-under=9.0
 | **OS** | Linux (Debian, Ubuntu, Raspbian, Parrot, Kali) — also runs on Termux (Android) in passive mode |
 | **Python** | 3.11+ |
 | **Root** | Recommended (raw sockets, iptables, sub-1024 binding). Non-root and Termux run in passive mode (honeypots, OSINT, web, nmap connect-scan). |
-| **System** | nmap, tshark, tcpdump, traceroute |
+| **System** | nmap, tshark, tcpdump, traceroute (more for optional commands: see Install) |
 | **Python** | flask, requests, python-whois, dnspython, markupsafe, cryptography |
 | **Optional** | graphene, flask-graphql, meshtastic, speedtest-cli |
 
@@ -553,6 +568,7 @@ Tested on Raspberry Pi 5, Parrot OS, and Termux (Android, passive mode).
 ```bash
 git clone https://github.com/Mattmorris-dev/netwatch-sec.git && cd netwatch-sec
 sudo apt install nmap tshark tcpdump traceroute
+python3 --version                      # must be 3.11 or later
 pip3 install -r requirements.txt
 
 # System-wide install
@@ -594,13 +610,20 @@ unlocks these; without one it simply keeps running as Free.
 | Nodes | 1 | 1 | 25 | negotiated |
 | Price | $0 | $20/mo · $200/yr | $99/mo · $990/yr | custom |
 
-Pricing and terms live in [PRICING.md](https://github.com/mattymomo1993/netwatch-pro).
+For pricing or a license key, open an issue or use the contact in [SECURITY.md](SECURITY.md).
 Already have a key:
 
 ```bash
 netwatch activate <your-license-key>
 netwatch license          # confirm the tier and expiry
 ```
+
+## Upgrading to 1.6.2
+
+- Python 3.11 or later is required. Check with `python3 --version` before you upgrade.
+- Your own addresses (router, VPN peers) are no longer in the shipped whitelist. Add them: `sudo netwatch config set whitelist 192.0.2.1,100.64.0.5`.
+- `subnet`, `sweep` and the start-up sweep now use the private subnet on your interface instead of `10.0.1.0/24`.
+- New: `cve`, `config`, `help <word>`, `mesh connect`. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Support
 
