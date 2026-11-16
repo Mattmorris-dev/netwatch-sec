@@ -8,7 +8,7 @@
 [![Downloads](https://static.pepy.tech/badge/netwatch-sec)](https://pepy.tech/project/netwatch-sec)
 [![Downloads/month](https://static.pepy.tech/badge/netwatch-sec/month)](https://pepy.tech/project/netwatch-sec)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Flask](https://img.shields.io/badge/Flask-2.3+-000000?logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
 [![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-A22846?logo=raspberrypi&logoColor=white)](https://www.raspberrypi.org/)
 [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)](https://www.linux.org/)
@@ -497,7 +497,7 @@ pylint $(git ls-files '*.py') --fail-under=9.0
 | Component | Details |
 |-----------|---------|
 | **OS** | Linux (Debian, Ubuntu, Raspbian, Parrot, Kali) — also runs on Termux (Android) in passive mode |
-| **Python** | 3.9+ |
+| **Python** | 3.11+ |
 | **Root** | Recommended (raw sockets, iptables, sub-1024 binding). Non-root and Termux run in passive mode (honeypots, OSINT, web, nmap connect-scan). |
 | **System** | nmap, tshark, tcpdump, traceroute |
 | **Python** | flask, requests, python-whois, dnspython, markupsafe, cryptography |

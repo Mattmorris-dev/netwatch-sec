@@ -27,7 +27,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY netwatch.py replay.py netwatch_crowdsec.py ./
+COPY netwatch.py replay.py netwatch_crowdsec.py netwatch_shipper.py netwatch_cve.py ./
 
 # Honeypot + dashboard ports (informational — on Linux use --network host).
 # Defaults: HTTP 8080, Telnet 2323, FTP 2121, RTSP 8554, dashboard 9090.

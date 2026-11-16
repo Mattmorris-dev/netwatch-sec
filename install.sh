@@ -15,12 +15,16 @@ warn() { printf '%s\n' "  ${YELLOW}!${RESET} $*"; }
 
 say "NetWatch installer"
 
-# 1. Python 3.9+
+# 1. Python 3.11+
 if ! command -v python3 >/dev/null 2>&1; then
-  printf '%s\n' "${RED}python3 not found. Install Python 3.9+ and re-run.${RESET}" >&2
+  printf '%s\n' "${RED}python3 not found. Install Python 3.11+ and re-run.${RESET}" >&2
   exit 1
 fi
 PYV=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+  printf '%s\n' "${RED}python3 $PYV is too old. NetWatch needs Python 3.11+ (the fixed dnspython needs it).${RESET}" >&2
+  exit 1
+fi
 ok "python3 $PYV"
 
 # 2. Install the CLI — prefer pipx (isolated), fall back to pip --user.
