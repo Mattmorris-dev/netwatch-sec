@@ -144,12 +144,18 @@ class TestTerminalTransitions:
 
             console_mode = True
             _render_lock.acquire()
+            # Take the baseline with the lock held. The render thread draws a
+            # frame every 0.1 s, so one more frame can land between the read of
+            # initial_renders above and this point; that frame is legitimate
+            # (the dashboard was still active) and made this test fail about
+            # one run in eight.
+            frames_before_console = render_count[0]
             try:
                 termios.tcsetattr(slave, termios.TCSADRAIN, original)
                 os.write(master, b"\033[2J\033[H[CONSOLE MODE]\n")
                 time.sleep(0.2)
                 renders_during_console = render_count[0]
-                assert renders_during_console == initial_renders, \
+                assert renders_during_console == frames_before_console, \
                     "No frames should render during console mode"
             finally:
                 try:
